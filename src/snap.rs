@@ -19,9 +19,54 @@ pub use crate::snap_types::{
 // Serde `#[serde(default = ...)]` helpers, shared with the Lua parse path.
 use crate::snap_types::{default_confinement, default_grade};
 
-impl SnapRef {
+// ── Lua-side constructors for the shared vocabulary (ADR-0051) ──
+//
+// The value types now live in the `nau-core` crate (`crate::snap_types`
+// re-exports them), and Rust only permits inherent impls in the defining
+// crate. Their Lua-parsing constructors are eval/build-side machinery —
+// `nau-core` stays mlua-free — so they remain here as extension traits.
+// Import the trait wherever these constructors are called.
+
+/// Construct from a Lua pin table (`pin = pin { … }`), validated by the DSL.
+pub trait FromPinTable: Sized {
+    fn from_pin_table(table: &mlua::Table) -> miette::Result<Self>;
+}
+
+/// Construct from an `mlua::Value` (must be a table).
+pub trait FromLuaValue: Sized {
+    fn from_lua_value(value: &mlua::Value) -> miette::Result<Self>;
+}
+
+/// Construct from a validated Lua table.
+pub trait FromLuaTable: Sized {
+    fn from_lua_table(table: &mlua::Table) -> miette::Result<Self>;
+}
+
+/// Construct from a validated Lua table plus the map key naming it
+/// (`app = { … }`, `service = { … }` — the key names the errors).
+pub trait FromLuaTableNamed: Sized {
+    fn from_lua_table(name: &str, table: &mlua::Table) -> miette::Result<Self>;
+}
+
+/// Build-side identity machinery that stays out of `nau-core`: the
+/// resolved-recipe digest (sha3 + the `feed_*` helpers below).
+pub trait SnapMetaDigest {
+    fn build_input_digest(&self) -> String;
+}
+
+/// Module-private: layout entry parsing (via `SnapMeta::from_lua_table`).
+trait LayoutEntryLua: Sized {
+    fn from_lua_table(target: &str, t: &mlua::Table) -> miette::Result<Self>;
+}
+
+/// Module-private: typed plug/slot parsing (via `SnapMeta::from_lua_table`).
+trait PlugSlotLua: Sized {
+    fn from_lua_table(label: &str, t: &mlua::Table) -> miette::Result<Self>;
+}
+
+impl FromPinTable for SnapRef {
     /// Create from a Lua pin table (validated by the DSL).
-    pub fn from_pin_table(table: &mlua::Table) -> miette::Result<Self> {
+    fn from_pin_table(table: &mlua::Table) -> miette::Result<Self> {
         let name: String = table
             .get("name")
             .map_err(|_| miette::miette!("pin(): missing required field 'name'"))?;
@@ -379,7 +424,7 @@ fn feed_deps(buf: &mut Vec<u8>, deps: &PackageDeps) {
     }
 }
 
-impl SnapMeta {
+impl SnapMetaDigest for SnapMeta {
     /// Canonical build-input digest (sha3-384, hex) of this resolved
     /// recipe meta (issue #113). Deterministic: the same recipe digests
     /// identically across processes. Recorded on the installed package
@@ -396,7 +441,7 @@ impl SnapMeta {
     /// excluded: docs-only fields (summary, description, license),
     /// distribution metadata (compression, aliases, architectures), and
     /// machine-local paths (definition_dir).
-    pub fn build_input_digest(&self) -> String {
+    fn build_input_digest(&self) -> String {
         let mut buf = Vec::new();
         feed_str(&mut buf, &self.name);
         feed_str(&mut buf, &self.version);
@@ -587,7 +632,7 @@ pub(crate) fn validate_exec_text(service: &str, field: &str, value: &str) -> mie
     Ok(())
 }
 
-impl ServiceDecl {
+impl FromLuaTableNamed for ServiceDecl {
     /// Convert a Lua service table (from `service()` or a plain table)
     /// into a [`ServiceDecl`]. `name` is the service's key in `services`,
     /// used to name errors.
@@ -596,7 +641,7 @@ impl ServiceDecl {
     /// anything the schema doesn't know would otherwise vanish between
     /// the DSL and the emitted backend artifact — the same rule as
     /// [`SnapApp::from_lua_table`].
-    pub fn from_lua_table(name: &str, table: &mlua::Table) -> miette::Result<Self> {
+    fn from_lua_table(name: &str, table: &mlua::Table) -> miette::Result<Self> {
         const VALID_FIELDS: &str =
             "command, daemon, args, options, after, environment, backend_options";
         let mut unknown: Vec<String> = Vec::new();
@@ -994,9 +1039,9 @@ fn get_opt_backend_options(
 // These conversions extract pre-validated fields — errors here indicate
 // internal bugs or version mismatches, not user config errors.
 
-impl SnapMeta {
+impl FromLuaValue for SnapMeta {
     /// Convert from an `mlua::Value` (must be a table).
-    pub fn from_lua_value(value: &mlua::Value) -> miette::Result<Self> {
+    fn from_lua_value(value: &mlua::Value) -> miette::Result<Self> {
         match value {
             Value::Table(table) => Self::from_lua_table(table),
             other => Err(miette::miette!(
@@ -1005,9 +1050,11 @@ impl SnapMeta {
             )),
         }
     }
+}
 
+impl FromLuaTable for SnapMeta {
     /// Convert a validated Lua table (from `snap()`) into a `SnapMeta`.
-    pub fn from_lua_table(table: &mlua::Table) -> miette::Result<Self> {
+    fn from_lua_table(table: &mlua::Table) -> miette::Result<Self> {
         let name = get_required_string(table, "name")?;
         let adopt_info = get_opt_string(table, "adopt_info")?;
         // With adopt-info, version (and summary/description) are adopted
@@ -1436,7 +1483,7 @@ fn icon_target_from_source(source: Option<&str>) -> miette::Result<Option<String
     Ok(Some(format!("meta/gui/icon.{ext}")))
 }
 
-impl LayoutEntry {
+impl LayoutEntryLua for LayoutEntry {
     /// Convert a validated Lua layout entry (exactly one of
     /// bind/bind_file/symlink/tmpfs) into a `LayoutEntry`.
     fn from_lua_table(target: &str, t: &mlua::Table) -> miette::Result<Self> {
@@ -1521,7 +1568,7 @@ fn get_opt_tmpfs(t: &mlua::Table, target: &str) -> miette::Result<Option<TmpfsSp
     }
 }
 
-impl PlugSlot {
+impl PlugSlotLua for PlugSlot {
     /// Convert a validated Lua plug/slot attribute table (required string
     /// `interface` plus string-valued attributes) into a `PlugSlot`.
     fn from_lua_table(label: &str, t: &mlua::Table) -> miette::Result<Self> {
@@ -1569,7 +1616,7 @@ impl PlugSlot {
     }
 }
 
-impl SnapApp {
+impl FromLuaTableNamed for SnapApp {
     /// Convert a validated Lua table (from `app()`) into a `SnapApp`.
     /// `name` is the app's key in `apps`, used to name errors.
     ///
@@ -1578,7 +1625,7 @@ impl SnapApp {
     /// the emitted snap.yaml — the same silent-drop bug class as outputs
     /// (e.g. a template emitting `restart_condition`, which the schema
     /// never supported).
-    pub fn from_lua_table(name: &str, table: &mlua::Table) -> miette::Result<Self> {
+    fn from_lua_table(name: &str, table: &mlua::Table) -> miette::Result<Self> {
         let mut unknown: Vec<String> = Vec::new();
         for pair in table.pairs::<String, Value>() {
             let (k, _) = pair.map_err(|e| miette::miette!("app '{name}': {e}"))?;
@@ -2310,25 +2357,7 @@ fn get_package_inputs(
 }
 
 // ── Phase 4: YAML serialization ──
-
-impl SnapMeta {
-    /// Serialize to YAML string (the `meta/snap.yaml` content).
-    pub fn to_yaml(&self) -> miette::Result<String> {
-        serde_yaml::to_string(self)
-            .map_err(|e| miette::miette!("failed to serialize snap metadata to YAML: {}", e))
-    }
-
-    /// The version to show in identity output (`nau check`, build
-    /// status): an adopt-info snap has no declared version until build
-    /// time, and the "0" placeholder must never read as one.
-    pub fn display_version(&self) -> &str {
-        if self.adopt_info.is_some() && self.version_adopted {
-            "(version adopted at build)"
-        } else {
-            &self.version
-        }
-    }
-}
+// (`SnapMeta::to_yaml`/`display_version` live with the type in nau-core.)
 
 // ── Phase 5/6: Snap directory assembly + SquashFS packaging ──
 

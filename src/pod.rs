@@ -83,6 +83,7 @@ use miette::{IntoDiagnostic, WrapErr};
 use serde::{Deserialize, Serialize};
 
 use crate::lock::{LockFile, PodPackageLockEntry};
+use crate::snap::SnapMetaDigest;
 
 /// The implicit pod when no `--name` is given (`nau pod <verb>`).
 pub const DEFAULT_POD: &str = "default";

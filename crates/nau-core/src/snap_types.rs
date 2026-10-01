@@ -2,11 +2,14 @@
 //! declaration (#316; the first wall of the future `nau-core` crate,
 //! ADR-0051).
 //!
-//! This home is deliberately dependency-light: std, serde, and the
-//! plugin option payload ([`crate::plugins::PluginValue`]) only — no mlua,
-//! no full_moon, no build machinery. The code that parses Lua definitions
-//! and drives builds stays on the heavy side ([`crate::snap`]); re-exports
-//! there keep every pre-existing `crate::snap::` path compiling.
+//! This home is deliberately dependency-light: std, serde, serde_json,
+//! serde_yaml (the meta/snap.yaml rendering), miette as the error type,
+//! and the plugin option payload ([`PluginValue`], moved down from the root
+//! crate's `plugins` module — ADR-0051 Decision 3, shared vocabulary goes
+//! into core) — no mlua, no full_moon, no build machinery. The code
+//! that parses Lua definitions and drives builds stays on the heavy side
+//! (the root crate's `snap` module); re-exports there keep every
+//! pre-existing `crate::snap::` path compiling.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -399,17 +402,36 @@ pub struct SnapMeta {
     pub definition_dir: Option<std::path::PathBuf>,
 }
 
+impl SnapMeta {
+    /// Serialize to YAML string (the `meta/snap.yaml` content).
+    pub fn to_yaml(&self) -> miette::Result<String> {
+        serde_yaml::to_string(self)
+            .map_err(|e| miette::miette!("failed to serialize snap metadata to YAML: {}", e))
+    }
+
+    /// The version to show in identity output (`nau check`, build
+    /// status): an adopt-info snap has no declared version until build
+    /// time, and the "0" placeholder must never read as one.
+    pub fn display_version(&self) -> &str {
+        if self.adopt_info.is_some() && self.version_adopted {
+            "(version adopted at build)"
+        } else {
+            &self.version
+        }
+    }
+}
+
 /// Skip `type:` in snap.yaml for nau build classifications
 /// ("source"/"meta"/"store") and snapd's default ("app").
 fn skip_internal_or_default_type(t: &Option<String>) -> bool {
     !matches!(t.as_deref(), Some("base" | "gadget" | "kernel" | "snapd"))
 }
 
-pub(crate) fn default_grade() -> String {
+pub fn default_grade() -> String {
     "stable".to_string()
 }
 
-pub(crate) fn default_confinement() -> String {
+pub fn default_confinement() -> String {
     "strict".to_string()
 }
 
@@ -521,7 +543,12 @@ impl BackendKind {
         }
     }
 
-    pub(crate) fn from_str(s: &str) -> Option<Self> {
+    // Named after the snapd keyword parse it mirrors, not std::str::FromStr
+    // (that trait would change the return type to Result and break the
+    // callers); the visibility widening to `pub` (nau-core extraction,
+    // ADR-0051) is what makes the lint fire at all.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "bwrap" => Some(BackendKind::Bwrap),
             "apparmor" => Some(BackendKind::Apparmor),
@@ -656,6 +683,41 @@ pub struct SnapHook {
     pub source: String,
 }
 
+/// One option value from a definition's plugin options table. Lives here
+/// (not in the root crate's plugin registry) because [`SnapPart`] carries
+/// it — ADR-0051 Decision 3 moves shared vocabulary down into nau-core;
+/// the registry itself stays in the root `plugins` module, which re-exports
+/// this type under its old `crate::plugins::PluginValue` path.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PluginValue {
+    Str(String),
+    Bool(bool),
+    Arr(Vec<String>),
+    Map(BTreeMap<String, String>),
+}
+
+impl PluginValue {
+    /// Canonical JSON for cache keys: maps serialize with sorted keys
+    /// (BTreeMap), arrays keep order, booleans map to JSON booleans.
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            PluginValue::Str(s) => serde_json::Value::String(s.clone()),
+            PluginValue::Bool(b) => serde_json::Value::Bool(*b),
+            PluginValue::Arr(items) => serde_json::Value::Array(
+                items
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            ),
+            PluginValue::Map(map) => serde_json::Value::Object(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect(),
+            ),
+        }
+    }
+}
+
 /// One part of a multi-part build: a shell command plus optional `after`
 /// dependencies (names of parts that must complete first).
 ///
@@ -675,5 +737,5 @@ pub struct SnapPart {
     pub plugin: Option<String>,
     /// Raw plugin options (deep-validated by the plugin at the Rust
     /// boundary). Build-time only — never emitted to snap.yaml.
-    pub plugin_options: Option<BTreeMap<String, crate::plugins::PluginValue>>,
+    pub plugin_options: Option<BTreeMap<String, PluginValue>>,
 }

@@ -6,9 +6,9 @@
 //! manifest ([`ImageManifest`]) and the declarative image vocabulary
 //! ([`ImageDeclaration`] and companions), plus their serialization. The code
 //! that evaluates and constructs manifests stays on the build side —
-//! [`crate::manifest`] for the IR construction, [`crate::image`] for the
-//! declaration's Lua parsing. Re-exports in both keep every pre-existing
-//! path compiling.
+//! the root crate's `manifest` module for the IR construction, its `image`
+//! module for the declaration's Lua parsing. Re-exports in both keep every
+//! pre-existing path compiling.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -398,8 +398,8 @@ impl Serialize for ImageDeclaration {
 
 impl ImageDeclaration {
     /// Resolve every [`Self::files`] entry's `source` against the directory
-    /// of the declaring lua file (called from [`crate::lua::`
-    /// `evaluate_images_file`], the one place that knows the `--file`
+    /// of the declaring lua file (called from the root crate's
+    /// `lua::evaluate_images_file`, the one place that knows the `--file`
     /// path). Absolute sources pass through untouched.
     pub fn resolve_files_against(&mut self, base_dir: &Path) {
         for file in &mut self.files {

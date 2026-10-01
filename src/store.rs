@@ -369,6 +369,7 @@ pub fn sha3_384_file(path: &Path) -> miette::Result<String> {
 mod tests {
     use super::*;
     use crate::command::RunnerOutput;
+    use crate::snap::FromPinTable;
     use std::sync::Mutex;
 
     #[test]

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::analysis::Span;
 use crate::image::ImageDeclaration;
-use crate::snap::{PackageInput, SnapMeta};
+use crate::snap::{FromLuaTable, FromLuaValue, PackageInput, SnapMeta};
 
 /// Named outputs from a `nau.lua`, fully converted to owned Rust types.
 pub type Outputs = HashMap<String, SnapMeta>;
@@ -1177,6 +1177,7 @@ fn json_to_lua(lua: &mlua::Lua, v: &serde_json::Value) -> mlua::Result<mlua::Val
 
 #[cfg(test)]
 mod tests {
+    use crate::snap::FromLuaValue;
     use mlua::Value;
 
     /// Create a fresh Lua instance with the DSL globals injected.

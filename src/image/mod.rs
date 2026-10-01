@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::command::CommandRunner;
 use crate::doctor;
 use crate::lock::LockFile;
-use crate::snap::SnapRef;
+use crate::snap::{FromLuaTable, FromPinTable, SnapRef};
 use crate::store::ResolvedSnap;
 
 // Moved to the IR home ([`crate::manifest_ir`], #317); re-exported so
@@ -81,9 +81,9 @@ pub mod test_support {
 
 // ── Conversion from Lua ──
 
-impl ImageDeclaration {
+impl FromLuaTable for ImageDeclaration {
     /// Create from a validated Lua table (from `image()`).
-    pub fn from_lua_table(table: &mlua::Table) -> miette::Result<Self> {
+    fn from_lua_table(table: &mlua::Table) -> miette::Result<Self> {
         let name: String =
             get_required(table, "name").map_err(|e| miette::miette!("image(): {e}"))?;
         let version: String =
