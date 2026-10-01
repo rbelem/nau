@@ -1733,7 +1733,6 @@ dependencies = [
  "ed25519-dalek",
  "flate2",
  "libc",
- "mdns-sd",
  "miette",
  "mlua",
  "nau-build",
@@ -1741,6 +1740,7 @@ dependencies = [
  "nau-core",
  "nau-image",
  "nau-infra",
+ "nau-peer",
  "nau-ship",
  "pgp",
  "rand",
@@ -1859,6 +1859,21 @@ dependencies = [
  "toml",
  "ureq",
  "xz2",
+]
+
+[[package]]
+name = "nau-peer"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "mdns-sd",
+ "miette",
+ "nau-core",
+ "nau-infra",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

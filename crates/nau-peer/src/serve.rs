@@ -6,7 +6,7 @@
 //! The wire grammar is NORMATIVE (ADR-0033 Decision 4 — safety is
 //! conditional on it, not intrinsic to "read-only"): a blob segment is
 //! exactly 64 lowercase hex resolved through
-//! [`crate::runtime::RuntimeStore::blob_path`], never a raw join — a
+//! [`nau_core::blob_store::BlobStore::blob_path`], never a raw join — a
 //! naive join turns `GET /blobs/../../.config/nau/secret-key` into
 //! an unauthenticated arbitrary-file read over plaintext HTTP. Package
 //! names are `[a-z0-9-]+` (the ADR-0032 collision-classifier charset).
@@ -18,7 +18,7 @@
 //! `/manifests/<pkg>` and `/info` publish the UNION of the current
 //! generation's records (minted + signed on the fly — unsigned store
 //! entries are never served) and the pull-staging inbox
-//! ([`crate::pkg_manifest::manifest_path`]) per its documented
+//! ([`nau_core::pkg_manifest::manifest_path`]) per its documented
 //! invariant — the exact union `export` freezes into the static tree,
 //! through the same shared helpers.
 //!
@@ -28,6 +28,12 @@
 //! the lifetime of the accept loop. Announce failure is a warning, not
 //! an error: on multicast-filtered networks explicit peer addresses
 //! degrade gracefully, and discovery sugar must not take serving down.
+//!
+//! Issue #326 PR 5 (crate extraction): the env-reading pod roots stay
+//! root — the caller resolves `pod_root(None)` and hands it in; the
+//! store view consumed here is the narrow core seam
+//! ([`nau_core::blob_store::BlobStore`] + the generation view), never
+//! the root `RuntimeStore`.
 
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
@@ -39,10 +45,12 @@ use std::thread;
 use std::time::Duration;
 
 use miette::{IntoDiagnostic, WrapErr};
+use nau_core::blob_store::BlobStore;
+use nau_core::generation_view;
+use nau_core::paths::DEFAULT_SERVE_ADDRESS;
+use nau_core::pkg_manifest::Generation;
+use nau_infra::output;
 use serde::Serialize;
-
-use crate::lua::DEFAULT_SERVE_ADDRESS;
-use crate::runtime::{Generation, RuntimeStore};
 
 /// Hard connection-concurrency bound (ADR-0033 Decision 4). The accept
 /// loop refuses with 503 beyond this — one thread per connection with
@@ -169,7 +177,14 @@ fn read_head<R: Read>(reader: &mut R) -> Head {
 /// threads behind an [`Arc`].
 #[derive(Clone)]
 struct ServerCtx {
-    store: Arc<RuntimeStore>,
+    /// The served pod's state root: the generation manifests, the
+    /// `active` link, and the staged-manifest inbox hang off it. The
+    /// root glue resolves it (the env-reading `pod_root` stays root).
+    state_root: PathBuf,
+    /// The content-blob store over `<state_root>/store` — the narrow
+    /// read-only seam `/blobs/<sha>` streams through (issue #326 PR 5:
+    /// the crate never touches the root `RuntimeStore`).
+    blobs: Arc<BlobStore>,
     /// Home used for the signing key (`~/.config/nau/secret-key`)
     /// when minting manifests. A seam: tests point it at a tempdir.
     home: PathBuf,
@@ -202,21 +217,24 @@ impl Handled {
 /// the `--announce` flag as an override; `node_name: None` falls back
 /// to the kernel hostname. `pod` is the `--pod` flag: the named pod's
 /// store is the served surface (default `default`, matching the
-/// `--pod` flags on `pull` and `export`). Foreground until
+/// `--pod` flags on `pull` and `export`). `pod_root` is the pod state
+/// root the flag resolves under — resolved by the root glue (the
+/// env-reading `pod_root` stays root). Foreground until
 /// interrupted; no daemonization (ADR-0033 Decision 5).
 pub fn run(
+    pod_root: &Path,
     address: Option<&str>,
     port: Option<u16>,
     announce: bool,
     node_name: Option<&str>,
     pod: Option<&str>,
 ) -> miette::Result<()> {
-    let (pod_name, ctx) = serve_ctx(&crate::pod::pod_root(None), pod, node_name)?;
+    let (pod_name, ctx) = serve_ctx(pod_root, pod, node_name)?;
     let (host, port) = resolve_bind(address, port)?;
     let listener = TcpListener::bind((host.as_str(), port))
         .into_diagnostic()
         .wrap_err_with(|| format!("binding serve address {host}:{port}"))?;
-    crate::output::info(format!(
+    output::info(format!(
         "serving pod '{pod_name}' store on http://{host}:{port} — Ctrl-C to stop"
     ));
     // The guard binds the registration to the serve loop's lifetime —
@@ -227,21 +245,21 @@ pub fn run(
         let is_loopback = matches!(host.as_str(), "127.0.0.1" | "::1");
         let name = node_name
             .map(str::to_string)
-            .unwrap_or_else(crate::pkg_manifest::hostname);
+            .unwrap_or_else(nau_core::pkg_manifest::hostname);
         match crate::discovery::announce(&name, port) {
             Ok(guard) => {
-                crate::output::info(format!(
+                output::info(format!(
                     "announcing as '{name}' on _nau._tcp (mDNS) — `nau peers` finds it"
                 ));
                 if is_loopback {
-                    crate::output::warn(
+                    output::warn(
                         "announcing a loopback-only bind — LAN peers will discover this node but cannot connect; bind a real address (e.g. 0.0.0.0) to serve the LAN",
                     );
                 }
                 Some(guard)
             }
             Err(e) => {
-                crate::output::warn(format!(
+                output::warn(format!(
                     "mDNS announce failed ({e:#}) — peers can still pull by explicit address"
                 ));
                 None
@@ -254,7 +272,7 @@ pub fn run(
 }
 
 /// Resolve the pod to serve under an explicit pod root: the `--pod`
-/// name ([`crate::pod::resolve_pod_dir_under`]) plus the
+/// name ([`nau_core::paths::resolve_pod_dir_under`]) plus the
 /// store-existence gate, and carry the node name through to `/info`.
 /// Split from [`run`] so tests can point the pod root at a tempdir and
 /// observe which store a pod flag selects. A missing store is a named
@@ -264,7 +282,7 @@ fn serve_ctx(
     pod: Option<&str>,
     node_name: Option<&str>,
 ) -> miette::Result<(String, ServerCtx)> {
-    let (pod_name, pod_dir) = crate::pod::resolve_pod_dir_under(pod_root, pod)?;
+    let (pod_name, pod_dir) = nau_core::paths::resolve_pod_dir_under(pod_root, pod)?;
     if !pod_dir.is_dir() {
         miette::bail!(
             "no store for pod '{pod_name}' at {} — nothing to serve; \
@@ -274,7 +292,12 @@ fn serve_ctx(
     }
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
     let ctx = ServerCtx {
-        store: Arc::new(crate::pod::pod_store(&pod_dir)),
+        // The store dir half of the runtime state layout
+        // (`<state root>/store`, the same component
+        // `nau_core::pkg_manifest::inbox_manifests` derives the inbox
+        // from) — built straight over it via the core seam.
+        state_root: pod_dir.clone(),
+        blobs: Arc::new(BlobStore::new(pod_dir.join("store"))),
         home,
         node_name: node_name.map(str::to_string),
     };
@@ -316,7 +339,7 @@ fn accept_loop(listener: TcpListener, ctx: ServerCtx, active: Arc<AtomicUsize>) 
             continue;
         };
         if active.load(Ordering::Relaxed) >= MAX_CONCURRENT_CONNECTIONS {
-            crate::output::warn(format!(
+            output::warn(format!(
                 "connection limit reached ({MAX_CONCURRENT_CONNECTIONS}) — \
                  refusing a peer with 503"
             ));
@@ -387,7 +410,7 @@ fn serve_connection(mut stream: TcpStream, ctx: &ServerCtx) -> std::io::Result<(
                 // wire gets a generic body — dispatch errors can name
                 // signing keys, store paths, internal layout, and none
                 // of that belongs on the peer-facing wire.
-                crate::output::warn(format!("serve: {method} {path} → 500: {e:#}"));
+                output::warn(format!("serve: {method} {path} → 500: {e:#}"));
                 log_request(method, path, 500);
                 write_json_error(&mut stream, 500, "internal error")
             }
@@ -422,8 +445,8 @@ fn request_target(line: &str) -> (&str, &str) {
 /// controlled bytes: control characters (terminal escapes, CR/LF) are
 /// stripped before the line reaches the log.
 fn log_request(method: &str, path: &str, status: u16) {
-    let path = crate::output::strip_control_chars(path);
-    crate::output::info(format!("{method} {path} → {status}"));
+    let path = output::strip_control_chars(path);
+    output::info(format!("{method} {path} → {status}"));
 }
 
 /// Route a validated request to its handler.
@@ -456,14 +479,14 @@ struct Info {
 /// `GET /info`: the pod inventory — the UNION of the current
 /// generation's records and the inbox-only staged manifests (the same
 /// rule `export` freezes into `index.json`, through the same
-/// [`crate::pkg_manifest`] helpers). Identity is the configured
+/// [`nau_core::pkg_manifest`] helpers). Identity is the configured
 /// `node.name`; the kernel hostname is only the fallback. No
 /// generation and no inbox → an empty inventory (still 200 — the node
 /// exists, it just has nothing to show).
 fn handle_info(ctx: &ServerCtx) -> miette::Result<Handled> {
-    let generation = ctx.store.active_generation()?;
-    let inbox = crate::pkg_manifest::inbox_manifests(ctx.store.root())?;
-    let inbox_only = crate::pkg_manifest::union_inbox(&generation, &inbox);
+    let generation = generation_view::active_generation(&ctx.state_root)?;
+    let inbox = nau_core::pkg_manifest::inbox_manifests(&ctx.state_root)?;
+    let inbox_only = nau_core::pkg_manifest::union_inbox(&generation, &inbox);
     let mut packages: Vec<InfoPackage> = match &generation {
         Some(gen) => gen
             .packages
@@ -480,7 +503,7 @@ fn handle_info(ctx: &ServerCtx) -> miette::Result<Handled> {
         let raw = fs::read(path)
             .into_diagnostic()
             .wrap_err_with(|| format!("reading staged manifest {}", path.display()))?;
-        let manifest: crate::pkg_manifest::PackageManifest = serde_json::from_slice(&raw)
+        let manifest: nau_core::pkg_manifest::PackageManifest = serde_json::from_slice(&raw)
             .map_err(|e| miette::miette!("staged manifest for '{name}' does not parse: {e}"))?;
         packages.push(InfoPackage {
             name: manifest.name,
@@ -495,7 +518,7 @@ fn handle_info(ctx: &ServerCtx) -> miette::Result<Handled> {
         name: ctx
             .node_name
             .clone()
-            .unwrap_or_else(crate::pkg_manifest::hostname),
+            .unwrap_or_else(nau_core::pkg_manifest::hostname),
         packages,
     };
     let body =
@@ -510,16 +533,16 @@ fn handle_info(ctx: &ServerCtx) -> miette::Result<Handled> {
 /// otherwise 404. The minted body is byte-identical to the file export
 /// freezes into `manifests/<pkg>.json` — one mint, one truth.
 fn handle_manifest(ctx: &ServerCtx, pkg: &str) -> miette::Result<Handled> {
-    let generation: Option<Generation> = ctx.store.active_generation()?;
+    let generation: Option<Generation> = generation_view::active_generation(&ctx.state_root)?;
     if let Some(rec) = generation.as_ref().and_then(|g| g.packages.get(pkg)) {
-        let kp = crate::pkg_manifest::load_signing_key(&ctx.home)?;
-        let mut manifest = crate::pkg_manifest::mint_manifest(rec);
-        crate::pkg_manifest::sign(&mut manifest, &kp)?;
+        let kp = nau_core::pkg_manifest::load_signing_key(&ctx.home)?;
+        let mut manifest = nau_core::pkg_manifest::mint_manifest(rec);
+        nau_core::pkg_manifest::sign(&mut manifest, &kp)?;
         let body = serde_json::to_vec_pretty(&manifest)
             .map_err(|e| miette::miette!("serialize package manifest: {e}"))?;
         return Ok(Handled::Body(200, "application/json", body));
     }
-    let inbox = crate::pkg_manifest::manifest_path(ctx.store.root(), pkg);
+    let inbox = nau_core::pkg_manifest::manifest_path(&ctx.state_root, pkg);
     match fs::metadata(&inbox) {
         Ok(meta) if meta.is_file() => {
             let body = fs::read(&inbox)
@@ -532,10 +555,10 @@ fn handle_manifest(ctx: &ServerCtx, pkg: &str) -> miette::Result<Handled> {
 }
 
 /// `GET /blobs/<sha256>`: stream the content blob with Content-Length,
-/// resolved ONLY through [`RuntimeStore::blob_path`] after the strict
+/// resolved ONLY through [`BlobStore::blob_path`] after the strict
 /// hex-grammar validation — never a raw join. Absent → 404.
 fn handle_blob(ctx: &ServerCtx, sha: &str) -> Handled {
-    let path = ctx.store.blob_path(sha);
+    let path = ctx.blobs.blob_path(sha);
     match fs::metadata(&path) {
         Ok(meta) if meta.is_file() => {
             Handled::File(200, "application/octet-stream", path, meta.len())
@@ -618,9 +641,11 @@ fn write_json_error(stream: &mut TcpStream, status: u16, message: &str) -> std::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pkg_manifest;
-    use crate::runtime::InstalledPackage;
-    use crate::sign;
+    use nau_core::cache_key::sha256_hex;
+    use nau_core::generation_view;
+    use nau_core::pkg_manifest;
+    use nau_core::pkg_manifest::InstalledPackage;
+    use nau_core::sign;
     use std::collections::BTreeMap;
     use std::io::Cursor;
     use std::net::SocketAddr;
@@ -812,12 +837,12 @@ mod tests {
     fn start_with_signing_key(with_key: bool) -> ServeFixture {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let store = RuntimeStore::new(root.to_path_buf());
+        let blobs = BlobStore::new(root.join("store"));
 
         // Blob + generation record for "hello-world".
         let blob_body = b"payload-bytes".to_vec();
-        let blob_sha = crate::oci::sha256_hex(&blob_body);
-        let blob_path = store.blob_path(&blob_sha);
+        let blob_sha = sha256_hex(&blob_body);
+        let blob_path = blobs.blob_path(&blob_sha);
         fs::create_dir_all(blob_path.parent().unwrap()).unwrap();
         fs::write(&blob_path, &blob_body).unwrap();
 
@@ -831,7 +856,7 @@ mod tests {
                 sha3_384: "abc".into(),
                 files: vec![blob_sha.clone()],
                 units: Vec::new(),
-                layer: crate::farm::ClaimLayer::Own,
+                layer: nau_core::pkg_manifest::ClaimLayer::Own,
                 apps: BTreeMap::new(),
                 requires: Vec::new(),
                 launchers: BTreeMap::new(),
@@ -852,7 +877,7 @@ mod tests {
             created_epoch: 0,
             boot_entry: None,
         };
-        let gen_dir = store.generation_dir(1);
+        let gen_dir = generation_view::generation_dir(root, 1);
         fs::create_dir_all(gen_dir.join("extensions")).unwrap();
         fs::write(
             gen_dir.join("manifest.json"),
@@ -888,7 +913,8 @@ mod tests {
         };
 
         let ctx = ServerCtx {
-            store: Arc::new(store),
+            state_root: root.to_path_buf(),
+            blobs: Arc::new(blobs),
             home,
             node_name: None,
         };
@@ -1058,10 +1084,11 @@ mod tests {
     /// package (`pkg`) with a single blob — enough for `/info` to
     /// identify whose store is being served.
     fn fabricate_pod(root: &Path, pod: &str, pkg: &str) {
-        let store = RuntimeStore::new(root.join(pod));
+        let state_root = root.join(pod);
+        let blobs = BlobStore::new(state_root.join("store"));
         let body = format!("payload-of-{pkg}").into_bytes();
-        let sha = crate::oci::sha256_hex(&body);
-        let blob_path = store.blob_path(&sha);
+        let sha = sha256_hex(&body);
+        let blob_path = blobs.blob_path(&sha);
         fs::create_dir_all(blob_path.parent().unwrap()).unwrap();
         fs::write(&blob_path, &body).unwrap();
 
@@ -1075,7 +1102,7 @@ mod tests {
                 sha3_384: "abc".into(),
                 files: vec![sha],
                 units: Vec::new(),
-                layer: crate::farm::ClaimLayer::Own,
+                layer: nau_core::pkg_manifest::ClaimLayer::Own,
                 apps: BTreeMap::new(),
                 requires: Vec::new(),
                 launchers: BTreeMap::new(),
@@ -1096,14 +1123,14 @@ mod tests {
             created_epoch: 0,
             boot_entry: None,
         };
-        let gen_dir = store.generation_dir(1);
+        let gen_dir = generation_view::generation_dir(&state_root, 1);
         fs::create_dir_all(gen_dir.join("extensions")).unwrap();
         fs::write(
             gen_dir.join("manifest.json"),
             serde_json::to_vec(&gen).unwrap(),
         )
         .unwrap();
-        std::os::unix::fs::symlink("generations/1", store.root().join("active")).unwrap();
+        std::os::unix::fs::symlink("generations/1", state_root.join("active")).unwrap();
     }
 
     /// `--pod` selects the named pod's store as the served surface
@@ -1174,7 +1201,7 @@ mod tests {
     fn logged_paths_are_sanitized_of_control_characters() {
         let line = "GET /manifests/\u{1b}[31mhello-world\u{1b}[0m HTTP/1.1";
         let (method, path) = request_target(line);
-        let sanitized = crate::output::strip_control_chars(path);
+        let sanitized = output::strip_control_chars(path);
         assert!(
             !sanitized.contains('\u{1b}'),
             "no ESC may survive: {sanitized:?}"

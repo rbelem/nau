@@ -16,6 +16,7 @@ members = [
     "crates/nau-build",
     "crates/nau-image",
     "crates/nau-ship",
+    "crates/nau-peer",
 ]
 resolver = "2"
 
@@ -42,6 +43,9 @@ nau-image = { path = "crates/nau-image" }
 # The ship domain (issue #326 PR 4): the OCI registry client, the pull
 # reference grammar, the peer/static pull transport lane.
 nau-ship = { path = "crates/nau-ship" }
+# The peer domain (issue #326 PR 5): mDNS discovery, the read-only
+# serve surface, the static export lane.
+nau-peer = { path = "crates/nau-peer" }
 clap = { version = "4", features = ["derive"] }
 mlua = { version = "0.12", features = ["luau"] }
 miette = { version = "7", features = ["fancy"] }
@@ -80,17 +84,6 @@ tar = "0.4"
 xz2 = "0.1"
 libc = "0.2"
 clap_complete = "4"
-# LAN peer discovery (ADR-0033 Decisions 3+4, src/discovery.rs): the ONE
-# new runtime crate of the peer-sharing feature. mdns-sd is synchronous
-# pure Rust with no async-runtime dependency. Its transitive tree (from
-# `cargo tree -e normal -p mdns-sd` at 0.21.3): fastrand, flume
-# (+ futures-core, futures-sink, spin → lock_api → scopeguard), if-addrs,
-# log, mio, socket-pktinfo, socket2. Genuinely NEW units in the lock
-# (git diff Cargo.lock, `+name` lines): mdns-sd, flume, futures-sink,
-# if-addrs, mio, socket-pktinfo, socket2 — fastrand/futures-core/spin/
-# lock_api/scopeguard/log were already vendored via pgp/tempfile, and
-# libc only bumps. No tokio, no hyper.
-mdns-sd = "0.21"
 # libsecret source (ADR-0042 issue #185, src/secrets.rs): Secret Service
 # (gnome-keyring/kwalletd behind it) attribute lookups through
 # dbus-secret-service — the synchronous libdbus client, NO async runtime

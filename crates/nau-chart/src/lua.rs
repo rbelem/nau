@@ -16,7 +16,10 @@ pub type Outputs = HashMap<String, SnapMeta>;
 /// The serve address every default falls back to: loopback, because
 /// `/info` publishes the pod inventory to everyone who can reach the
 /// socket — binding wider is an explicit choice the operator types.
-pub const DEFAULT_SERVE_ADDRESS: &str = "127.0.0.1:7780";
+/// Moved DOWN into `nau_core::paths` (issue #326 PR 5); re-exported so
+/// the `node {}` handling and every `nau::lua::DEFAULT_SERVE_ADDRESS`
+/// path keep resolving.
+pub use nau_core::paths::DEFAULT_SERVE_ADDRESS;
 
 /// The `node {}` serving/pulling declaration, carried to Rust in the
 /// eval payload beside the snap outputs (`node` is a first-class field

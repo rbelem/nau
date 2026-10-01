@@ -5,7 +5,8 @@
 //!
 //! Discovery is never trust (ADR-0033 Decisions 3+7): an mDNS response
 //! is unauthenticated and raceable — it only yields `host:port` hints
-//! for [`crate::pull_ref`]; every manifest stays fail-closed on pull.
+//! for `nau pull` (the ship lane's `pull_ref` grammar); every manifest
+//! stays fail-closed on pull.
 //!
 //! Announcing uses a TXT record `nau=1` to version the protocol
 //! cheaply: browse accepts only instances whose value matches

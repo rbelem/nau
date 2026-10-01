@@ -31,6 +31,10 @@
 #   nau-ship   {nau-core, nau-infra}   — the ship domain (no dev-edge:
 #              the moved tests are RuntimeStore-fixture tests that stay
 #              root; nau-ship's own tests use core + infra only)
+#   nau-peer   {nau-core, nau-infra}   — the peer domain (discovery/
+#              serve/export; no dev-edge: the serve tests dropped the
+#              ship sha256 for the core cache key, and export tests
+#              build core literals)
 #   nau (root) exempt                  — the root composes everything
 set -euo pipefail
 
@@ -51,6 +55,7 @@ allowed_normal() {
         nau-build)  echo "nau-core nau-infra" ;;
         nau-image)  echo "nau-core nau-infra" ;;
         nau-ship)   echo "nau-core nau-infra" ;;
+        nau-peer)   echo "nau-core nau-infra" ;;
         *)          return 1 ;;
     esac
 }

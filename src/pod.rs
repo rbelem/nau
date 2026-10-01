@@ -85,8 +85,12 @@ use serde::{Deserialize, Serialize};
 use crate::lock::{LockFile, PodPackageLockEntry};
 use crate::snap::SnapMetaDigest;
 
-/// The implicit pod when no `--name` is given (`nau pod <verb>`).
-pub const DEFAULT_POD: &str = "default";
+// The pod path vocabulary (`DEFAULT_POD`, `pod_dir`, `validate_pod_name`,
+// `resolve_pod_dir_under`) moved DOWN into `nau_core::paths` (issue #326
+// PR 5) so the peer crate composes pods from names + roots without
+// importing this module. Re-exported so every `crate::pod::` path keeps
+// resolving; the env-reading `pod_root`/`pod_store` below stay root.
+pub use nau_core::paths::{pod_dir, resolve_pod_dir_under, validate_pod_name, DEFAULT_POD};
 
 /// The pod declaration file, inside the pod's state directory.
 pub const POD_FILE: &str = "pod.lua";
@@ -113,50 +117,6 @@ pub fn pod_root(explicit: Option<&str>) -> PathBuf {
         }
     };
     data_home.join("nau").join("pods")
-}
-
-/// One pod's state directory: `<root>/<name>` (holding `pod.lua`, the
-/// lockfile, and — in later tickets — generation links).
-pub fn pod_dir(root: &Path, pod_name: &str) -> PathBuf {
-    root.join(pod_name)
-}
-
-/// Validate a pod name: the name becomes a directory under the pod root
-/// AND reaches generated unit file names and `Description=` lines
-/// (ADR-0032 Decision 4), so besides being a single path-safe component
-/// it must not carry control characters or quotes (a newline would
-/// inject into the unit text; a quote breaks its quoting — issue #109
-/// S5).
-pub fn validate_pod_name(name: &str) -> miette::Result<()> {
-    if name.is_empty() {
-        miette::bail!("pod name must not be empty");
-    }
-    if name == "." || name == ".." {
-        miette::bail!("pod name '{name}' is not allowed");
-    }
-    if name.chars().any(|c| c == '/' || c == '\\') {
-        miette::bail!("pod name '{name}' must not contain path separators");
-    }
-    if name
-        .chars()
-        .any(|c| c.is_control() || c == '\'' || c == '"')
-    {
-        miette::bail!(
-            "pod name '{name}' must not contain control characters or quotes — the \
-             name reaches unit file names and unit descriptions verbatim"
-        );
-    }
-    Ok(())
-}
-
-/// Resolve a `--pod` param to `(name, pod dir)` under an explicit pod
-/// root — `default` when None, name validated per [`validate_pod_name`].
-/// Split from [`resolve_pod_dir`] so tests can point the root at a
-/// tempdir.
-pub fn resolve_pod_dir_under(root: &Path, pod: Option<&str>) -> miette::Result<(String, PathBuf)> {
-    let name = pod.unwrap_or(DEFAULT_POD);
-    validate_pod_name(name)?;
-    Ok((name.to_string(), pod_dir(root, name)))
 }
 
 /// [`resolve_pod_dir_under`] against the resolved [`pod_root`]: the one
