@@ -221,19 +221,11 @@ fn oracle_note(unit: &DaemonUnit) -> String {
 
 // ── Version-suffix lint (ADR-0047 D5, issue #260) ──
 
-/// Split a `<base><digits>` name into its base: `Some(base)` when the
-/// name ends in one or more ASCII digits and stripping them leaves a
-/// non-empty base, `None` otherwise (`node22` → `node`, `foo` → `None`,
-/// `22` → `None`, `foo2bar` → `None`). Shared with the farm collision
-/// vocabulary, which points at `name@constraint` for version-line pairs.
-pub fn split_version_suffix(name: &str) -> Option<&str> {
-    let base = name.trim_end_matches(|c: char| c.is_ascii_digit());
-    if base.is_empty() || base.len() == name.len() {
-        None
-    } else {
-        Some(base)
-    }
-}
+/// Split a `<base><digits>` name into its base — moved DOWN into
+/// `nau_core::snap_types` (issue #326 PR 6: the pod farm's collision
+/// classifier consumes it too); re-exported so the lint and every
+/// `nau_chart::lint::split_version_suffix` path keeps resolving.
+pub use nau_core::snap_types::split_version_suffix;
 
 /// The eval lint (ADR-0047 Decision 5, #260): warn when a package name
 /// matches `<base><digits>` AND its unsuffixed base is also in the

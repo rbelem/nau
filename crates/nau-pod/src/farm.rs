@@ -68,7 +68,8 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::runtime::{Generation, InstalledPackage, RuntimeStore};
+use nau_core::generation_view::StoreView;
+use nau_core::pkg_manifest::{Generation, InstalledPackage};
 
 /// The farm directory inside a generation: `<root>/generations/<n>/farm`.
 pub const FARM_DIR: &str = "farm";
@@ -139,17 +140,17 @@ const LOADER_LIB_SUBDIRS: [&str; 4] = [
 ];
 
 /// Path of generation `n`'s loader-lib list.
-pub fn loader_libs_path(store: &RuntimeStore, n: u64) -> PathBuf {
+pub fn loader_libs_path(store: &StoreView, n: u64) -> PathBuf {
     store.generation_dir(n).join(LOADER_LIBS_FILE)
 }
 
 /// Path of generation `n`'s recorded env object.
-pub fn env_path(store: &RuntimeStore, n: u64) -> PathBuf {
+pub fn env_path(store: &StoreView, n: u64) -> PathBuf {
     store.generation_dir(n).join(ENV_FILE)
 }
 
 /// Path of generation `n`'s recorded secret references.
-pub fn secrets_path(store: &RuntimeStore, n: u64) -> PathBuf {
+pub fn secrets_path(store: &StoreView, n: u64) -> PathBuf {
     store.generation_dir(n).join(SECRETS_FILE)
 }
 
@@ -160,7 +161,7 @@ pub fn secrets_path(store: &RuntimeStore, n: u64) -> PathBuf {
 /// ascending within a layer. Only dirs that exist in the freshly
 /// staged tree are recorded — the emit runs right after materialization,
 /// so the stat is authoritative and no manifest schema changes.
-pub fn loader_lib_dirs(store: &RuntimeStore, gen: &Generation) -> Vec<String> {
+pub fn loader_lib_dirs(store: &StoreView, gen: &Generation) -> Vec<String> {
     let extensions = store.generation_dir(gen.n).join("extensions");
     let mut dirs: Vec<(ClaimLayer, String, String)> = Vec::new();
     for pkg in layered_packages(gen) {
@@ -178,7 +179,7 @@ pub fn loader_lib_dirs(store: &RuntimeStore, gen: &Generation) -> Vec<String> {
 /// Record the generation's loader-lib dirs (issue #89). Written on
 /// every emit — including the empty case, so a re-emit of a generation
 /// that lost its lib payloads withdraws the stale list.
-fn record_loader_libs(store: &RuntimeStore, gen: &Generation) -> miette::Result<()> {
+fn record_loader_libs(store: &StoreView, gen: &Generation) -> miette::Result<()> {
     let path = loader_libs_path(store, gen.n);
     let mut body = String::new();
     for rel in loader_lib_dirs(store, gen) {
@@ -197,7 +198,7 @@ fn record_loader_libs(store: &RuntimeStore, gen: &Generation) -> miette::Result<
 /// object, withdrawing stale vars on re-emit — the same rule as the
 /// loader-lib list.
 pub fn write_generation_env(
-    store: &RuntimeStore,
+    store: &StoreView,
     n: u64,
     vars: &BTreeMap<String, String>,
 ) -> miette::Result<()> {
@@ -241,7 +242,7 @@ pub fn canonical_secrets_bytes(
 /// serialization path, so `secrets.rs` hashes the very bytes this
 /// records (the session-cache key can never disagree with the record).
 pub fn write_generation_secrets(
-    store: &RuntimeStore,
+    store: &StoreView,
     n: u64,
     refs: &BTreeMap<String, crate::pod::SecretSource>,
 ) -> miette::Result<()> {
@@ -268,7 +269,7 @@ pub fn write_generation_secrets(
 /// `env.json` reader's rule. A corrupt object fails loud — trusted
 /// data, never a silently wrong reference set at serve time.
 pub fn read_generation_secrets(
-    store: &RuntimeStore,
+    store: &StoreView,
     n: u64,
 ) -> miette::Result<BTreeMap<String, crate::pod::SecretSource>> {
     let path = secrets_path(store, n);
@@ -301,12 +302,12 @@ pub use nau_core::pkg_manifest::AppAssembly;
 pub use nau_core::pkg_manifest::ClaimLayer;
 
 /// The generation's assembly area: `<root>/generations/<n>/apps`.
-pub fn assembly_dir(store: &RuntimeStore, n: u64) -> PathBuf {
+pub fn assembly_dir(store: &StoreView, n: u64) -> PathBuf {
     store.generation_dir(n).join(ASSEMBLY_DIR)
 }
 
 /// One package's assembly subtree root: `<root>/generations/<n>/apps/<pkg>`.
-pub fn package_assembly_dir(store: &RuntimeStore, n: u64, pkg: &str) -> PathBuf {
+pub fn package_assembly_dir(store: &StoreView, n: u64, pkg: &str) -> PathBuf {
     assembly_dir(store, n).join(pkg)
 }
 
@@ -314,7 +315,7 @@ pub fn package_assembly_dir(store: &RuntimeStore, n: u64, pkg: &str) -> PathBuf 
 /// the generation's assembly subtree, whose directory holds the
 /// recorded siblings. `nau run` execs this path for multi-file
 /// apps so relative-to-executable resolution finds the siblings.
-pub fn assembly_bin_path(store: &RuntimeStore, n: u64, pkg: &str, asm: &AppAssembly) -> PathBuf {
+pub fn assembly_bin_path(store: &StoreView, n: u64, pkg: &str, asm: &AppAssembly) -> PathBuf {
     package_assembly_dir(store, n, pkg).join(&asm.binary)
 }
 
@@ -367,9 +368,9 @@ fn is_version_line_pair(winner: &str, loser: &str) -> bool {
     if winner == loser {
         return true;
     }
-    match crate::lint::split_version_suffix(winner) {
+    match nau_core::snap_types::split_version_suffix(winner) {
         Some(base) => base == loser,
-        None => crate::lint::split_version_suffix(loser) == Some(winner),
+        None => nau_core::snap_types::split_version_suffix(loser) == Some(winner),
     }
 }
 
@@ -395,22 +396,22 @@ fn coexistence_hint(winner: &str, loser: &str) -> Option<String> {
 pub fn warn_emit_collision(kind: &str, id: &str, winner: &str, loser: &str, same_layer: bool) {
     let hint = coexistence_hint(winner, loser);
     if same_layer {
-        crate::output::warn(format!(
+        nau_infra::output::warn(format!(
             "{kind} '{id}' is shipped by both '{winner}' and '{loser}' at the same \
              precedence (pre-composition manifest) — '{winner}' wins deterministically"
         ));
     } else {
-        crate::output::warn(format!(
+        nau_infra::output::warn(format!(
             "{kind} '{id}' from '{winner}' overrides '{loser}' (higher layer wins)"
         ));
     }
     if let Some(hint) = hint {
-        crate::output::warn(hint);
+        nau_infra::output::warn(hint);
     }
 }
 
 /// Farm directory of generation `n`.
-pub fn farm_dir(store: &RuntimeStore, n: u64) -> PathBuf {
+pub fn farm_dir(store: &StoreView, n: u64) -> PathBuf {
     store.generation_dir(n).join(FARM_DIR)
 }
 
@@ -419,7 +420,10 @@ pub fn farm_dir(store: &RuntimeStore, n: u64) -> PathBuf {
 /// component would write the symlink outside the farm. Refuse named.
 /// Also the shared validator for the sideload precheck (issue #150),
 /// which must refuse the same names zero-write before any install.
-pub(crate) fn check_farm_link_name(kind: &str, name: &str, pkg: &str) -> miette::Result<()> {
+/// Pub for the root pod module's `--pod` validation (a pod name is a
+/// farm-link name component); helper, not API surface.
+#[doc(hidden)]
+pub fn check_farm_link_name(kind: &str, name: &str, pkg: &str) -> miette::Result<()> {
     if name.starts_with('/') || name.split('/').any(|c| c == "..") {
         miette::bail!(
             "package '{pkg}': {kind} name '{name}' is not a bare name — refusing \
@@ -438,7 +442,7 @@ pub(crate) fn check_farm_link_name(kind: &str, name: &str, pkg: &str) -> miette:
 /// warning; a same-precedence duplicate (only possible in pre-#8
 /// manifests) warns and resolves deterministically by package name.
 /// Cross-layer shadowing is never silent.
-pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<PathBuf> {
+pub fn emit(store: &StoreView, gen: &Generation) -> miette::Result<PathBuf> {
     let farm = farm_dir(store, gen.n);
     if farm.exists() {
         std::fs::remove_dir_all(&farm)
@@ -541,11 +545,10 @@ pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<PathBuf> {
     // no apps, so without this their payloads would sit inert in the
     // store — the user-level fonts dir is their activation seam.
     crate::fonts::emit(store, gen)?;
-    // And the service surface (ADR-0032, issue #106): rendered from the
-    // generation's recorded `units.json` alone, so a rollback's re-emit
-    // (this same call path) restores the target generation's link set
-    // without any declaration context.
-    crate::services::emit(store, gen)?;
+    // The service surface (ADR-0032, issue #106) chains at the ROOT
+    // emit orchestrator (`emit_pod_surfaces`): the systemd unit
+    // actuation vocabulary is root-runtime-coupled (`RuntimeTools`), so
+    // the services emitter stayed root (issue #326 PR 6).
     // And the loader-lib list (issue #89): the generation's payload lib
     // dirs, consumed by the LD wrappers written above (issue #110,
     // ADR-0034) and by `nau run`'s pod-scoped env overlay. The file
@@ -567,7 +570,7 @@ pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<PathBuf> {
 /// silent. Like every farm entry in a lib-shipping generation, each
 /// shim is an LD wrapper over the payload copy.
 fn emit_cargo_subcommand_shims<'a>(
-    store: &RuntimeStore,
+    store: &StoreView,
     n: u64,
     pkg: &'a InstalledPackage,
     asm: &'a AppAssembly,
@@ -618,7 +621,7 @@ fn emit_cargo_subcommand_shims<'a>(
 /// the complete `usr/lib` tree the bin-only assembly lacks), the
 /// assembly subtree's hardlinked leaf as fallback.
 fn shim_target_rel(
-    store: &RuntimeStore,
+    store: &StoreView,
     n: u64,
     pkg_name: &str,
     asm: &AppAssembly,
@@ -642,7 +645,7 @@ fn shim_target_rel(
 
 /// Reset the generation's assembly area wholesale (issue #37): the emit
 /// is a full rebuild, so stale packages' subtrees never accumulate.
-fn reset_assembly(store: &RuntimeStore, n: u64) -> miette::Result<()> {
+fn reset_assembly(store: &StoreView, n: u64) -> miette::Result<()> {
     let dir = assembly_dir(store, n);
     if dir.exists() {
         std::fs::remove_dir_all(&dir)
@@ -653,7 +656,7 @@ fn reset_assembly(store: &RuntimeStore, n: u64) -> miette::Result<()> {
 
 /// Path of generation `n`'s LD-wrapper area (issue #110):
 /// `generations/<n>/ld-wrappers`.
-fn ld_wrappers_dir(store: &RuntimeStore, n: u64) -> PathBuf {
+fn ld_wrappers_dir(store: &StoreView, n: u64) -> PathBuf {
     store.generation_dir(n).join(LD_WRAPPERS_DIR)
 }
 
@@ -661,7 +664,7 @@ fn ld_wrappers_dir(store: &RuntimeStore, n: u64) -> PathBuf {
 /// same full-rebuild rule as [`reset_assembly`], so a generation that
 /// lost its lib payloads (or an older emit's wrappers for renamed
 /// apps) never leaves stale wrappers behind.
-fn reset_ld_wrappers(store: &RuntimeStore, n: u64) -> miette::Result<()> {
+fn reset_ld_wrappers(store: &StoreView, n: u64) -> miette::Result<()> {
     let dir = ld_wrappers_dir(store, n);
     if dir.exists() {
         std::fs::remove_dir_all(&dir)
@@ -685,7 +688,7 @@ fn reset_ld_wrappers(store: &RuntimeStore, n: u64) -> miette::Result<()> {
 /// process, and whatever ambient `LD_LIBRARY_PATH` the caller carried
 /// stops at the wrapper (#110).
 fn write_ld_wrapper(
-    store: &RuntimeStore,
+    store: &StoreView,
     n: u64,
     app: &str,
     real_target: &str,
@@ -743,7 +746,7 @@ fn write_ld_wrapper(
 /// `nau run`, which performs its own assembly resolution). A
 /// single-binary app keeps the unchanged direct store link.
 fn entry_target_rel(
-    store: &RuntimeStore,
+    store: &StoreView,
     n: u64,
     pkg: &InstalledPackage,
     app: &str,
@@ -809,7 +812,7 @@ fn store_blob_rel(hash: &str) -> String {
 /// `/proc/self/exe` back onto the lone store blob and the siblings
 /// would be lost again.
 fn build_assembly(
-    store: &RuntimeStore,
+    store: &StoreView,
     n: u64,
     pkg: &str,
     binary_hash: &str,
@@ -861,7 +864,7 @@ fn build_assembly(
 /// Hardlink one store blob into the assembly subtree at `dest`.
 /// Cross-device (EXDEV) is a loud fail-closed error, mirroring the
 /// extension-tree rule: the state root lives on ONE filesystem.
-fn hardlink_assembly_blob(store: &RuntimeStore, dest: &Path, sha256: &str) -> miette::Result<()> {
+fn hardlink_assembly_blob(store: &StoreView, dest: &Path, sha256: &str) -> miette::Result<()> {
     let parent = dest
         .parent()
         .ok_or_else(|| miette::miette!("assembly path {} has no parent", dest.display()))?;
@@ -950,21 +953,30 @@ pub fn current_generation(pod_dir: &Path) -> miette::Result<Option<u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nau_core::blob_store::BlobStore;
     use std::collections::BTreeMap;
 
-    fn store_fixture(dir: &Path) -> RuntimeStore {
+    /// The crate-side fixture for a pod state root: the view over it
+    /// with the paired `<state-root>/store` blob store.
+    fn store_view(root: impl Into<std::path::PathBuf>) -> StoreView {
+        let root = root.into();
+        let blobs = BlobStore::new(root.join("store"));
+        StoreView::new(root, blobs)
+    }
+
+    fn store_fixture(dir: &Path) -> StoreView {
         // The documented pod layout `<data-home>/nau/pods/<pod>`:
         // the launcher emitter derives its user-level surface from this
         // shape, so a nested fixture root keeps every write inside the
         // test's tempdir without touching the environment.
-        RuntimeStore::new(dir.join("nau/pods/default"))
+        store_view(dir.join("nau/pods/default"))
     }
 
     fn gen_with_apps(n: u64, pkg: &str, apps: &[(&str, &str)]) -> Generation {
         let mut packages = BTreeMap::new();
         packages.insert(
             pkg.to_string(),
-            crate::runtime::InstalledPackage {
+            InstalledPackage {
                 name: pkg.to_string(),
                 version: "1.0".into(),
                 revision: 1,
@@ -1008,7 +1020,7 @@ mod tests {
         let mut packages = BTreeMap::new();
         packages.insert(
             pkg.to_string(),
-            crate::runtime::InstalledPackage {
+            InstalledPackage {
                 name: pkg.to_string(),
                 version: "1.0".into(),
                 revision: 1,
@@ -1026,8 +1038,8 @@ mod tests {
                     .map(|(a, h)| (a.to_string(), h.to_string()))
                     .collect(),
                 assembly: BTreeMap::new(),
-                confined: Some(crate::snap::Confinement {
-                    backend: crate::snap::BackendKind::Bwrap,
+                confined: Some(nau_core::snap_types::Confinement {
+                    backend: nau_core::snap_types::BackendKind::Bwrap,
                     filesystem: vec!["write".into()],
                     network: false,
                     sockets: vec![],
@@ -1104,7 +1116,7 @@ mod tests {
         std::fs::write(&blob, b"daemon").unwrap();
 
         let mut packages = BTreeMap::new();
-        let mut pkg = crate::runtime::InstalledPackage {
+        let mut pkg = InstalledPackage {
             name: "valkey".to_string(),
             version: "1.0".into(),
             revision: 1,
@@ -1127,7 +1139,7 @@ mod tests {
         pkg.service_bins
             .insert("valkey".to_string(), hash.to_string());
         packages.insert(pkg.name.clone(), pkg);
-        let gen = crate::runtime::Generation {
+        let gen = Generation {
             n: 1,
             base_version: "24.04".into(),
             packages,
@@ -1210,7 +1222,7 @@ mod tests {
 
     // ── Issue #7: desktop launchers beside the farm ──
 
-    use crate::runtime::{DesktopIcon, DesktopLauncher};
+    use nau_core::pkg_manifest::{DesktopIcon, DesktopLauncher};
 
     fn launcher(name: &str, categories: &[&str], icon: Option<DesktopIcon>) -> DesktopLauncher {
         DesktopLauncher {
@@ -1232,7 +1244,7 @@ mod tests {
         let mut packages = BTreeMap::new();
         packages.insert(
             pkg.to_string(),
-            crate::runtime::InstalledPackage {
+            InstalledPackage {
                 name: pkg.to_string(),
                 version: "1.0".into(),
                 revision: 1,
@@ -1413,7 +1425,7 @@ mod tests {
         let mut packages = BTreeMap::new();
         packages.insert(
             pkg.to_string(),
-            crate::runtime::InstalledPackage {
+            InstalledPackage {
                 name: pkg.to_string(),
                 version: "1.0".into(),
                 revision: 1,
@@ -1447,7 +1459,7 @@ mod tests {
 
     /// Store a blob with explicit mode (the exec test needs an
     /// executable binary blob).
-    fn write_blob(store: &RuntimeStore, hash: &str, content: &[u8], mode: u32) {
+    fn write_blob(store: &StoreView, hash: &str, content: &[u8], mode: u32) {
         use std::os::unix::fs::PermissionsExt;
         let blob = store.blob_path(hash);
         std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
@@ -1731,7 +1743,7 @@ mod tests {
         for (name, layer) in pkgs {
             packages.insert(
                 name.to_string(),
-                crate::runtime::InstalledPackage {
+                InstalledPackage {
                     name: name.to_string(),
                     version: "1.0".into(),
                     revision: 1,
@@ -1762,7 +1774,7 @@ mod tests {
         }
     }
 
-    fn materialize_ext_dir(store: &RuntimeStore, n: u64, pkg: &str, sub: &str) {
+    fn materialize_ext_dir(store: &StoreView, n: u64, pkg: &str, sub: &str) {
         let dir = store
             .generation_dir(n)
             .join("extensions")

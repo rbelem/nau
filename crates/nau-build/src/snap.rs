@@ -3333,25 +3333,12 @@ fn ro_bind_if_exists(cmd: &mut std::process::Command, path: &str) {
     }
 }
 
-/// Host path roots bound read-only into the build sandbox (see
-/// [`bind_system_ro_paths`]). This is the sandbox's entire view of the host
-/// filesystem apart from the resolver/trust files of
-/// [`SANDBOX_ETC_RO_PATHS`]: a build tool resolves inside the sandbox only
-/// if its PATH entry lives under one of these roots. Entries elsewhere (e.g. a
-/// project's `.devbox` profile dir) are invisible to sandboxed builds, and
-/// a `nix store` garbage collection can delete `/nix/store` paths a stale
-/// shell still exports — both turn a working host setup into an obscure
-/// mid-build failure. Doctor and the sandboxed build runner resolve tools
-/// against this same list so that failure mode becomes a named pre-flight
-/// diagnostic instead.
-pub const SANDBOX_RO_ROOTS: [&str; 6] = [
-    "/usr",
-    "/lib",
-    "/lib64",
-    "/nix",
-    "/bin",
-    "/run/current-system",
-];
+/// Host path roots bound read-only into the build sandbox — moved DOWN
+/// into `nau_core::snap_types` (issue #326 PR 6: the confinement
+/// backend consumes the same roots); re-exported so every
+/// `nau_build::snap::SANDBOX_RO_ROOTS` path (and the root
+/// `crate::snap::` glob) keeps resolving.
+pub use nau_core::snap_types::SANDBOX_RO_ROOTS;
 
 /// Name-resolution and CA-trust paths bound read-only into the build
 /// sandbox (issue #176), on top of [`SANDBOX_RO_ROOTS`]. The FHS roots

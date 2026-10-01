@@ -19,7 +19,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::snap::{BackendKind, Confinement, SANDBOX_RO_ROOTS};
+use nau_core::generation_view::StoreView;
+use nau_core::pkg_manifest::{Generation, InstalledPackage};
+use nau_core::snap_types::{BackendKind, Confinement, SANDBOX_RO_ROOTS};
 
 /// Run `app` from a pod confined per its declared grants (ticket #11).
 ///
@@ -38,7 +40,8 @@ use crate::snap::{BackendKind, Confinement, SANDBOX_RO_ROOTS};
 /// the generation's declared env (ADR-0030): declared replaces
 /// inherited, undeclared passes through.
 pub fn run(pod_dir: &Path, pod_name: &str, app: &str, args: &[String]) -> miette::Result<()> {
-    let store = crate::runtime::RuntimeStore::new(pod_dir.to_path_buf());
+    let blobs = nau_core::blob_store::BlobStore::new(pod_dir.join("store"));
+    let store = StoreView::new(pod_dir.to_path_buf(), blobs);
     let gen = store.active_generation()?.ok_or_else(|| {
         miette::miette!("pod '{pod_name}' has no active generation — nothing to run for '{app}'")
     })?;
@@ -126,10 +129,10 @@ pub fn run(pod_dir: &Path, pod_name: &str, app: &str, args: &[String]) -> miette
 /// leaf in the generation's assembly subtree when the package records a
 /// sibling assembly for the app, else the lone content blob.
 fn exec_target(
-    store: &crate::runtime::RuntimeStore,
+    store: &StoreView,
     gen_n: u64,
     pkg_name: &str,
-    pkg: &crate::runtime::InstalledPackage,
+    pkg: &InstalledPackage,
     app: &str,
     real_hash: &str,
 ) -> PathBuf {
@@ -142,9 +145,9 @@ fn exec_target(
 /// Locate the installed package providing `app` and the real command
 /// binary hash `nau run` should exec.
 fn resolve_app<'a>(
-    gen: &'a crate::runtime::Generation,
+    gen: &'a Generation,
     app: &str,
-) -> Option<(&'a str, &'a crate::runtime::InstalledPackage, &'a str)> {
+) -> Option<(&'a str, &'a InstalledPackage, &'a str)> {
     for (name, pkg) in &gen.packages {
         if let Some(hash) = pkg.apps.get(app) {
             return Some((name, pkg, hash));
@@ -214,7 +217,7 @@ fn resolve_command_in(name: &str, entries: &[PathBuf]) -> miette::Result<PathBuf
     if name.contains('/') {
         return Ok(PathBuf::from(name));
     }
-    crate::snap::resolve_in_path(name, entries).ok_or_else(|| {
+    nau_infra::pathsearch::resolve_in_path(name, entries).ok_or_else(|| {
         miette::miette!(
             "command '{name}' not found in the pod's farm ({}), or PATH — \
              add the package that provides it to the pod \
@@ -295,7 +298,7 @@ fn run_bwrap(
 ) -> miette::Result<()> {
     // Floor-tool seam (issue #101): bwrap resolves provisioned-first with
     // PATH fallback; a tool error still fails closed.
-    let bwrap = crate::tools::resolve(crate::tools::ToolName::Bwrap).map_err(|_| {
+    let bwrap = nau_infra::tools::resolve(nau_infra::tools::ToolName::Bwrap).map_err(|_| {
         miette::miette!(
             "confined app '{app}' uses the bwrap backend, but bubblewrap is not \
              available on this host (no provisioned set and none on PATH) — refusing \
@@ -305,8 +308,8 @@ fn run_bwrap(
         )
     })?;
     let bwrap = match bwrap {
-        crate::tools::ResolvedTool::Provisioned { path, .. }
-        | crate::tools::ResolvedTool::Path { path, .. } => path,
+        nau_infra::tools::ResolvedTool::Provisioned { path, .. }
+        | nau_infra::tools::ResolvedTool::Path { path, .. } => path,
     };
     if !userns_available() {
         return Err(miette::miette!(
@@ -836,7 +839,11 @@ mod tests {
     #[test]
     fn exec_target_prefers_the_assembly_leaf_for_multifile_apps() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = crate::runtime::RuntimeStore::new(tmp.path().to_path_buf());
+        let store = {
+            let root = tmp.path().to_path_buf();
+            let blobs = nau_core::blob_store::BlobStore::new(root.join("store"));
+            StoreView::new(root, blobs)
+        };
         let asm = crate::farm::AppAssembly {
             binary: "usr/bin/gcm".into(),
             files: [("libSkiaSharp.so".to_string(), "cc33".to_string())]
@@ -844,7 +851,7 @@ mod tests {
                 .collect(),
             links: BTreeMap::new(),
         };
-        let mut pkg = crate::runtime::InstalledPackage {
+        let mut pkg = InstalledPackage {
             name: "git-credential-manager".into(),
             version: "1.0".into(),
             revision: 1,
@@ -895,7 +902,7 @@ mod tests {
         let gen_dir = dir.join("generations").join(generation.to_string());
         let farm = gen_dir.join("farm");
         std::fs::create_dir_all(&farm).unwrap();
-        let gen = crate::runtime::Generation {
+        let gen = Generation {
             n: generation,
             base_version: "24.04".into(),
             packages: BTreeMap::new(),

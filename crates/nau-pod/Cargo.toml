@@ -1,0 +1,52 @@
+[package]
+name = "nau-pod"
+version = "0.1.0"
+edition = "2021"
+description = "nau's pod domain: the bin farm + launcher/font/unit emit family, the `nau run` confinement backend, secret resolution, and the pod grammar's pure halves (ADR-0051, ADR-0053)"
+license = "GPL-3.0-only"
+
+[dependencies]
+# The spine (ADR-0051 Decision 3): snap value types, the install
+# records, the pod layout grammar, the lockfile, the generation/store
+# view, the blob-store seam.
+nau-core = { path = "../nau-core" }
+# The mechanism leaf (issue #326): tool provisioning (the bwrap
+# resolver), terminal presentation (farm collision warnings), the
+# bounded-timeout constants (the vault provider's fetch windows).
+nau-infra = { path = "../nau-infra" }
+# Error vocabulary (unified with the root's fancy feature).
+miette = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# secrets.rs: sha256 over the canonical reference bytes — the cache key
+# (a reference change is a fresh cache path, ADR-0042 D3).
+sha2 = "0.10"
+# secrets.rs: the atomic 0600 cache/envfile writes stage through a
+# same-directory NamedTempFile + rename (the D3 durability shape).
+tempfile = "3"
+# confine.rs: the euid gate (unprivileged user namespaces are root-only
+# to create); farm.rs: the EXDEV errno the farm's rename fallback
+# specializes on (issue #213's link-count sibling).
+libc = "0.2"
+# secrets.rs vault provider (ADR-0042): native HTTPS for
+# `GET /v1/{mount}/data/{path}` — the provider must not depend on the
+# curl it may itself be serving. rustls TLS (`tls` feature, webpki roots
+# bundled — no reliance on the host trust store); the gzip/json/charset
+# defaults are dead weight for one JSON body — off. Same spec the root
+# carried for this call site.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+# secrets.rs libsecret source (ADR-0042 issue #185): Secret Service
+# (gnome-keyring/kwalletd behind it) attribute lookups through
+# dbus-secret-service — the synchronous libdbus client, NO async runtime
+# in this tree. search_items() over the declared attributes map is the
+# exact `secret-tool lookup <pairs>` surface. Sync D-Bus only; features:
+# `crypto-rust` picks the pure-Rust DH session crypto (no OpenSSL
+# linkage); `vendored` builds libdbus from source — no host needs
+# libdbus-1.dev on its pkg-config path, and the gate pod env stays
+# untouched (tests never touch the bus; the lookup sits behind the seam
+# in secrets.rs).
+dbus-secret-service = { version = "4", features = ["crypto-rust", "vendored"] }
+
+[dev-dependencies]
+# secrets/desktop/farm fixtures stage pod stores and cache dirs.
+tempfile = "3"

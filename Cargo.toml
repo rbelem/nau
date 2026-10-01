@@ -17,6 +17,7 @@ members = [
     "crates/nau-image",
     "crates/nau-ship",
     "crates/nau-peer",
+    "crates/nau-pod",
 ]
 resolver = "2"
 
@@ -46,6 +47,10 @@ nau-ship = { path = "crates/nau-ship" }
 # The peer domain (issue #326 PR 5): mDNS discovery, the read-only
 # serve surface, the static export lane.
 nau-peer = { path = "crates/nau-peer" }
+# The pod domain (issue #326 PR 6): the bin farm + launcher/font emit
+# family, the `nau run` confinement backend, secret resolution, and the
+# pod grammar's pure halves.
+nau-pod = { path = "crates/nau-pod" }
 clap = { version = "4", features = ["derive"] }
 mlua = { version = "0.12", features = ["luau"] }
 miette = { version = "7", features = ["fancy"] }
@@ -84,27 +89,6 @@ tar = "0.4"
 xz2 = "0.1"
 libc = "0.2"
 clap_complete = "4"
-# libsecret source (ADR-0042 issue #185, src/secrets.rs): Secret Service
-# (gnome-keyring/kwalletd behind it) attribute lookups through
-# dbus-secret-service — the synchronous libdbus client, NO async runtime
-# in this tree (the ADR's "keyring crate" wording is superseded: keyring
-# 3.x cannot search by attributes — its schema is hardcoded
-# service/user/target — and its async Secret Service backend drags in
-# tokio). search_items() over the declared attributes map is the exact
-# `secret-tool lookup <pairs>` surface the survey names. Sync D-Bus only:
-# the session bus is the workstation-only caveat (survey §2) — headless
-# hosts fail named, never partially. Features: `crypto-rust` picks the
-# pure-Rust DH session crypto (no OpenSSL linkage); `vendored` builds
-# libdbus from source — no host needs libdbus-1.dev on its pkg-config
-# path, and the gate pod env stays untouched (tests never touch the
-# bus; the lookup sits behind the seam in src/secrets.rs).
-dbus-secret-service = { version = "4", features = ["crypto-rust", "vendored"] }
-# Floor-tool self-provisioning (issue #101 disposition (c), src/tools.rs):
-# native HTTPS for fetching pinned tool binaries — the provisioner must not
-# depend on the curl it provisions. rustls TLS (`tls` feature, webpki roots
-# bundled — no reliance on the host trust store); the gzip/json/charset
-# defaults are dead weight for streaming raw binaries — off.
-ureq = { version = "2", default-features = false, features = ["tls"] }
 
 [profile.release]
 # The image build embeds this binary into every image it builds at
@@ -114,6 +98,9 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 strip = true
 
 [dev-dependencies]
+# The live-D-Bus gated secrets test (NAU_SECRETS_LIVE_DBUS=1) drives the
+# real Secret Service client; the provider itself lives in nau-pod.
+dbus-secret-service = { version = "4", features = ["crypto-rust", "vendored"] }
 # Dependency-fetch integration tests (issue #13): compute npm SRI
 # integrity and wheel hashes for the loopback registry fixtures.
 sha2 = "0.10"

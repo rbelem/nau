@@ -229,7 +229,7 @@ pub fn record(
     pod_overrides: &BTreeMap<String, BTreeMap<String, serde_json::Value>>,
     secrets_envfile: Option<&str>,
 ) -> miette::Result<()> {
-    let pod = crate::desktop::pod_name(store)?;
+    let pod = crate::desktop::pod_name(&store.store_view())?;
     record_in(store, gen, pod_overrides, &pod, secrets_envfile)
 }
 
@@ -246,8 +246,8 @@ pub fn record_in(
         pod,
         home: &std::env::var("HOME").unwrap_or_else(|_| ".".into()),
         extensions: current.join("extensions").to_string_lossy().into_owned(),
-        gen_env: read_generation_env(&crate::farm::env_path(store, gen.n))?,
-        loader_libs: crate::farm::loader_lib_dirs(store, gen),
+        gen_env: read_generation_env(&crate::farm::env_path(&store.store_view(), gen.n))?,
+        loader_libs: crate::farm::loader_lib_dirs(&store.store_view(), gen),
         current: current.to_string_lossy().into_owned(),
         // ADR-0042 D3 (issue #184): the pod's 0600 runtime envfile,
         // derived from the references' decl-hash alone — record bakes
@@ -745,7 +745,7 @@ pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<()> {
             return Ok(());
         }
     }
-    let pod = crate::desktop::pod_name(store)?;
+    let pod = crate::desktop::pod_name(&store.store_view())?;
     emit_in(store, gen, &user_systemd_unit_dir(), &pod)
 }
 
@@ -877,7 +877,7 @@ fn withdraw_stale_services(
 /// Withdraw ALL of this pod's user-level unit links (the `desktop::clear`
 /// analog; the generation's own `services/` dir is left for the GC).
 pub fn clear(store: &RuntimeStore) -> miette::Result<()> {
-    let pod = crate::desktop::pod_name(store)?;
+    let pod = crate::desktop::pod_name(&store.store_view())?;
     withdraw_stale_services(&user_systemd_unit_dir(), &pod, &BTreeSet::new())
 }
 
@@ -1920,7 +1920,7 @@ mod tests {
         // emit presents them before `record` runs.
         std::fs::create_dir_all(store.generation_dir(1)).unwrap();
         crate::farm::write_generation_env(
-            &store,
+            &store.store_view(),
             1,
             &[("EDITOR".to_string(), "vi".to_string())]
                 .into_iter()

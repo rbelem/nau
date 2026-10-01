@@ -39,7 +39,8 @@
 
 use std::collections::BTreeSet;
 
-use crate::runtime::{DesktopLauncher, Generation, RuntimeStore};
+use nau_core::generation_view::StoreView;
+use nau_core::pkg_manifest::{DesktopLauncher, Generation};
 
 /// The launcher directory inside a generation: `<root>/generations/<n>/
 /// launchers`. The bin farm's sibling (issue #7; the farm keeps its own
@@ -99,7 +100,10 @@ fn documented_layout_data_home(root: &std::path::Path) -> Option<&std::path::Pat
 }
 
 /// The pod name behind a store: the last component of its root path.
-pub(crate) fn pod_name(store: &RuntimeStore) -> miette::Result<String> {
+/// The pod name a state root carries (the root services emitter's
+/// unit text names it). Shared emit helper, not API surface.
+#[doc(hidden)]
+pub fn pod_name(store: &StoreView) -> miette::Result<String> {
     store
         .root()
         .file_name()
@@ -116,7 +120,7 @@ pub fn icon_name(pod: &str, app_id: &str) -> String {
 }
 
 /// The launcher directory of generation `n`.
-pub fn launchers_dir(store: &RuntimeStore, n: u64) -> std::path::PathBuf {
+pub fn launchers_dir(store: &StoreView, n: u64) -> std::path::PathBuf {
     store.generation_dir(n).join(LAUNCHERS_DIR)
 }
 
@@ -127,7 +131,7 @@ pub fn launchers_dir(store: &RuntimeStore, n: u64) -> std::path::PathBuf {
 ///
 /// The user-level surface is redirected through [`user_data_home`]; use
 /// [`emit_in`] for an explicit data home (tests).
-pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<std::path::PathBuf> {
+pub fn emit(store: &StoreView, gen: &Generation) -> miette::Result<std::path::PathBuf> {
     let data_home = user_data_home(store.root());
     let pod = pod_name(store)?;
     emit_in(store, gen, &data_home, &pod)
@@ -139,7 +143,7 @@ pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<std::path:
 /// points at a tempdir). `pod` is threaded in (rather than re-derived) so
 /// callers that already know the pod name don't re-read the store root.
 pub fn emit_in(
-    store: &RuntimeStore,
+    store: &StoreView,
     gen: &Generation,
     data_home: &std::path::Path,
     pod: &str,
@@ -306,12 +310,12 @@ fn keep_any(keep: &BTreeSet<String>, id_ext: &str) -> bool {
 /// generation's own `launchers/` directory is left in place (the store's
 /// GC frees it with the generation); only the user-level surface is
 /// withdrawn. Missing links are no-ops.
-pub fn clear(store: &RuntimeStore) -> miette::Result<()> {
+pub fn clear(store: &StoreView) -> miette::Result<()> {
     clear_in(store, &user_data_home(store.root()))
 }
 
 /// [`clear`] with an explicit data home.
-pub fn clear_in(store: &RuntimeStore, data_home: &std::path::Path) -> miette::Result<()> {
+pub fn clear_in(store: &StoreView, data_home: &std::path::Path) -> miette::Result<()> {
     let pod = pod_name(store)?;
     withdraw_stale(
         &user_applications_dir(data_home),
@@ -325,7 +329,11 @@ pub fn clear_in(store: &RuntimeStore, data_home: &std::path::Path) -> miette::Re
 /// Symlink `dest` to `src`, replacing any existing file/link at `dest`.
 /// Creating the same link again (a re-emit) is idempotent; a link to a
 /// different target is replaced.
-pub(crate) fn link_or_replace(src: &std::path::Path, dest: &std::path::Path) -> miette::Result<()> {
+/// Atomically (re)point `dest` at `src`: remove + symlink. Shared emit
+/// helper (the root services emitter's unit surface uses it too), not
+/// API surface.
+#[doc(hidden)]
+pub fn link_or_replace(src: &std::path::Path, dest: &std::path::Path) -> miette::Result<()> {
     let _ = std::fs::remove_file(dest);
     std::os::unix::fs::symlink(src, dest)
         .map_err(|e| miette::miette!("linking {} -> {}: {e}", dest.display(), src.display()))?;
@@ -1010,7 +1018,7 @@ mod tests {
             comment: Some("Example interface".into()),
             categories: vec!["Graphics".into(), "Viewer".into()],
             icon_ref: None,
-            icon: Some(crate::runtime::DesktopIcon {
+            icon: Some(nau_core::pkg_manifest::DesktopIcon {
                 sha256: "abc".into(),
                 ext: "png".into(),
             }),
