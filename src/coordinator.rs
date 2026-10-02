@@ -780,6 +780,14 @@ pub fn plan_node_job(
     // members).
     let mut deps = Vec::new();
     for dep in crate::deps::resolve_dep_names(&[name.to_string()], true)? {
+        // The walk seeds with the node itself and pushes every popped
+        // seed — including this node. Its own payload cannot pre-exist
+        // (the job builds it), so a self-edge makes manifest_for demand
+        // the output as input and refuse every cold dispatch (#309
+        // window 10). The node is not its own dependency.
+        if dep == name {
+            continue;
+        }
         let dep_meta = match crate::deps::load_meta(&dep) {
             Ok(m) => m,
             Err(e) => miette::bail!("farm job: dep '{dep}' of '{name}': {e:#}"),
