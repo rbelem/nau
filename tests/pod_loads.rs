@@ -846,3 +846,249 @@ gated_test!(
         );
     }
 );
+
+// ── Held-pin elimination (issue #331): zero store routes on a no-op ──
+
+/// A `curl` shim that logs every invocation and FAILS: a sync under
+/// this PATH cannot make a single network route without (a) the log
+/// recording it and (b) the sync exiting nonzero. The empty log plus a
+/// zero exit IS the zero-routes proof.
+fn curl_shim(log: &Path) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let shim = dir.path().join("curl");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 1\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    (dir, shim)
+}
+
+/// [`run_named`] with `dir` PREPENDED to PATH (the curl shim's dir) and
+/// `CURLOPT_LOG` pointing at the shim's log.
+fn run_with_shim(
+    project: &Path,
+    root: &Path,
+    pod: &str,
+    args: &[&str],
+    shim_dir: &Path,
+    log: &Path,
+) -> (Option<i32>, String, String) {
+    let path = std::env::var("PATH").unwrap_or_default();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
+    cmd.arg("pod");
+    if !pod.is_empty() {
+        cmd.arg("--name").arg(pod);
+    }
+    cmd.args(args).arg("--root").arg(root);
+    cmd.current_dir(project);
+    cmd.env("NAU_DATA_HOME", root.join("data-home"));
+    cmd.env("NAU_SYSTEMD", "off");
+    cmd.env("CURLOPT_LOG", log);
+    cmd.env("PATH", format!("{}:{path}", shim_dir.display()));
+    let out = cmd.output().expect("failed to spawn nau pod");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+fn curl_routes(log: &Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+// The #331 elimination, end to end: a fully-held sync of a pod that
+// loads an UNCHANGED pod makes ZERO network routes. After the first
+// syncs, the loaded pod's member recipe drifts in the collection —
+// the re-resolved build inputs move, but the content both pods
+// execute is identical (the declaring pod's generation still carries
+// it). The plain sync must hold the member at that content: no source
+// download, no rebuild, no generation churn — while curl is shimmed
+// to fail loudly, the sync exits 0 with an EMPTY route log.
+// (Baseline on the pre-#331 tree: the same drift forced a full member
+// rebuild — a curl source download on every sync, forever.)
+gated_test!(
+    fully_held_sync_with_unchanged_loaded_pod_makes_zero_routes,
+    {
+        let project = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let port = serve_dir(server.path());
+
+        write_app_pkg(project.path(), "base-pkg", "1.0", "base-ran", "tool", port);
+        make_tarball(server.path(), "base-pkg");
+        write_app_pkg(project.path(), "top-pkg", "1.0", "top-ran", "topbin", port);
+        make_tarball(server.path(), "top-pkg");
+
+        let (code, _, stderr) =
+            run_named(project.path(), root.path(), "base", &["add", "base-pkg"]);
+        assert_eq!(code, Some(0), "base add failed: {stderr}");
+
+        let (code, _, stderr) = run_named(project.path(), root.path(), "work", &["add", "top-pkg"]);
+        assert_eq!(code, Some(0), "work add failed: {stderr}");
+        let work_decl = pod_dir(root.path(), "work").join("pod.lua");
+        let decl = std::fs::read_to_string(&work_decl).unwrap();
+        let edited = decl.replace(
+            r#"packages = { "top-pkg" },"#,
+            r#"loads = { "base" },
+    packages = { "top-pkg" },"#,
+        );
+        assert_ne!(edited, decl, "fixture must match the rendered declaration");
+        std::fs::write(&work_decl, &edited).unwrap();
+        let (code, _, stderr) = run_named(project.path(), root.path(), "work", &["sync"]);
+        assert_eq!(code, Some(0), "work sync (loads) failed: {stderr}");
+        let generations_before = generation_count(root.path(), "work");
+
+        // Collection drift: the loaded member's recipe changes at a
+        // constant version. Neither pod's installed content moves — only
+        // the re-resolution digest does.
+        write_app_pkg(
+            project.path(),
+            "base-pkg",
+            "1.0",
+            "base-ran-EDITED",
+            "tool",
+            port,
+        );
+
+        // The fully-held sync: curl shimmed to log-and-fail.
+        let log = root.path().join("curl-routes.log");
+        let (_shim, _shim_path) = curl_shim(&log);
+        let (code, stdout, stderr) = run_with_shim(
+            project.path(),
+            root.path(),
+            "work",
+            &["sync"],
+            _shim.path(),
+            &log,
+        );
+        assert_eq!(
+            code,
+            Some(0),
+            "a fully-held sync must succeed offline; routes: {:?}; stderr: {stderr}",
+            curl_routes(&log)
+        );
+        assert!(
+            curl_routes(&log).is_empty(),
+            "a fully-held sync must make ZERO store routes: {:?}",
+            curl_routes(&log)
+        );
+        assert!(
+            stderr.contains("held 'base-pkg'"),
+            "the loaded member must be reported held: {stdout}{stderr}"
+        );
+        assert_eq!(
+            generation_count(root.path(), "work"),
+            generations_before,
+            "a held sync must not churn generations"
+        );
+        assert_eq!(
+            farm_output(&current_farm(root.path(), "work"), "tool"),
+            "base-ran",
+            "the held member keeps its executing content"
+        );
+    }
+);
+
+// The positive control: when the DECLARING pod moves (its own sync
+// lands the drifted recipe — the "changed constraint" shape), the
+// loading pod MUST verify by rebuilding: the same shimmed sync now
+// fails (the rebuild needs its source route), and with the real
+// server up it rebuilds, downloads, and bumps the generation.
+gated_test!(moved_declaring_pod_forces_the_member_rebuild, {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+
+    write_app_pkg(project.path(), "base-pkg", "1.0", "base-ran", "tool", port);
+    make_tarball(server.path(), "base-pkg");
+    write_app_pkg(project.path(), "top-pkg", "1.0", "top-ran", "topbin", port);
+    make_tarball(server.path(), "top-pkg");
+
+    let (code, _, stderr) = run_named(project.path(), root.path(), "base", &["add", "base-pkg"]);
+    assert_eq!(code, Some(0), "base add failed: {stderr}");
+    let (code, _, stderr) = run_named(project.path(), root.path(), "work", &["add", "top-pkg"]);
+    assert_eq!(code, Some(0), "work add failed: {stderr}");
+    let work_decl = pod_dir(root.path(), "work").join("pod.lua");
+    let decl = std::fs::read_to_string(&work_decl).unwrap();
+    let edited = decl.replace(
+        r#"packages = { "top-pkg" },"#,
+        r#"loads = { "base" },
+    packages = { "top-pkg" },"#,
+    );
+    assert_ne!(edited, decl, "fixture must match the rendered declaration");
+    std::fs::write(&work_decl, &edited).unwrap();
+    let (code, _, stderr) = run_named(project.path(), root.path(), "work", &["sync"]);
+    assert_eq!(code, Some(0), "work sync (loads) failed: {stderr}");
+    let generations_before = generation_count(root.path(), "work");
+
+    // The declaring pod's content moves: recipe drift + its own sync.
+    write_app_pkg(
+        project.path(),
+        "base-pkg",
+        "1.0",
+        "base-ran-MOVED",
+        "tool",
+        port,
+    );
+    let (code, _, stderr) = run_named(project.path(), root.path(), "base", &["sync"]);
+    assert_eq!(code, Some(0), "base sync failed: {stderr}");
+
+    // Offline, the verify-by-rebuild attempt FAILS to fetch: the route
+    // is attempted (the shim logs it, curl fails) and the build failure
+    // is CONTAINED (ADR-0048) — the sync proceeds, the member keeps the
+    // declaring pod's previous content.
+    let log = root.path().join("curl-routes.log");
+    let (_shim, _shim_path) = curl_shim(&log);
+    let (code, stdout, stderr) = run_with_shim(
+        project.path(),
+        root.path(),
+        "work",
+        &["sync"],
+        _shim.path(),
+        &log,
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "the contained rebuild failure must not abort the sync: {stdout}{stderr}"
+    );
+    assert!(
+        !curl_routes(&log).is_empty(),
+        "the verify must have attempted the member's source route: {:?}",
+        curl_routes(&log)
+    );
+    assert_eq!(
+        generation_count(root.path(), "work"),
+        generations_before,
+        "the failed fetch must keep the previous content"
+    );
+
+    // Online, the rebuild lands: new content, generation bump.
+    let (code, _, stderr) = run_named(project.path(), root.path(), "work", &["sync"]);
+    assert_eq!(code, Some(0), "work sync failed: {stderr}");
+    assert_eq!(
+        generation_count(root.path(), "work"),
+        generations_before + 1,
+        "the rebuilt member must install as a new generation"
+    );
+    assert_eq!(
+        farm_output(&current_farm(root.path(), "work"), "tool"),
+        "base-ran-MOVED",
+        "the loading pod must follow the declaring pod's moved content"
+    );
+});

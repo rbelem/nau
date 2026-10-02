@@ -138,6 +138,96 @@ impl StoreClient {
         Self::resolve_with(&crate::command::RealRunner, pin, channel, arch)
     }
 
+    /// The deterministic cache filename [`Self::download`] writes —
+    /// shared so a pin-first lookup can never drift from it (issue
+    /// #331).
+    fn cached_snap_filename(name: &str, revision: u32, sha3_384: &str) -> String {
+        format!("{name}_{revision}_{sha3_384}.snap")
+    }
+
+    /// Pin-first local resolution (issue #331, elimination family): a
+    /// FULLY pinned ref (revision + sha3-384) whose payload is already
+    /// in the cache under the deterministic download filename — and
+    /// whose bytes still hash to the pinned digest — IS the resolution.
+    /// Returns the verified cached path with zero store routes.
+    ///
+    /// `None` falls back to the store-verify path, never a guess: an
+    /// incomplete pin (resolving it IS the store query — channel head,
+    /// refresh) or a missing local blob. A PRESENT blob whose bytes
+    /// mismatch the pin fails closed HERE: the store path would not
+    /// re-download (the cached filename exists) and would fail the same
+    /// digest check at [`Self::fetch`]'s final verify — after the
+    /// resolve's round trips were spent for nothing.
+    pub fn pinned_cached_payload(
+        pin: &SnapRef,
+        cache_dir: &Path,
+    ) -> Option<miette::Result<PathBuf>> {
+        let (revision, sha3_384) = match (pin.revision, pin.sha3_384.as_deref()) {
+            (Some(rev), Some(sha)) => (rev, sha),
+            _ => return None,
+        };
+        let path = cache_dir.join(Self::cached_snap_filename(&pin.name, revision, sha3_384));
+        if !path.exists() {
+            return None;
+        }
+        let computed = match sha3_384_file(&path) {
+            Ok(computed) => computed,
+            Err(e) => return Some(Err(e)),
+        };
+        if computed != sha3_384 {
+            return Some(Err(miette::miette!(
+                "cached payload {} no longer matches its pin: sha3-384 mismatch \
+                 (expected {sha3_384}, got {computed}) — remove the file and re-fetch",
+                path.display()
+            )));
+        }
+        Some(Ok(path))
+    }
+
+    /// [`Self::resolve_with`] with the pin-first cache check (issue
+    /// #331): a fully-pinned ref whose payload is already cached
+    /// resolves locally with zero store routes; anything else takes the
+    /// store-verify path unchanged. The local hit's `download_url` is
+    /// empty — [`Self::download`] short-circuits on the same
+    /// deterministic path, so it is never consulted (the same shape as
+    /// the image staging index-pin hit).
+    pub fn resolve_cached_with(
+        runner: &dyn CommandRunner,
+        pin: &SnapRef,
+        channel: &str,
+        arch: &str,
+        cache_dir: &Path,
+    ) -> miette::Result<ResolvedSnap> {
+        match Self::pinned_cached_payload(pin, cache_dir) {
+            Some(Ok(_)) => {
+                eprintln!(
+                    "  ✓ {} — pin held at cached payload (no store query)",
+                    pin.name
+                );
+                Ok(ResolvedSnap {
+                    name: pin.name.clone(),
+                    revision: pin.revision.unwrap_or_default(),
+                    sha3_384: pin.sha3_384.clone().unwrap_or_default(),
+                    download_url: String::new(),
+                })
+            }
+            // A present-but-corrupt cached payload fails closed without
+            // network contact (see [`Self::pinned_cached_payload`]).
+            Some(Err(e)) => Err(e),
+            None => Self::resolve_with(runner, pin, channel, arch),
+        }
+    }
+
+    /// [`Self::resolve_cached_with`] with the host tool runner.
+    pub fn resolve_cached(
+        pin: &SnapRef,
+        channel: &str,
+        arch: &str,
+        cache_dir: &Path,
+    ) -> miette::Result<ResolvedSnap> {
+        Self::resolve_cached_with(&crate::command::RealRunner, pin, channel, arch, cache_dir)
+    }
+
     /// The store snap-id for one snap name (the top-level `snap-id` of the
     /// `/v2/snaps/info` response) — the identity UC model assertions and
     /// seed.yaml carry for every system snap. `NAU_SNAP_IDS` entries
@@ -257,10 +347,8 @@ impl StoreClient {
         resolved: &ResolvedSnap,
         output_dir: &Path,
     ) -> miette::Result<PathBuf> {
-        let filename = format!(
-            "{}_{}_{}.snap",
-            resolved.name, resolved.revision, resolved.sha3_384
-        );
+        let filename =
+            Self::cached_snap_filename(&resolved.name, resolved.revision, &resolved.sha3_384);
         let output_path = output_dir.join(&filename);
 
         if output_path.exists() {
@@ -311,6 +399,11 @@ impl StoreClient {
     }
 
     /// Resolve, download, and verify a pinned snap in one step.
+    ///
+    /// Pin-first (issue #331): a fully-pinned ref whose payload is
+    /// already cached — and whose bytes still verify against the pin —
+    /// returns the cached path with zero store routes; everything else
+    /// takes the resolve → download → verify path.
     pub fn fetch(
         runner: &dyn CommandRunner,
         pin: &SnapRef,
@@ -318,6 +411,15 @@ impl StoreClient {
         arch: &str,
         cache_dir: &Path,
     ) -> miette::Result<PathBuf> {
+        if let Some(verified) = Self::pinned_cached_payload(pin, cache_dir) {
+            let path = verified?;
+            eprintln!(
+                "  ✓ {} revision {} — pin held at cached payload — sha3-384 verified",
+                pin.name,
+                pin.revision.unwrap_or_default()
+            );
+            return Ok(path);
+        }
         let resolved = Self::resolve(pin, channel, arch)?;
         let path = Self::download(runner, &resolved, cache_dir)?;
         Self::verify(&path, &resolved.sha3_384)?;
@@ -348,4 +450,222 @@ pub fn sha3_384_file(path: &Path) -> miette::Result<String> {
     }
     let hash = hasher.finalize();
     Ok(hash.iter().map(|b| format!("{b:02x}")).collect::<String>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::command::RunnerOutput;
+    use std::sync::Mutex;
+
+    // ── pin-first local resolution (issue #331): the route-count seam ──
+    //
+    // A fully-pinned ref whose payload is already cached IS the
+    // resolution: zero store routes. Baseline (before the pin-first
+    // helper) every fully-pinned resolve spent the same three routes —
+    // info + snap-revision + account-key — re-verifying an unchanged
+    // pin; the tests below pin the after-number at 0 and keep the
+    // fail-closed fallbacks (missing blob, incomplete pin) on the
+    // store-verify path.
+
+    const HELLO_SNAP_ID: &str = "buPKUD3TKqCOgLEjjHx5kSiCpIs5cMuQ";
+    const HELLO_DIGEST_HEX: &str =
+        "b07bdb78e762c2e6020c75fafc92055b323a6f8da3ab42a3963da5ade386aba11f77e3c8f919b8aa23f3aa5c06c844f9";
+    const HELLO_SIZE: u64 = 20480;
+    const SNAP_REVISION: &str =
+        include_str!("../../../tests/fixtures/assertions/hello-world-rev29.snap-revision.assert");
+    const STORE_ACCOUNT_KEY: &str =
+        include_str!("../../../tests/fixtures/assertions/store.account-key.assert");
+
+    struct Reply {
+        code: i32,
+        stdout: String,
+        stderr: String,
+    }
+
+    fn ok_json(body: impl Into<String>) -> Reply {
+        Reply {
+            code: 0,
+            stdout: body.into(),
+            stderr: String::new(),
+        }
+    }
+
+    fn hello_channel_map(track: &str, risk: &str) -> String {
+        format!(
+            r#"{{
+                "channel-map": [
+                    {{
+                        "channel": {{"architecture": "amd64", "name": "{risk}", "track": "{track}", "risk": "{risk}"}},
+                        "download": {{"sha3-384": "{HELLO_DIGEST_HEX}", "size": {HELLO_SIZE}, "url": "https://cdn.example/hello_29.snap"}},
+                        "revision": 29
+                    }}
+                ],
+                "snap-id": "{HELLO_SNAP_ID}"
+            }}"#
+        )
+    }
+
+    /// Scripted curl: the first route whose URL substring matches
+    /// answers; no match panics (unexpected call). Every invocation is
+    /// recorded — the route counter the #331 assertions read.
+    struct FakeStore {
+        routes: Mutex<Vec<(&'static str, Reply)>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl FakeStore {
+        fn new() -> FakeStore {
+            FakeStore {
+                routes: Mutex::new(Vec::new()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn route(self, url_part: &'static str, reply: Reply) -> FakeStore {
+            self.routes.lock().unwrap().push((url_part, reply));
+            self
+        }
+
+        fn snap_info(self, track: &str, risk: &str) -> FakeStore {
+            self.route("snaps/info/", ok_json(hello_channel_map(track, risk)))
+        }
+
+        fn assertion_chain(self) -> FakeStore {
+            self.route("snap-revision/", ok_json(SNAP_REVISION))
+                .route("account-key/", ok_json(STORE_ACCOUNT_KEY))
+        }
+
+        /// How many curl invocations the client made (every `run` call
+        /// — one subprocess per store route).
+        fn route_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+    }
+
+    impl CommandRunner for FakeStore {
+        fn run(&self, argv: &[String]) -> std::io::Result<RunnerOutput> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(argv.last().cloned().unwrap_or_default());
+            let url = argv.last().unwrap();
+            for (part, reply) in self.routes.lock().unwrap().iter() {
+                if url.contains(part) {
+                    return Ok(RunnerOutput {
+                        code: reply.code,
+                        stdout: reply.stdout.clone().into_bytes(),
+                        stderr: reply.stderr.clone(),
+                    });
+                }
+            }
+            panic!("unexpected curl invocation: {argv:?}");
+        }
+    }
+
+    /// Runner for paths that must not shell out at all (short-circuits).
+    struct NoRunner;
+
+    impl CommandRunner for NoRunner {
+        fn run(&self, argv: &[String]) -> std::io::Result<RunnerOutput> {
+            panic!("no subprocess expected: {argv:?}");
+        }
+    }
+
+    /// The sha3-384 of `b"hello world\n"`, used as the fixture pin
+    /// digest (the bytes the cache helper writes below hash to it).
+    fn hello_payload_sha() -> &'static str {
+        "28fc308d4d5c1ef9e60acedb13c3a1fcf7266560602c639000580ae3541dea5c\
+         e78a685de897e96b65a0fc15515c3780"
+    }
+
+    fn hello_pin(revision: Option<u32>, sha3_384: Option<&str>) -> SnapRef {
+        SnapRef {
+            name: "hello-world".into(),
+            revision,
+            sha3_384: sha3_384.map(str::to_string),
+        }
+    }
+
+    /// Cache the fixture payload under the deterministic download
+    /// filename for `revision`, returning the fully-pinned ref + path.
+    fn cache_hello_payload(dir: &Path, revision: u32) -> (SnapRef, PathBuf) {
+        let sha = hello_payload_sha();
+        let pin = hello_pin(Some(revision), Some(sha));
+        let path = dir.join(format!("hello-world_{revision}_{sha}.snap"));
+        std::fs::write(&path, b"hello world\n").unwrap();
+        (pin, path)
+    }
+
+    #[test]
+    fn pinned_cached_hit_resolves_with_zero_store_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pin, _) = cache_hello_payload(dir.path(), 29);
+        let resolved =
+            StoreClient::resolve_cached_with(&NoRunner, &pin, "latest/stable", "amd64", dir.path())
+                .unwrap();
+        assert_eq!(resolved.revision, 29);
+        assert_eq!(resolved.sha3_384, hello_payload_sha());
+        // The local hit needs no download URL: download() short-circuits
+        // on the same deterministic path.
+        assert_eq!(resolved.download_url, "");
+    }
+
+    #[test]
+    fn pinned_cache_miss_falls_back_to_the_store_verify_path() {
+        let dir = tempfile::tempdir().unwrap();
+        // Same pin shape, nothing cached: the blob is missing, so the
+        // store-verify path must run (never a local guess).
+        let pin = hello_pin(Some(29), Some(HELLO_DIGEST_HEX));
+        let runner = FakeStore::new()
+            .snap_info("latest", "stable")
+            .assertion_chain();
+        let resolved =
+            StoreClient::resolve_cached_with(&runner, &pin, "latest/stable", "amd64", dir.path())
+                .unwrap();
+        assert_eq!(resolved.revision, 29);
+        // The baseline re-verify cost, unchanged for the fallback: info
+        // + snap-revision + account-key.
+        assert_eq!(runner.route_count(), 3);
+    }
+
+    #[test]
+    fn pinned_corrupt_cache_fails_closed_without_store_contact() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pin, cached) = cache_hello_payload(dir.path(), 29);
+        std::fs::write(&cached, b"corrupted bytes").unwrap();
+        let err =
+            StoreClient::resolve_cached_with(&NoRunner, &pin, "latest/stable", "amd64", dir.path())
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("sha3-384 mismatch"), "{err}");
+        assert!(err.contains("remove the file"), "{err}");
+    }
+
+    #[test]
+    fn incomplete_pin_ignores_the_cache_and_takes_the_store_path() {
+        let dir = tempfile::tempdir().unwrap();
+        // A payload IS cached — but the pin carries no revision/digest,
+        // so resolving it is the store query's job (channel head).
+        let _ = cache_hello_payload(dir.path(), 29);
+        let pin = hello_pin(None, None);
+        let runner = FakeStore::new()
+            .snap_info("latest", "stable")
+            .assertion_chain();
+        let resolved =
+            StoreClient::resolve_cached_with(&runner, &pin, "latest/stable", "amd64", dir.path())
+                .unwrap();
+        assert_eq!(resolved.revision, 29);
+        assert_eq!(runner.route_count(), 3);
+    }
+
+    #[test]
+    fn fetch_of_a_pinned_cached_snap_makes_no_store_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pin, cached) = cache_hello_payload(dir.path(), 29);
+        let path =
+            StoreClient::fetch(&NoRunner, &pin, "latest/stable", "amd64", dir.path()).unwrap();
+        assert_eq!(path, cached);
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello world\n");
+    }
 }
