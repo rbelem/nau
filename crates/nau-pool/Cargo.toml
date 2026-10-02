@@ -1,0 +1,28 @@
+[package]
+name = "nau-pool"
+version = "0.1.0"
+edition = "2021"
+description = "The pool/farm domain (ADR-0053): the SSH worker transport, the farm build scheduler, the machine provisioning + host-CA ceremony lane, and the worker wire protocol"
+license = "GPL-3.0-only"
+
+[dependencies]
+# The spine: the shared vocabulary this domain consumes (worker value
+# types, arch resolution, sha256 cache-key vocabulary). Domains may
+# depend on nau-core; it never depends on a domain.
+nau-core = { path = "../nau-core" }
+# The non-domain leaf: the command seam (every ssh/scp/ssh-keygen call)
+# and terminal presentation. Same direction rule as nau-core.
+nau-infra = { path = "../nau-infra" }
+# The worker-verb/report error vocabulary. No "fancy" here — the root
+# keeps one miette in the graph (see nau-core).
+miette = "7"
+# The worker wire protocol (job manifest / capability / result documents)
+# and the publish-channel records serialize as JSON.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The burst window stages user-data + rewrites the managed config block
+# through a 0600 NamedTempFile; tests stage ceremony homes.
+tempfile = "3"
+# The burst's SIGINT forwarding trap (kill to the wrapped child) and the
+# wrapped command's signal-death exit code.
+libc = "0.2"

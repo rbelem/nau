@@ -1742,6 +1742,7 @@ dependencies = [
  "nau-infra",
  "nau-peer",
  "nau-pod",
+ "nau-pool",
  "nau-runtime",
  "nau-ship",
  "nau-trust",
@@ -1892,6 +1893,19 @@ dependencies = [
  "sha2",
  "tempfile",
  "ureq",
+]
+
+[[package]]
+name = "nau-pool"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "miette",
+ "nau-core",
+ "nau-infra",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

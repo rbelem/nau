@@ -413,7 +413,7 @@ fn farm_eligible(
                     alive[x]
                         && matches!(&fe.kind,
                             ExecutorKind::Worker { declared_arch: Some(d) }
-                            if crate::snap::triplet_arch(d)
+                            if nau_core::snap_types::triplet_arch(d)
                                 .is_some_and(|da| caps.archs.iter().any(|a| a == da)))
                 })
             } else {
@@ -421,7 +421,10 @@ fn farm_eligible(
             }
         }
         ExecutorKind::Worker { declared_arch } => {
-            match declared_arch.as_deref().and_then(crate::snap::triplet_arch) {
+            match declared_arch
+                .as_deref()
+                .and_then(nau_core::snap_types::triplet_arch)
+            {
                 // A declared worker takes only jobs that match its
                 // arch, or cross jobs — the remote side re-checks
                 // everything at dispatch preflight. ("all" jobs are
@@ -699,7 +702,7 @@ pub fn run_ready_set_farm(
                                 // moment it happens: a re-dispatch can
                                 // absorb the loss, and the escape hatch
                                 // is removing the worker from config.
-                                crate::output::warn(format!(
+                                nau_infra::output::warn(format!(
                                     "worker lost: {err} — affected jobs re-dispatch to the \
                                      surviving executors"
                                 ));
@@ -765,7 +768,7 @@ pub fn run_ready_set_farm(
     // job's phases, in completion order. Members without timings (the
     // local slots) record none, so a worker-less run prints nothing.
     let timings: Vec<JobTiming> = farm.iter().flat_map(|fe| fe.job.job_timings()).collect();
-    if !timings.is_empty() && !crate::output::is_json() {
+    if !timings.is_empty() && !nau_infra::output::is_json() {
         eprint!("{}", render_farm_timings(&timings));
     }
     FarmOutcome {
@@ -1035,7 +1038,7 @@ impl<T: ManifestSource + Send + ?Sized> ManifestSource for std::sync::Arc<T> {
 /// [`SshExecutor`](crate::ssh_exec::SshExecutor) plus the assembly
 /// that feeds it. Attribution lines mirror the local executor's
 /// `▶ [name slot/total]` shapes, prefixed by the worker's short host.
-pub struct RemoteExecutor<R: crate::command::CommandRunner + Sync, S: ManifestSource> {
+pub struct RemoteExecutor<R: nau_infra::command::CommandRunner + Sync, S: ManifestSource> {
     exec: crate::ssh_exec::SshExecutor<R>,
     source: S,
     display: String,
@@ -1047,7 +1050,7 @@ pub struct RemoteExecutor<R: crate::command::CommandRunner + Sync, S: ManifestSo
     timings: Mutex<Vec<JobTiming>>,
 }
 
-impl<R: crate::command::CommandRunner + Sync, S: ManifestSource> RemoteExecutor<R, S> {
+impl<R: nau_infra::command::CommandRunner + Sync, S: ManifestSource> RemoteExecutor<R, S> {
     /// Wrap one worker's executor. `slots` is the entry's `jobs`; the
     /// worker's short host name attributes its lines.
     pub fn new(
@@ -1069,10 +1072,12 @@ impl<R: crate::command::CommandRunner + Sync, S: ManifestSource> RemoteExecutor<
     }
 }
 
-impl<R: crate::command::CommandRunner + Sync, S: ManifestSource> FarmJob for RemoteExecutor<R, S> {
+impl<R: nau_infra::command::CommandRunner + Sync, S: ManifestSource> FarmJob
+    for RemoteExecutor<R, S>
+{
     fn run(&self, name: &str) -> Result<(), JobFailure> {
         let slot = self.dispatch.fetch_add(1, Ordering::SeqCst) + 1;
-        if !crate::output::is_json() {
+        if !nau_infra::output::is_json() {
             eprintln!("▶ [{} {slot}/{}] {name}", self.display, self.total);
         }
         let manifest = self
@@ -1107,7 +1112,7 @@ impl<R: crate::command::CommandRunner + Sync, S: ManifestSource> FarmJob for Rem
         match outcome {
             Ok(o) => {
                 if o.cache_hit {
-                    if !crate::output::is_json() {
+                    if !nau_infra::output::is_json() {
                         eprintln!(
                             "✓ [{} {slot}/{}] {name} (manifest cache)",
                             self.display, self.total
@@ -1131,7 +1136,7 @@ impl<R: crate::command::CommandRunner + Sync, S: ManifestSource> FarmJob for Rem
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .push(timing.clone());
-                    if !crate::output::is_json() {
+                    if !nau_infra::output::is_json() {
                         eprintln!(
                             "✓ [{} {slot}/{}] {name} — {}",
                             self.display,
@@ -1205,7 +1210,7 @@ fn channel_loss_in(err: &miette::Error) -> bool {
 /// plus the sum of every declared worker's job allowance. An absent or
 /// empty `workers` table yields today's fixed parallelism — the default
 /// `local_jobs` and no workers.
-pub fn pool_budget(workers: &crate::lua::WorkersConfig) -> usize {
+pub fn pool_budget(workers: &nau_core::worker_types::WorkersConfig) -> usize {
     workers.local_jobs as usize
         + workers
             .workers

@@ -7,7 +7,6 @@ pub use nau_chart::{
 
 pub mod assert;
 pub mod build_orch;
-pub mod build_sched;
 pub mod cli;
 pub mod commands;
 pub mod coordinator;
@@ -61,9 +60,14 @@ pub use nau_runtime::slot_recovery;
 // runtime.rs stay real shim FILES (the eval-coupled test clusters live
 // there); ca is a pure re-export.
 pub use nau_trust::ca;
+// The pool domain (issue #326 PR 9): the SSH worker transport and the
+// farm build scheduler moved whole; worker.rs stays a real shim FILE
+// (the machine-verb execution half lives there, re-exporting the wire
+// vocabulary from nau_pool::worker) and provision/ stays a real shim
+// DIR (the clap-typed dispatch + burst-count glue stay root).
+pub use nau_pool::{build_sched, ssh_exec};
 pub mod oci;
 pub mod snap;
-pub mod ssh_exec;
 #[cfg(test)]
 pub(crate) mod test_env;
 pub mod units;

@@ -20,6 +20,7 @@ members = [
     "crates/nau-pod",
     "crates/nau-runtime",
     "crates/nau-trust",
+    "crates/nau-pool",
 ]
 resolver = "2"
 
@@ -64,6 +65,10 @@ nau-runtime = { path = "crates/nau-runtime" }
 # ceremony. (The pgp PRIMITIVES live in nau-infra; the image-side
 # sysupdate policy keeps nau-image's own pgp dep.)
 nau-trust = { path = "crates/nau-trust" }
+# The pool domain (issue #326 PR 9): the SSH worker transport, the farm
+# build scheduler, the machine provisioning + host-CA publish/issue
+# ceremony lane, and the worker wire protocol.
+nau-pool = { path = "crates/nau-pool" }
 clap = { version = "4", features = ["derive"] }
 mlua = { version = "0.12", features = ["luau"] }
 miette = { version = "7", features = ["fancy"] }

@@ -110,74 +110,12 @@ impl NodeConfig {
 /// schema.
 const NODE_MARKER: &str = "_node";
 
-/// The `workers` config surface (ADR-0040 Decision 3): the coordinator's
-/// own slot count plus the Worker entries, declared as one global table
-/// in `nau.lua` — the array part holds the entries, the
-/// `local_jobs` hash key holds the slot count. Absent entirely means
-/// zero behavior change: no SSH, no sockets, no new code paths.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WorkersConfig {
-    /// The coordinator's own build slots (today's
-    /// `build_sched::MAX_PARALLEL_BUILD_WORKERS`, now config-driven).
-    #[serde(default = "default_local_jobs")]
-    pub local_jobs: u32,
-    /// The Worker entries, in declaration order.
-    #[serde(default)]
-    pub workers: Vec<WorkerConfig>,
-}
-
-/// One Worker entry: where to reach it, how many concurrent jobs it
-/// takes, and the arch override when the preflight probe must not be
-/// trusted to match (ADR-0040 Decision 3).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkerConfig {
-    /// `ssh://[user@]host[:port]`.
-    pub address: String,
-    /// Max concurrent jobs on this machine (default 2).
-    #[serde(default = "default_worker_jobs")]
-    pub jobs: u32,
-    /// GNU triplet override; probed via `__worker-cap` at preflight
-    /// when absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub arch: Option<String>,
-    /// The pinned SSH host identity (ADR-0045 Decision 4, as amended by
-    /// #295): the host CA's `SHA256:` fingerprint (the `nau ca list`
-    /// form) — the only pin form. The executor builds a nau-managed
-    /// `@cert-authority` known_hosts entry from the ceremony CA whose
-    /// fingerprint matches, scoped to the worker's certificate principals
-    /// and connected under the provisioned machine identity. Pins are
-    /// never learned: `StrictHostKeyChecking=yes` against the managed
-    /// known_hosts, and preflight refuses a worker whose pin cannot be
-    /// enforced by name. The retired mint-and-inject pin (a full
-    /// public-key line) refuses at parse with the re-pin remedy. No
-    /// `ssh-keyscan` path exists.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_key: Option<String>,
-    /// The client identity ssh presents to this worker (#298): the path
-    /// of a private key, pinned so ambient `~/.ssh/config` cannot
-    /// substitute its own `IdentityFile`. Absent = resolution falls to
-    /// `NAU_SSH_IDENTITY`, then the operator's default key halves —
-    /// the executor's resolution order, never ssh_config's.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity: Option<String>,
-}
-
-fn default_local_jobs() -> u32 {
-    nau_core::MAX_PARALLEL_BUILD_WORKERS as u32
-}
-
-fn default_worker_jobs() -> u32 {
-    2
-}
-
-impl Default for WorkersConfig {
-    fn default() -> Self {
-        WorkersConfig {
-            local_jobs: default_local_jobs(),
-            workers: Vec::new(),
-        }
-    }
-}
+/// The `workers` config value types moved DOWN into
+/// `nau_core::worker_types` (issue #326 PR 9: the pool domain's
+/// ssh_exec/build_sched consume them and must not depend on the
+/// chart); re-exported so every `crate::lua::` and `nau::lua::` path
+/// keeps resolving.
+pub use nau_core::worker_types::{WorkerConfig, WorkersConfig};
 
 /// Validate one `ssh://[user@]host[:port]` worker address (ADR-0040
 /// Decision 3's grammar: integer port 1-65535, non-empty host, the host
@@ -283,96 +221,99 @@ fn parse_positive_int(value: &mlua::Value, field: &str) -> miette::Result<u32> {
     u32::try_from(n).map_err(|_| miette::miette!("field '{field}' value {n} is out of range"))
 }
 
-impl WorkersConfig {
-    /// Convert from the raw `workers` global table. Unknown fields are
-    /// rejected fail-closed; one named miette diagnostic per malformed
-    /// shape, naming the field and the entry index.
-    pub fn from_lua_value(value: &mlua::Value) -> miette::Result<Self> {
-        const KNOWN_FIELDS: &str =
-            "known keys: local_jobs; array entries take address, jobs, arch, host_key";
-        let mlua::Value::Table(table) = value else {
-            return Err(miette::miette!(
-                "'workers' must be a table, got {}",
-                value.type_name()
-            ));
-        };
-        let mut cfg = WorkersConfig::default();
-        // Entries arrive with their 1-based declaration index as the key
-        // (integer or string digit — Luau hash iteration order is
-        // otherwise not stable), so collect and sort to restore the
-        // declared order. The density check below turns sparse or
-        // mixed numbering into a named refusal instead of the silent
-        // renumber a plain sort would imply (pre-wiring for #191, where
-        // workers are addressed by their declared index).
-        let mut entries: Vec<(usize, WorkerConfig)> = Vec::new();
-        for pair in table.pairs::<mlua::Value, mlua::Value>() {
-            let (key, val) = pair.map_err(|e| miette::miette!("workers entry: {e}"))?;
-            match key {
-                mlua::Value::String(s) => {
-                    let field = s
-                        .to_str()
-                        .map_err(|e| miette::miette!("workers: key name: {e}"))?
-                        .to_string();
-                    // Luau's pairs() yields array entries with string
-                    // digit keys — a numeric key is a worker entry, no
-                    // matter how the VM surfaced it.
-                    if let Ok(idx) = field.parse::<usize>() {
-                        if idx == 0 {
-                            return Err(miette::miette!(
-                                "workers: array indices are 1-based, got key '{field}'"
-                            ));
-                        }
-                        entries.push((idx, parse_worker_entry(&val, idx)?));
-                    } else if field == "local_jobs" {
-                        cfg.local_jobs = parse_positive_int(&val, "local_jobs")
-                            .map_err(|e| miette::miette!("workers: {e}"))?;
-                    } else {
-                        return Err(miette::miette!(
-                            "workers: unknown key '{field}' ({KNOWN_FIELDS})"
-                        ));
-                    }
-                }
-                mlua::Value::Integer(i) => {
-                    let idx = usize::try_from(i)
-                        .map_err(|_| miette::miette!("workers: negative array index"))?;
+/// Convert from the raw `workers` global table. Unknown fields are
+/// rejected fail-closed; one named miette diagnostic per malformed
+/// shape, naming the field and the entry index.
+///
+/// A free function rather than an inherent [`WorkersConfig`] method:
+/// the type now lives in `nau_core::worker_types` (issue #326 PR 9)
+/// and an out-of-crate inherent impl is illegal. This extraction stays
+/// chart-local; the single caller is [`extract_workers_from_lua`].
+fn workers_config_from_lua_value(value: &mlua::Value) -> miette::Result<WorkersConfig> {
+    const KNOWN_FIELDS: &str =
+        "known keys: local_jobs; array entries take address, jobs, arch, host_key";
+    let mlua::Value::Table(table) = value else {
+        return Err(miette::miette!(
+            "'workers' must be a table, got {}",
+            value.type_name()
+        ));
+    };
+    let mut cfg = WorkersConfig::default();
+    // Entries arrive with their 1-based declaration index as the key
+    // (integer or string digit — Luau hash iteration order is
+    // otherwise not stable), so collect and sort to restore the
+    // declared order. The density check below turns sparse or
+    // mixed numbering into a named refusal instead of the silent
+    // renumber a plain sort would imply (pre-wiring for #191, where
+    // workers are addressed by their declared index).
+    let mut entries: Vec<(usize, WorkerConfig)> = Vec::new();
+    for pair in table.pairs::<mlua::Value, mlua::Value>() {
+        let (key, val) = pair.map_err(|e| miette::miette!("workers entry: {e}"))?;
+        match key {
+            mlua::Value::String(s) => {
+                let field = s
+                    .to_str()
+                    .map_err(|e| miette::miette!("workers: key name: {e}"))?
+                    .to_string();
+                // Luau's pairs() yields array entries with string
+                // digit keys — a numeric key is a worker entry, no
+                // matter how the VM surfaced it.
+                if let Ok(idx) = field.parse::<usize>() {
                     if idx == 0 {
                         return Err(miette::miette!(
-                            "workers: array indices are 1-based, got key '{i}'"
+                            "workers: array indices are 1-based, got key '{field}'"
                         ));
                     }
                     entries.push((idx, parse_worker_entry(&val, idx)?));
-                }
-                other => {
+                } else if field == "local_jobs" {
+                    cfg.local_jobs = parse_positive_int(&val, "local_jobs")
+                        .map_err(|e| miette::miette!("workers: {e}"))?;
+                } else {
                     return Err(miette::miette!(
-                        "workers: keys must be strings or array indices, got {}",
-                        other.type_name()
+                        "workers: unknown key '{field}' ({KNOWN_FIELDS})"
                     ));
                 }
             }
-        }
-        entries.sort_by_key(|(idx, _)| *idx);
-        // Dense 1..n only: after sorting, position i must carry index
-        // i+1. A gap (sparse, `{ [1]=w, [3]=w }`) or any mismatch names
-        // the offending index instead of silently renumbering.
-        for (pos, (idx, _)) in entries.iter().enumerate() {
-            let expected = pos + 1;
-            if *idx != expected {
+            mlua::Value::Integer(i) => {
+                let idx = usize::try_from(i)
+                    .map_err(|_| miette::miette!("workers: negative array index"))?;
+                if idx == 0 {
+                    return Err(miette::miette!(
+                        "workers: array indices are 1-based, got key '{i}'"
+                    ));
+                }
+                entries.push((idx, parse_worker_entry(&val, idx)?));
+            }
+            other => {
                 return Err(miette::miette!(
-                    "workers[{idx}]: array indices must be dense 1..n, expected index {expected} here"
+                    "workers: keys must be strings or array indices, got {}",
+                    other.type_name()
                 ));
             }
         }
-        for (idx, worker) in entries {
-            if cfg.workers.iter().any(|w| w.address == worker.address) {
-                return Err(miette::miette!(
-                    "workers[{idx}]: duplicate address '{}'",
-                    worker.address
-                ));
-            }
-            cfg.workers.push(worker);
-        }
-        Ok(cfg)
     }
+    entries.sort_by_key(|(idx, _)| *idx);
+    // Dense 1..n only: after sorting, position i must carry index
+    // i+1. A gap (sparse, `{ [1]=w, [3]=w }`) or any mismatch names
+    // the offending index instead of silently renumbering.
+    for (pos, (idx, _)) in entries.iter().enumerate() {
+        let expected = pos + 1;
+        if *idx != expected {
+            return Err(miette::miette!(
+                "workers[{idx}]: array indices must be dense 1..n, expected index {expected} here"
+            ));
+        }
+    }
+    for (idx, worker) in entries {
+        if cfg.workers.iter().any(|w| w.address == worker.address) {
+            return Err(miette::miette!(
+                "workers[{idx}]: duplicate address '{}'",
+                worker.address
+            ));
+        }
+        cfg.workers.push(worker);
+    }
+    Ok(cfg)
 }
 
 /// A string field of a worker entry: the value or a named refusal.
@@ -424,7 +365,7 @@ fn parse_worker_entry(value: &mlua::Value, index: usize) -> miette::Result<Worke
         ));
     };
     let mut address: Option<String> = None;
-    let mut jobs = default_worker_jobs();
+    let mut jobs = nau_core::worker_types::default_worker_jobs();
     let mut arch: Option<String> = None;
     let mut host_key: Option<String> = None;
     let mut identity: Option<String> = None;
@@ -509,52 +450,11 @@ pub fn validate_host_key(raw: &str) -> miette::Result<()> {
     ))
 }
 
-/// The known SSH host-key types (the published-half grammar and the
-/// legacy-pin shape check).
-const HOST_KEY_TYPES: &[&str] = &[
-    "ssh-ed25519",
-    "ecdsa-sha2-nistp256",
-    "ecdsa-sha2-nistp384",
-    "ecdsa-sha2-nistp521",
-    "ssh-rsa",
-    "rsa-sha2-256",
-    "rsa-sha2-512",
-];
-
-/// The published public-key-line grammar: `<keytype> <base64> [comment]`,
-/// usable verbatim as a known_hosts key. This is the GUEST's published
-/// host-key half (the publish receive surface and the issue-path defense
-/// re-check), not a config pin — config pins are CA fingerprints only
-/// ([`validate_host_key`]).
-pub fn validate_public_key_line(raw: &str) -> miette::Result<()> {
-    let mut parts = raw.split_whitespace();
-    let key_type = parts.next();
-    let key = parts.next();
-    let comment = parts.next();
-    if parts.next().is_some() {
-        return Err(miette::miette!(
-            "expected '<keytype> <base64> [comment]', got '{raw}'"
-        ));
-    }
-    match (key_type, key, comment) {
-        (Some(k), Some(key), comment) if HOST_KEY_TYPES.contains(&k) => {
-            let comment_ok = comment.is_none_or(|c| !c.starts_with('-') && !c.contains(char::is_whitespace));
-            let key_ok = key.len() >= 16 && key.bytes().all(|b| is_base64_char(b) || b == b'=');
-            if key_ok && comment_ok {
-                return Ok(());
-            }
-            Err(miette::miette!(
-                "'{k}' is a known host-key type, but the entry is not a valid public-key line: '{raw}'"
-            ))
-        }
-        (Some(k), ..) if !HOST_KEY_TYPES.contains(&k) => Err(miette::miette!(
-            "unknown host-key type '{k}' (expected ssh-ed25519, ecdsa-sha2-nistp*, ssh-rsa, or rsa-sha2-*)"
-        )),
-        _ => Err(miette::miette!(
-            "expected '<keytype> <base64> [comment]', got '{raw}'"
-        )),
-    }
-}
+// The published public-key-line grammar moved DOWN into
+// `nau_infra::ssh_ca` (issue #326 PR 9: pure ssh public-key-line
+// grammar, no Lua machinery — the pgp precedent); re-exported so the
+// pin-shape checks below and every `crate::lua::` path keep resolving.
+pub use nau_infra::ssh_ca::{is_base64_char, validate_public_key_line, HOST_KEY_TYPES};
 
 /// True when `raw` opens like a known-keytype public-key line — the
 /// retired mint-and-inject pin shape, refused by name in
@@ -563,11 +463,6 @@ fn looks_like_public_key_line(raw: &str) -> bool {
     raw.split_whitespace()
         .next()
         .is_some_and(|k| HOST_KEY_TYPES.contains(&k))
-}
-
-/// One base64 character (standard alphabet, no padding).
-fn is_base64_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'+' || b == b'/'
 }
 
 /// Extract the global `workers` table from an evaluated Lua state.
@@ -579,7 +474,7 @@ fn extract_workers_from_lua(lua: &mlua::Lua) -> miette::Result<WorkersConfig> {
         .map_err(|e| miette::miette!("failed to read 'workers' global: {e}"))?;
     match value {
         mlua::Value::Nil => Ok(WorkersConfig::default()),
-        other => WorkersConfig::from_lua_value(&other),
+        other => workers_config_from_lua_value(&other),
     }
 }
 

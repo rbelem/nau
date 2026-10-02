@@ -638,27 +638,19 @@ fn clear_stage_dir(stage_dir: &Path) -> miette::Result<()> {
 
 /// Host architecture in snapd naming ("amd64", "arm64", …). Rust's
 /// `consts::ARCH` passes through unchanged for other targets.
-pub fn host_arch() -> &'static str {
-    match std::env::consts::ARCH {
-        "x86_64" => "amd64",
-        "aarch64" => "arm64",
-        other => other,
-    }
-}
+///
+/// Moved DOWN into `nau_core::snap_types` (issue #326 PR 9: the pool
+/// domain's ssh_exec/build_sched/provision consume it); re-exported so
+/// every build-internal and `crate::snap::` path keeps resolving.
+pub use nau_core::snap_types::host_arch;
 
 /// Leading-component architecture of a GNU target triplet.
 /// "aarch64-linux-gnu" → Some("arm64"), "x86_64-linux-gnu" → Some("amd64"),
 /// "arm-linux-gnueabihf" → Some("armhf"). Unknown vendor/OS suffixes are not
 /// interpreted: the first component maps by the rules above, else identity.
-pub fn triplet_arch(triplet: &str) -> Option<&str> {
-    let first = triplet.split('-').next()?;
-    match first {
-        "x86_64" | "amd64" => Some("amd64"),
-        "aarch64" | "arm64" => Some("arm64"),
-        "arm" => Some("armhf"),
-        other => Some(other),
-    }
-}
+///
+/// Moved DOWN into `nau_core::snap_types` (issue #326 PR 9); re-exported.
+pub use nau_core::snap_types::triplet_arch;
 
 /// Refuse builds whose requested architecture cannot be produced honestly.
 ///

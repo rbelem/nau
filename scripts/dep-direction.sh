@@ -49,6 +49,11 @@
 #              dev-edge: the schema down-move puts ImageManifest in
 #              nau-core::manifest_ir, and the two eval-coupled fixture
 #              clusters stay root)
+#   nau-pool   {nau-core, nau-infra}   — the pool/farm domain (SSH
+#              worker transport, farm build scheduler, provisioning +
+#              host-CA publish/issue ceremony, the worker wire
+#              protocol; no dev-edge: the ssh_exec/build_sched/
+#              provision suites moved in-crate)
 #   nau (root) exempt                  — the root composes everything
 set -euo pipefail
 
@@ -73,6 +78,7 @@ allowed_normal() {
         nau-pod)    echo "nau-core nau-infra" ;;
         nau-runtime) echo "nau-core nau-infra" ;;
         nau-trust) echo "nau-core nau-infra" ;;
+        nau-pool)    echo "nau-core nau-infra" ;;
         *)          return 1 ;;
     esac
 }

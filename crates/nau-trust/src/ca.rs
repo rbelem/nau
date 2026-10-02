@@ -29,42 +29,24 @@
 //!   `@cert-authority` line source (sub-task 4).
 //! - the directory itself is 0700.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use miette::{IntoDiagnostic, WrapErr};
 
 use nau_infra::command::{exit_code, CommandRunner};
 
+// The CA material primitives (paths, introspection, fingerprinting)
+// moved DOWN into `nau_infra::ssh_ca` (issue #326 PR 9, the pgp
+// precedent: primitives to infra, ceremony policy stays with the
+// domain). Re-exported so every trust-internal caller and the root
+// `crate::ca` shim keep resolving byte-identically.
+pub use nau_infra::ssh_ca::{
+    ca_dir, ca_public_path, ca_secret_path, inspect, key_fingerprint, CaInfo,
+};
+
 /// The keypair comment ssh-keygen stamps on both halves — the marker
 /// provisioning output greps for when wiring pins by hand.
 pub const CA_COMMENT: &str = "nau-host-ca";
-
-/// The CA keypair directory under the ceremony home:
-/// `~/.config/nau/ca/`.
-pub fn ca_dir(home: &Path) -> PathBuf {
-    home.join(".config").join("nau").join("ca")
-}
-
-/// The CA private key: `<home>/.config/nau/ca/ca` (0600).
-pub fn ca_secret_path(home: &Path) -> PathBuf {
-    ca_dir(home).join("ca")
-}
-
-/// The CA public key: `<home>/.config/nau/ca/ca.pub`.
-pub fn ca_public_path(home: &Path) -> PathBuf {
-    ca_dir(home).join("ca.pub")
-}
-
-/// Operator-visible identity of a host CA: the raw public line (what a
-/// `@cert-authority` entry embeds), the ssh-keygen SHA256 fingerprint
-/// (what workers entries will carry), and whether the private half is
-/// on disk (issuance needs it; a pin-only consumer does not).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CaInfo {
-    pub public_line: String,
-    pub fingerprint: String,
-    pub secret_present: bool,
-}
 
 /// Mint the host CA keypair under `home` via `ssh-keygen`. Creates
 /// `~/.config/nau/ca/` (0700) when absent. An existing CA is a named
@@ -136,78 +118,6 @@ pub fn create_ca_keypair(
         fingerprint,
         secret_present: true,
     })
-}
-
-/// Load the host CA's identity, `Ok(None)` when neither half exists (the
-/// ceremony has not run). A private half without its public half is a
-/// named error — the keypair is incomplete and every downstream consumer
-/// needs the public line; fail closed rather than report a half-root.
-pub fn inspect(runner: &dyn CommandRunner, home: &Path) -> miette::Result<Option<CaInfo>> {
-    let secret = ca_secret_path(home);
-    let public = ca_public_path(home);
-    match (secret.exists(), public.exists()) {
-        (false, false) => Ok(None),
-        (true, false) => Err(miette::miette!(
-            "host CA private key exists at {} but its public half {} is missing — the \
-             keypair is incomplete; refusing to report it",
-            secret.display(),
-            public.display()
-        )),
-        (secret_present, true) => {
-            let text = std::fs::read_to_string(&public)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("reading {}", public.display()))?;
-            Ok(Some(CaInfo {
-                public_line: text.trim().to_string(),
-                fingerprint: key_fingerprint(runner, &public)?,
-                secret_present,
-            }))
-        }
-    }
-}
-
-/// The ssh-keygen SHA256 fingerprint of a public key file — the stable,
-/// short identity a `known_hosts` comment or a workers entry carries.
-/// `ssh-keygen -lf` behind the command seam; a nonzero exit (not a key
-/// file, truncated, corrupt) is a named error naming the path.
-pub fn key_fingerprint(runner: &dyn CommandRunner, public_path: &Path) -> miette::Result<String> {
-    let argv = vec![
-        "ssh-keygen".to_string(),
-        "-lf".to_string(),
-        public_path.to_string_lossy().into_owned(),
-    ];
-    let out = runner
-        .run(&argv)
-        .map_err(|e| miette::miette!("ca: cannot run ssh-keygen (is openssh installed?): {e}"))?;
-    if exit_code(&out) != 0 {
-        return Err(miette::miette!(
-            "ca: {} is not a usable public key file (ssh-keygen -lf failed: {})",
-            public_path.display(),
-            out.stderr.trim()
-        ));
-    }
-    parse_fingerprint_line(&String::from_utf8_lossy(&out.stdout)).wrap_err_with(|| {
-        format!(
-            "parsing ssh-keygen fingerprint of {}",
-            public_path.display()
-        )
-    })
-}
-
-/// The fingerprint is the second whitespace field of `ssh-keygen -lf`'s
-/// single line: `256 SHA256:base64… comment (ED25519)`.
-fn parse_fingerprint_line(output: &str) -> miette::Result<String> {
-    let line = output.lines().next().unwrap_or("");
-    let fingerprint = line
-        .split_whitespace()
-        .nth(1)
-        .filter(|f| f.starts_with("SHA256:"))
-        .ok_or_else(|| {
-            miette::miette!(
-                "ssh-keygen fingerprint output is not the expected `bits SHA256:…` shape: {line:?}"
-            )
-        })?;
-    Ok(fingerprint.to_string())
 }
 
 #[cfg(test)]
@@ -319,23 +229,6 @@ mod tests {
     }
 
     #[test]
-    fn paths_follow_the_documented_contract() {
-        let home = Path::new("/somewhere/home");
-        assert_eq!(
-            ca_dir(home),
-            PathBuf::from("/somewhere/home/.config/nau/ca")
-        );
-        assert_eq!(
-            ca_secret_path(home),
-            PathBuf::from("/somewhere/home/.config/nau/ca/ca")
-        );
-        assert_eq!(
-            ca_public_path(home),
-            PathBuf::from("/somewhere/home/.config/nau/ca/ca.pub")
-        );
-    }
-
-    #[test]
     fn keygen_mints_via_ssh_keygen_with_the_ceremony_argv() {
         let dir = tempfile::tempdir().unwrap();
         let fake = FakeKeygen::new();
@@ -418,61 +311,5 @@ mod tests {
             !ca_public_path(dir.path()).exists(),
             "stale public half must not survive a failed force mint"
         );
-    }
-
-    #[test]
-    fn inspect_is_none_on_an_empty_ceremony_home() {
-        let dir = tempfile::tempdir().unwrap();
-        let found = inspect(&NeverRunner, dir.path()).unwrap();
-        assert!(found.is_none());
-    }
-
-    #[test]
-    fn inspect_refuses_a_secret_without_its_public_half() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(ca_dir(dir.path())).unwrap();
-        std::fs::write(ca_secret_path(dir.path()), "private").unwrap();
-        let err = inspect(&NeverRunner, dir.path()).unwrap_err();
-        let msg = format!("{err:?}");
-        assert!(msg.contains("incomplete"), "{msg}");
-        assert!(
-            msg.contains(&ca_public_path(dir.path()).display().to_string()),
-            "names the missing public half: {msg}"
-        );
-    }
-
-    #[test]
-    fn inspect_reports_a_public_only_chain_honestly() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(ca_dir(dir.path())).unwrap();
-        std::fs::write(ca_public_path(dir.path()), format!("{FIXTURE_A_PUB}\n")).unwrap();
-        let info = inspect(&FakeKeygen::new(), dir.path()).unwrap().unwrap();
-        assert!(!info.secret_present);
-        assert_eq!(info.public_line, FIXTURE_A_PUB);
-    }
-
-    #[test]
-    fn fingerprint_parses_the_second_field_and_demands_the_sha256_shape() {
-        assert_eq!(
-            parse_fingerprint_line(&fpr_out("SHA256:AbCd+/12")).unwrap(),
-            "SHA256:AbCd+/12"
-        );
-        let err = parse_fingerprint_line("256 deadbeef nau-host-ca (ED25519)").unwrap_err();
-        assert!(format!("{err:?}").contains("SHA256:"), "{err:?}");
-        let err = parse_fingerprint_line("").unwrap_err();
-        assert!(format!("{err:?}").contains("SHA256:"), "{err:?}");
-    }
-
-    #[test]
-    fn fingerprint_failure_names_the_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("garbage.pub");
-        std::fs::write(&path, "not a key\n").unwrap();
-        let fake = FakeKeygen::new();
-        fake.fail_after(0);
-        let err = key_fingerprint(&fake, &path).unwrap_err();
-        let msg = format!("{err:?}");
-        assert!(msg.contains("not a usable public key file"), "{msg}");
-        assert!(msg.contains(&path.display().to_string()), "{msg}");
     }
 }
