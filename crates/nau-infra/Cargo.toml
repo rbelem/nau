@@ -29,7 +29,9 @@ sha2 = "0.10"
 sha3 = "0.10"
 # assert.rs: base64url assertion bodies and signature envelopes.
 base64 = "0.22"
-# assert.rs: Snap Store assertion OpenPGP verification (ADR-0011 step b).
+# assert.rs: Snap Store assertion OpenPGP verification (ADR-0011 step b);
+# pgp.rs (PR 8): the sysupdate trust-anchor packet primitives (the
+# primitive/policy split — nau-image's sysupdate policy layer re-exports).
 pgp = "0.20"
 # tools.rs: staged temp files and atomic pointer flips.
 tempfile = "3"

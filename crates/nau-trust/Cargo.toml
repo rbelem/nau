@@ -1,0 +1,31 @@
+[package]
+name = "nau-trust"
+version = "0.1.0"
+edition = "2021"
+description = "nau's trust domain: the update-manifest signing/attestation ceremony, the device verify cluster, and the SSH host-CA ceremony (ADR-0011, ADR-0024, ADR-0045, ADR-0051, ADR-0053)"
+license = "GPL-3.0-only"
+
+[dependencies]
+# The spine (ADR-0051 Decision 3): the keychain/ceremony ledger core
+# (nau_core::sign), the eval-manifest schema + canonical bytes
+# (nau_core::manifest_ir), the device path vocabulary.
+nau-core = { path = "../nau-core" }
+# The mechanism leaf (issue #326): the sysupdate OpenPGP packet
+# primitives (nau_infra::pgp — the primitive/policy split; the trust
+# side's write_sysupdate_fragment persists the deterministic bytes) and
+# the command seam (the SSH host-CA's ssh-keygen runs).
+nau-infra = { path = "../nau-infra" }
+# Error vocabulary (unified with the root's fancy feature).
+miette = "7"
+# LedgerVerification (the verify outcome) derives Serialize for the
+# commands' JSON report path.
+serde = { version = "1", features = ["derive"] }
+# The verify cluster parses signature entries and checks the eval
+# manifest's provenance binding (serde_json::Value signature maps).
+serde_json = "1"
+
+[dev-dependencies]
+# keychain/ceremony fixtures stage homes and key dirs.
+tempfile = "3"
+# the golden-attestation and keypair fixtures derive SigningKeys.
+ed25519-dalek = "2"

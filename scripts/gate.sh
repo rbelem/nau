@@ -60,6 +60,13 @@ echo "gate: CC=$CC"
 echo "gate: CXX=$CXX"
 "$CC" --version | head -1
 
+# CARGO_INCREMENTAL=0 (2026-10-01): the dev-profile incremental cache
+# regrows to 8-31 GB per gate run and ENOSPC'd the repo partition at
+# link time three times in one afternoon. The gate's value is a clean
+# test/clippy/fmt verdict, not a warm incremental rebuild; recompiles
+# get somewhat slower and target/ stays small.
+export CARGO_INCREMENTAL=0
+
 # ── Gated-suite tool preflight (#291): a tool absent in the gate is a
 # FAIL, not a silent skip. The gated tests check NAU_GATE=1 too, so
 # a run that enters here without the outer provisioning still cannot

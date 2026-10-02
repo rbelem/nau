@@ -12,7 +12,7 @@
 //! Ceremony (joins ADR-0024's — the amendment records the join):
 //!
 //! - `nau ca keygen` — mint the keypair via `ssh-keygen` behind the
-//!   [`CommandRunner`][crate::command::CommandRunner] seam (the repo's
+//!   [`CommandRunner`][nau_infra::command::CommandRunner] seam (the repo's
 //!   subprocess convention — every provisioning-side ssh-keygen call
 //!   rides it — no new crates). Refuses to overwrite an existing CA
 //!   without `--force`: replacing the high-value trust root is a
@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 
 use miette::{IntoDiagnostic, WrapErr};
 
-use crate::command::{exit_code, CommandRunner};
+use nau_infra::command::{exit_code, CommandRunner};
 
 /// The keypair comment ssh-keygen stamps on both halves — the marker
 /// provisioning output greps for when wiring pins by hand.
@@ -213,7 +213,7 @@ fn parse_fingerprint_line(output: &str) -> miette::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::RunnerOutput;
+    use nau_infra::command::RunnerOutput;
     use std::io;
     use std::sync::{Arc, Mutex};
 

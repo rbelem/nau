@@ -44,6 +44,11 @@
 #              mutation, install/remove/rollback/gc, activation, slot
 #              recovery; no dev-edge: the store-fixture suites are
 #              in-crate, the cosign/attest fixtures stay root)
+#   nau-trust  {nau-core, nau-infra}   — the ceremony domain (key/CA
+#              ceremony, manifest signing/verify, ledger policy; no
+#              dev-edge: the schema down-move puts ImageManifest in
+#              nau-core::manifest_ir, and the two eval-coupled fixture
+#              clusters stay root)
 #   nau (root) exempt                  — the root composes everything
 set -euo pipefail
 
@@ -67,6 +72,7 @@ allowed_normal() {
         nau-peer)   echo "nau-core nau-infra" ;;
         nau-pod)    echo "nau-core nau-infra" ;;
         nau-runtime) echo "nau-core nau-infra" ;;
+        nau-trust) echo "nau-core nau-infra" ;;
         *)          return 1 ;;
     esac
 }

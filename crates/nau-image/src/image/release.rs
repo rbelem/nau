@@ -34,7 +34,7 @@
 //!
 //! The signed body is [`super::verify::image_manifest_canonical_bytes`] —
 //! the typed image manifest serialized with the signatures map emptied —
-//! NEVER the eval manifest's [`nau_core::sign::eval_manifest_canonical_bytes`]
+//! NEVER the eval manifest's [`nau_core::manifest_ir::eval_manifest_canonical_bytes`]
 //! (a different type, a different scheme; the eval signer is named for
 //! what it signs so this sentence can be checked mechanically). The
 //! signature is a bare base64 Ed25519 entry under the operator key's id,
