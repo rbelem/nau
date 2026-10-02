@@ -62,7 +62,11 @@ pub const DEFAULT_GO_PROXY: &str = "https://proxy.golang.org";
 // ── Orchestration ──
 
 /// Ensure the package's dependency closure is fetched and cached in the
-/// pod store, returning the pin to record in `nau.lock`.
+/// pod store, returning the pin to record in `nau.lock` plus the
+/// OBSERVED sha256 of the source tarball when this call downloaded one
+/// (`None` when a cached pin was honored or every lock was recipe-local —
+/// ADR-0017 Decision 4a: the float hold compares this observation against
+/// the lockfile's restamped source pin instead of rebuilding).
 ///
 /// Locked packages (`floating == false`) with a cached store entry never
 /// re-fetch — bit-reproducible. A locked package whose store entry went
@@ -78,7 +82,7 @@ pub fn ensure_pod_deps(
     prev: Option<&PackageDepsLock>,
     floating: bool,
     recipe_dir: Option<&Path>,
-) -> miette::Result<PackageDepsLock> {
+) -> miette::Result<(PackageDepsLock, Option<String>)> {
     let Some(deps) = &meta.deps else {
         miette::bail!(
             "internal: ensure_pod_deps called for '{}' which declares no deps",
@@ -93,74 +97,81 @@ pub fn ensure_pod_deps(
     if !floating {
         if let Some(hash) = pinned {
             if store.blob_path(hash).exists() {
-                return Ok(prev.expect("pinned implies prev").clone());
+                return Ok((prev.expect("pinned implies prev").clone(), None));
             }
         }
     }
 
-    let (hash, lock_sha256) = fetch_deps_closure(store, meta, deps, recipe_dir)?;
+    let (hash, lock_sha256, observed_source) = fetch_deps_closure(store, meta, deps, recipe_dir)?;
 
-    match pinned {
-        // The re-fetch reproduced the pin (locked entry rebuilt after GC,
-        // or a float whose upstream closure did not move): keep the pin —
-        // and its original fetched_at — untouched.
-        Some(old) if old == hash => Ok(prev.expect("pinned implies prev").clone()),
-        Some(old) => {
-            if !floating {
-                miette::bail!(
-                    "dependency closure for '{}' changed upstream ({:.12} → {:.12}) \
-                     but the package is locked and its cached store entry was missing — \
-                     refusing to move the pin; run `nau deps fetch --latest` to move it deliberately",
-                    meta.name,
-                    old,
-                    hash
-                );
+    Ok((
+        match pinned {
+            // The re-fetch reproduced the pin (locked entry rebuilt after GC,
+            // or a float whose upstream closure did not move): keep the pin —
+            // and its original fetched_at — untouched.
+            Some(old) if old == hash => prev.expect("pinned implies prev").clone(),
+            Some(old) => {
+                if !floating {
+                    miette::bail!(
+                        "dependency closure for '{}' changed upstream ({:.12} → {:.12}) \
+                         but the package is locked and its cached store entry was missing — \
+                         refusing to move the pin; run `nau deps fetch --latest` to move it deliberately",
+                        meta.name,
+                        old,
+                        hash
+                    );
+                }
+                nau_infra::output::warn(format!(
+                    "floating package '{}': dependency closure changed ({:.12} → {:.12})",
+                    meta.name, old, hash
+                ));
+                PackageDepsLock {
+                    deps_hash: hash,
+                    fetched_at: Some(today()),
+                    lock_sha256,
+                }
             }
-            nau_infra::output::warn(format!(
-                "floating package '{}': dependency closure changed ({:.12} → {:.12})",
-                meta.name, old, hash
-            ));
-            Ok(PackageDepsLock {
-                deps_hash: hash,
-                fetched_at: Some(today()),
-                lock_sha256,
-            })
-        }
-        None => {
-            // TOFU (ADR-0017 Decision 3): print the hash; the lockfile IS
-            // the pin record.
-            nau_infra::output::ok(format!(
-                "pinned dependency closure for '{}': {:.12}… (recorded in nau.lock)",
-                meta.name, hash
-            ));
-            Ok(PackageDepsLock {
-                deps_hash: hash,
-                fetched_at: Some(today()),
-                lock_sha256,
-            })
-        }
-    }
+            None => {
+                // TOFU (ADR-0017 Decision 3): print the hash; the lockfile IS
+                // the pin record.
+                nau_infra::output::ok(format!(
+                    "pinned dependency closure for '{}': {:.12}… (recorded in nau.lock)",
+                    meta.name, hash
+                ));
+                PackageDepsLock {
+                    deps_hash: hash,
+                    fetched_at: Some(today()),
+                    lock_sha256,
+                }
+            }
+        },
+        observed_source,
+    ))
 }
 
 /// Fetch + materialize the closure and store it as one content-addressed
-/// blob. Returns the blob's sha256 (the `deps_hash`) plus the sha256 of
+/// blob. Returns the blob's sha256 (the `deps_hash`), the sha256 of
 /// the lockfile bytes when the lock resolved from the package recipe
-/// directory (`recipe/` lock path — the audit field beside the pin);
-/// `None` for source-tree locks.
+/// directory (`recipe/` lock path — the audit field beside the pin;
+/// `None` for source-tree locks), and the OBSERVED sha256 of the source
+/// tarball when this call downloaded one (ADR-0017 Decision 4a — the
+/// float-hold's drift observation, reused so the sync never downloads
+/// the source twice). `None` when every lock was recipe-local and no
+/// source was read.
 fn fetch_deps_closure(
     store: &BlobStore,
     meta: &SnapMeta,
     deps: &nau_core::snap_types::PackageDeps,
     recipe_dir: Option<&Path>,
-) -> miette::Result<(String, Option<String>)> {
+) -> miette::Result<(String, Option<String>, Option<String>)> {
     let work = tempfile::tempdir().map_err(|e| miette::miette!("tempdir: {e}"))?;
     // All-recipe-local closures never read a source tree: every lock
     // resolves against the recipe directory, so there is nothing to
     // download — skip the fetch entirely (and with it the `source`
     // requirement, mirroring the parse-boundary relaxation in
     // `snap`). Any other lock shape still needs the tree.
-    let src_root = if deps.all_locks_recipe_local() {
-        work.path().to_path_buf()
+    let (src_root, observed_source) = if deps.all_locks_recipe_local() {
+        (work.path().to_path_buf(), None)
     } else {
         fetch_source_tree(meta, work.path())?
     };
@@ -173,7 +184,7 @@ fn fetch_deps_closure(
     fetch_all_resolvers(deps, &src_root, recipe_dir, &tree, work.path())?;
     let bytes = pack_canonical(&tree)?;
     let hash = store.write_blob(&bytes)?;
-    Ok((hash, lock_sha256))
+    Ok((hash, lock_sha256, observed_source))
 }
 
 /// The scratch dir the materialized closure tree is packed from.
@@ -208,7 +219,11 @@ fn fetch_all_resolvers(
 
 /// Verify the store's closure blob against its pin and unpack it into a
 /// fresh temp dir for the build sandbox to mount read-only (ADR-0017
-/// Decision 3: "the sandbox build verifies the hash before use").
+/// Decision 3: "the sandbox build verifies the hash before use"). The
+/// verify rides the process-lifetime blob memo (sync-speed plan item
+/// 6a: write_blob / held-sync verify / this mount hash the same blob in
+/// one sync — the memo keeps it at one hash), and the unpack STREAMS
+/// from the blob (6c: a 4 GB closure never lands in memory whole).
 pub fn materialize_deps_entry(
     store: &BlobStore,
     deps_hash: &str,
@@ -220,27 +235,29 @@ pub fn materialize_deps_entry(
              run `nau deps fetch` to fetch it"
         );
     }
-    let actual = sha256_file(&blob)?;
+    let actual = nau_core::blob_memo::memoized_sha256_file(&blob)?;
     if actual != deps_hash {
         miette::bail!(
             "dependency closure hash mismatch: expected {deps_hash}, found {actual} — \
              the store entry is corrupted or tampered with; refusing to build against it"
         );
     }
-    let bytes =
-        std::fs::read(&blob).map_err(|e| miette::miette!("reading {}: {e}", blob.display()))?;
+    let file = std::fs::File::open(&blob)
+        .map_err(|e| miette::miette!("reading {}: {e}", blob.display()))?;
     let dir = tempfile::tempdir().map_err(|e| miette::miette!("tempdir: {e}"))?;
-    unpack_canonical(&bytes, dir.path())?;
+    unpack_canonical(std::io::BufReader::new(file), dir.path())?;
     Ok(dir)
 }
 
 // ── Source tree ──
 
 /// Download + extract the package's source tarball and return its source
-/// root — the same download/TOFU semantics `run_build` applies. Lockfiles
-/// resolve from this tree first (plain `lock` values), or from the
-/// package recipe directory (`recipe/` values — see [`lock_candidates`]).
-fn fetch_source_tree(meta: &SnapMeta, work: &Path) -> miette::Result<PathBuf> {
+/// root plus the OBSERVED tarball sha256 (ADR-0017 Decision 4a: the
+/// float-hold's drift observation rides this fetch so the closure
+/// re-resolve never downloads the source twice). Lockfiles resolve from
+/// this tree first (plain `lock` values), or from the package recipe
+/// directory (`recipe/` values — see [`lock_candidates`]).
+fn fetch_source_tree(meta: &SnapMeta, work: &Path) -> miette::Result<(PathBuf, Option<String>)> {
     let spec = meta.source.as_ref().ok_or_else(|| {
         miette::miette!(
             "package '{}': deps requires source — the lockfile resolves from the source tree",
@@ -287,7 +304,7 @@ fn fetch_source_tree(meta: &SnapMeta, work: &Path) -> miette::Result<PathBuf> {
     nau_infra::archive::extract_tarball(&tarball, &src_dir)
         .map_err(|e| e.wrap_err(format!("failed to extract {filename}")))?;
     nau_infra::output::finish_ok(&spinner, &format!("fetched source of {}", meta.name));
-    Ok(find_source_root(&src_dir))
+    Ok((find_source_root(&src_dir), Some(sha)))
 }
 
 /// The single top-level directory after extraction, if there is exactly
@@ -1957,39 +1974,106 @@ fn collect_tree(
 }
 
 /// Unpack a canonical archive under `dest` (the build-sandbox mount is
-/// produced from this — pure data, no scripts).
-fn unpack_canonical(bytes: &[u8], dest: &Path) -> miette::Result<()> {
-    let mut pos = 0usize;
-    while pos < bytes.len() {
-        let Some(line_end) = bytes[pos..].iter().position(|&b| b == b'\n') else {
-            miette::bail!("corrupt closure archive: unterminated entry");
+/// produced from this — pure data, no scripts). STREAMING (sync-speed
+/// plan item 6c): the reader is consumed entry by entry, so a
+/// multi-gigabyte closure blob never lands in memory whole — the caller
+/// hands in a `BufReader` over the store blob (or a cursor in tests).
+fn unpack_canonical<R: std::io::Read>(mut reader: R, dest: &Path) -> miette::Result<()> {
+    loop {
+        let line = read_archive_line(&mut reader)?;
+        let Some(line) = line else {
+            miette::bail!("corrupt closure archive: missing END marker");
         };
-        let line = std::str::from_utf8(&bytes[pos..pos + line_end])
-            .map_err(|_| miette::miette!("corrupt closure archive: bad header"))?;
-        pos += line_end + 1;
         if line == "END" {
             return Ok(());
         }
-        pos += unpack_entry(line, &bytes[pos..], dest)?;
+        unpack_streamed_entry(&line, &mut reader, dest)?;
     }
-    miette::bail!("corrupt closure archive: missing END marker")
 }
 
-/// Unpack one archive entry given its header line and the payload bytes
-/// that follow it; returns how many payload bytes were consumed.
-fn unpack_entry(line: &str, body: &[u8], dest: &Path) -> miette::Result<usize> {
+/// One header line from the archive reader: bytes up to (not including)
+/// the newline, UTF-8 validated. `Ok(None)` at clean EOF.
+fn read_archive_line<R: std::io::Read>(reader: &mut R) -> miette::Result<Option<String>> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => {
+                if line.is_empty() {
+                    return Ok(None);
+                }
+                miette::bail!("corrupt closure archive: unterminated entry");
+            }
+            Ok(_) if byte[0] == b'\n' => {
+                let entry = std::str::from_utf8(&line)
+                    .map_err(|_| miette::miette!("corrupt closure archive: bad header"))?
+                    .to_string();
+                return Ok(Some(entry));
+            }
+            Ok(_) => line.push(byte[0]),
+            Err(e) => return Err(miette::miette!("reading closure archive: {e}")),
+        }
+    }
+}
+
+/// Unpack one streamed archive entry: the header line is parsed, then a
+/// file entry's payload is copied straight from the reader to disk.
+fn unpack_streamed_entry<R: std::io::Read>(
+    line: &str,
+    reader: &mut R,
+    dest: &Path,
+) -> miette::Result<()> {
     let mut parts = line.splitn(4, ' ');
     match parts.next() {
         Some("D") => {
             let rel = parts.next().unwrap_or("");
             std::fs::create_dir_all(dest.join(rel))
                 .map_err(|e| miette::miette!("mkdir {rel}: {e}"))?;
-            Ok(0)
+            Ok(())
         }
-        Some("L") => unpack_link_entry(line, dest),
-        Some("F") => unpack_file_entry(line, body, dest),
+        Some("L") => unpack_link_entry(line, dest).map(|_| ()),
+        Some("F") => unpack_streamed_file_entry(line, reader, dest),
         _ => miette::bail!("corrupt closure archive: unknown entry '{line}'"),
     }
+}
+
+/// Stream one file entry's payload: `F <mode:o> <size> <path>` followed
+/// by exactly `<size>` payload bytes copied reader → file (never buffered
+/// whole — the deepsec-sized closures stay O(1) in RSS). Short payload is
+/// the corrupt-archive error, same as the byte-buffered form.
+fn unpack_streamed_file_entry<R: std::io::Read>(
+    line: &str,
+    reader: &mut R,
+    dest: &Path,
+) -> miette::Result<()> {
+    let mut parts = line.splitn(4, ' ');
+    parts.next(); // "F"
+    let mode: u32 = parts
+        .next()
+        .and_then(|s| u32::from_str_radix(s, 8).ok())
+        .ok_or_else(|| miette::miette!("corrupt file entry"))?;
+    let size: usize = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| miette::miette!("corrupt file entry"))?;
+    let rel = parts.next().unwrap_or("");
+    let out = dest.join(rel);
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| miette::miette!("mkdir {rel}: {e}"))?;
+    }
+    let mut file = std::fs::File::create(&out).map_err(|e| miette::miette!("write {rel}: {e}"))?;
+    let copied = std::io::copy(&mut reader.take(size as u64), &mut file)
+        .map_err(|e| miette::miette!("write {rel}: {e}"))?;
+    if copied != size as u64 {
+        miette::bail!("corrupt file entry: short body ({rel})");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(mode))
+            .map_err(|e| miette::miette!("chmod {rel}: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Unpack a symlink entry: `L <target_len> <target> <path>` — target and
@@ -2019,38 +2103,6 @@ fn unpack_link_entry(line: &str, dest: &Path) -> miette::Result<usize> {
     #[cfg(unix)]
     std::os::unix::fs::symlink(target, &out).map_err(|e| miette::miette!("symlink {rel}: {e}"))?;
     Ok(0)
-}
-
-/// Unpack a file entry: `F <mode:o> <size> <path>` + `<size> payload
-/// bytes`; returns the consumed payload size.
-fn unpack_file_entry(line: &str, body: &[u8], dest: &Path) -> miette::Result<usize> {
-    let mut parts = line.splitn(4, ' ');
-    parts.next(); // "F"
-    let mode: u32 = parts
-        .next()
-        .and_then(|s| u32::from_str_radix(s, 8).ok())
-        .ok_or_else(|| miette::miette!("corrupt file entry"))?;
-    let size: usize = parts
-        .next()
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| miette::miette!("corrupt file entry"))?;
-    let rel = parts.next().unwrap_or("");
-    let payload = body
-        .get(..size)
-        .ok_or_else(|| miette::miette!("corrupt file entry: short body"))?;
-    let out = dest.join(rel);
-    if let Some(parent) = out.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| miette::miette!("mkdir {}: {e}", parent.display()))?;
-    }
-    std::fs::write(&out, payload).map_err(|e| miette::miette!("write {rel}: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(mode))
-            .map_err(|e| miette::miette!("chmod {rel}: {e}"))?;
-    }
-    Ok(size)
 }
 
 // ── Store blob plumbing ──
@@ -2719,7 +2771,7 @@ wheels = [
         assert_eq!(bytes1, bytes2, "archive must be mtime-independent");
 
         let out = dir.path().join("out");
-        unpack_canonical(&bytes1, &out).unwrap();
+        unpack_canonical(&bytes1[..], &out).unwrap();
         assert_eq!(
             std::fs::read(out.join("node_modules/dep/lib/index.js")).unwrap(),
             b"module.exports = 1;\n"
@@ -2759,7 +2811,7 @@ wheels = [
 
         let bytes = pack_canonical(&tree).unwrap();
         let out = dir.path().join("out");
-        unpack_canonical(&bytes, &out).unwrap();
+        unpack_canonical(&bytes[..], &out).unwrap();
         #[cfg(unix)]
         {
             let target = std::fs::read_link(out.join("node_modules/a/link.js")).unwrap();

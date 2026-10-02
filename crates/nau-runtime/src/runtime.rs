@@ -144,9 +144,29 @@ pub struct Journal {
 
 // ── Inputs ──
 
+/// Where a pending payload's bytes came from — the re-verify contract's
+/// provenance tag (sync-speed plan item 6b): `Built` means THE SAME
+/// PROCESS computed the sha3-384 over the exact bytes it just wrote (the
+/// pod build path hashes the payload at [`PendingSnap::payload_path`]
+/// immediately after the build produced it), so re-hashing the identical
+/// file is provably redundant and `prepare_snap` skips it. Every other
+/// origin — store downloads, sideloads, pulls — stays `Fetched` and
+/// keeps the full fail-closed re-verification (issue #116 untouched:
+/// the bytes on disk were never observed by this process).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SnapProvenance {
+    /// Bytes this process did not observe at write time — a store
+    /// download, a sideloaded payload, a peer pull. Full re-verify.
+    #[default]
+    Fetched,
+    /// The same process hashed these exact bytes at write time.
+    Built,
+}
+
 /// A resolved, downloaded, not-yet-installed snap. Resolution/download
 /// happen ABOVE this type (the CLI uses [`nau_infra::store`]; tests feed
-/// pre-made payloads) — install re-verifies sha3-384 fail-closed.
+/// pre-made payloads) — install re-verifies sha3-384 fail-closed
+/// (except [`SnapProvenance::Built`] payloads, see the enum).
 #[derive(Debug, Clone, Default)]
 pub struct PendingSnap {
     pub name: String,
@@ -163,6 +183,10 @@ pub struct PendingSnap {
     /// store/pull installs — the digest hold is a pod-own-package
     /// concept.
     pub meta_digest: Option<String>,
+    /// The payload's origin (sync-speed plan item 6b): `Built` skips the
+    /// install-time sha3-384 re-hash — same process, same bytes, same
+    /// hash — while `Fetched` keeps it (the issue #116 contract).
+    pub provenance: SnapProvenance,
 }
 
 // ── Reports ──
@@ -1047,8 +1071,14 @@ impl RuntimeStore {
 
         // Fail-closed sha3-384 re-verification over the download (the
         // store resolve already checked the assertion chain; this pins
-        // the bytes actually on disk).
-        StoreClient::verify(&snap.payload_path, &snap.sha3_384)?;
+        // the bytes actually on disk). SKIPPED only for `Built`
+        // payloads (sync-speed plan item 6b): their provenance proves
+        // the same process hashed these exact bytes at write time, so
+        // re-hashing is redundant; every `Fetched` origin keeps the
+        // full check (issue #116 untouched).
+        if snap.provenance != SnapProvenance::Built {
+            StoreClient::verify(&snap.payload_path, &snap.sha3_384)?;
+        }
 
         let work = tempfile::tempdir().map_err(|e| miette::miette!("tempdir: {e}"))?;
         let extract = work.path().join("extract");

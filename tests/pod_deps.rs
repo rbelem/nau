@@ -393,6 +393,14 @@ fn current_farm(root: &Path, pod: &str) -> PathBuf {
     }
 }
 
+/// How many generations the pod's store carries — the no-rebuild
+/// witness for hold tests (a hold must not bump the generation).
+fn generation_count(root: &Path, pod: &str) -> usize {
+    std::fs::read_dir(pod_dir(root, pod).join("generations"))
+        .map(|d| d.filter_map(|e| e.ok()).count())
+        .unwrap_or(0)
+}
+
 /// Run the installed app with the farm FIRST on PATH (ahead of the host
 /// tools a wrapper needs: readlink, dirname, the interpreter) — the
 /// farm-executes acceptance criterion.
@@ -683,6 +691,63 @@ gated_test!(floating_refetch_marks_and_rolls_back, &["node"], {
     assert!(
         out.contains("float-dep-v1"),
         "rollback must serve the prior generation's closure: {out:?}"
+    );
+});
+
+// An UNMOVED float HOLDS on its observed input tuple (ADR-0017
+// Decision 4a): the sync still re-resolves the closure — the drift
+// probe hits the server again, never skipped — but no build, no
+// install, no generation bump happens; the report records the hold,
+// and the recorded pin (hash AND fetched_at) is kept verbatim.
+gated_test!(unmoved_float_holds_without_rebuilding, &["node"], {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let (port, log) = serve_dir(server.path());
+    write_npm_pkg(
+        project.path(),
+        server.path(),
+        "zgfloat",
+        "float-hold-v1",
+        port,
+        true,
+    );
+
+    let (code, _, stderr) = run(project.path(), root.path(), &["pod", "add", "zgfloat"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let (hash_a, fetched_at_a) = lock_deps_pin(root.path(), "default", "zgfloat");
+    let generations_a = generation_count(root.path(), "default");
+    let requests_a = log.lock().unwrap().len();
+
+    // Upstream UNCHANGED: the sync re-resolves (more requests hit the
+    // server) but must hold instead of rebuilding.
+    let (code, _, stderr) = run(project.path(), root.path(), &["pod", "sync"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(
+        stderr.contains("held 'zgfloat'"),
+        "the unmoved float must be reported held: {stderr}"
+    );
+    assert!(
+        log.lock().unwrap().len() > requests_a,
+        "the drift probe must still hit upstream: the observation is never skipped"
+    );
+    let (hash_b, fetched_at_b) = lock_deps_pin(root.path(), "default", "zgfloat");
+    assert_eq!(hash_a, hash_b, "the closure pin is untouched by a hold");
+    assert_eq!(
+        fetched_at_a, fetched_at_b,
+        "a held float keeps fetched_at verbatim (no restamp)"
+    );
+    assert_eq!(
+        generation_count(root.path(), "default"),
+        generations_a,
+        "a held float must not bump the generation"
+    );
+
+    // The farm still executes the held content.
+    let out = run_farm_app(&current_farm(root.path(), "default"), "zgfloat");
+    assert!(
+        out.contains("float-hold-v1"),
+        "farm serves the held content: {out:?}"
     );
 });
 

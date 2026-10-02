@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crate::snap;
 use crate::tools::{self, ResolvedTool, ToolName};
+use miette::IntoDiagnostic;
 
 // The image-layout audit cluster (Check/CheckStatus + the three
 // builder-context audits + their initrd/verity machinery) moved to
@@ -1333,6 +1334,83 @@ pub fn print_notices() {
     if let Some(msg) = min_kernel_notice() {
         println!("  ⚠ {msg}");
     }
+}
+
+/// Deep-verify every content-addressed blob in the pod store(s)
+/// (`nau doctor --verify`, sync-speed plan item 6d): a held sync never
+/// re-reads store content (holds are input-identity and stat-based), so
+/// THIS verb is the corruption sweep — full streaming sha256 per blob,
+/// compared against its own content address (the store's layout names
+/// every blob by its digest, so name ≠ digest IS corruption). `only`
+/// names one pod; `None` sweeps every pod under the root. Returns the
+/// number of corrupt blobs; the caller turns nonzero into a failing
+/// exit.
+pub fn deep_verify_blobs(pods_root: &Path, only: Option<&str>) -> miette::Result<usize> {
+    let entries = match std::fs::read_dir(pods_root) {
+        Ok(entries) => entries,
+        Err(e) => miette::bail!("cannot read pod root {}: {e}", pods_root.display()),
+    };
+    let mut corrupt = 0usize;
+    for entry in entries {
+        let entry = entry.into_diagnostic()?;
+        let pod_dir = entry.path();
+        if !pod_dir.is_dir()
+            || pod_dir
+                .file_name()
+                .is_none_or(|n| n.to_string_lossy().starts_with('.'))
+        {
+            continue;
+        }
+        let pod_name = pod_dir.file_name().unwrap_or_default().to_string_lossy();
+        if let Some(only) = only {
+            if pod_name != only {
+                continue;
+            }
+        }
+        let store = pod_dir.join("store");
+        if !store.is_dir() {
+            continue;
+        }
+        let (checked, bad) = deep_verify_store(&store)?;
+        println!("  deep-verify '{pod_name}': {checked} blob(s), {bad} corrupt");
+        corrupt += bad;
+    }
+    Ok(corrupt)
+}
+
+/// Hash every regular file under a store dir and compare its digest to
+/// its file name. Returns (checked, corrupt).
+fn deep_verify_store(store: &Path) -> miette::Result<(usize, usize)> {
+    let mut checked = 0usize;
+    let mut corrupt = 0usize;
+    let mut stack = vec![store.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).into_diagnostic()? {
+            let entry = entry.into_diagnostic()?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let actual = nau_core::cache_key::sha256_file(&path)?;
+            checked += 1;
+            if actual != name {
+                corrupt += 1;
+                println!(
+                    "    ✗ corrupt: {} (content hashes to {:.12}…)",
+                    path.display(),
+                    actual
+                );
+            }
+        }
+    }
+    Ok((checked, corrupt))
 }
 
 /// The stale-shadow warning (#101 AC-5): the installed tools set is not

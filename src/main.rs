@@ -96,7 +96,12 @@ fn main() -> miette::Result<()> {
 
         Command::Index(sub) => nau::commands::cmd_index(sub),
 
-        Command::Doctor { pod, fix, from } => nau::commands::cmd_doctor(pod, fix, from.as_deref()),
+        Command::Doctor {
+            pod,
+            fix,
+            from,
+            verify,
+        } => nau::commands::cmd_doctor(pod, fix, from.as_deref(), verify),
 
         Command::Check(CheckArgs { file, json }) => {
             nau::output::set_mode(json);

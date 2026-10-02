@@ -2215,6 +2215,34 @@ struct BuildOutcome {
     adopted: Option<AdoptedMeta>,
 }
 
+/// Observe a package's source content WITHOUT building (ADR-0017
+/// Decision 4a): download the single `source` tarball into a scratch dir
+/// and return its SHA-256. Floating sources never consult the source
+/// cache in either direction (ADR-0048 Phase 2), so for a floating meta
+/// this is a real upstream observation — the drift probe the float hold
+/// is built on; the hold must never skip it. `None` when there is
+/// nothing observable: no `source`, a non-http source, or a multi-source
+/// declaration (those floats never take the input hold — fail-safe
+/// toward rebuilding). The bytes are discarded; the caller decides
+/// between hold and rebuild from the hash alone.
+pub fn observe_source(meta: &SnapMeta) -> miette::Result<Option<String>> {
+    if meta.sources.is_some() {
+        return Ok(None);
+    }
+    let Some(spec) = meta.source.as_ref() else {
+        return Ok(None);
+    };
+    let url = spec.url();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Ok(None);
+    }
+    let dir = tempfile::tempdir().map_err(|e| miette::miette!("temp dir: {e}"))?;
+    let filename = url.rsplit('/').next().unwrap_or("source.tar.gz");
+    let dest = dir.path().join(filename);
+    let sha = fetch_single_source(meta, spec, url, &dest, false)?;
+    Ok(Some(sha))
+}
+
 /// Run the build phase: download source, extract, and execute build command(s).
 ///
 /// Single-part form (`build = "..."`): one command runs with `$STAGE`

@@ -1129,12 +1129,132 @@ pub fn load_declaration_or_default(root: &Path, pod_name: &str) -> miette::Resul
 }
 
 /// Load a pod declaration; a missing `pod.lua` is an error.
+///
+/// Memoized for the lifetime of ONE reconcile (sync-speed plan item 5):
+/// inside [`reconcile_pod_scoped`]'s eval-memo guard the parsed
+/// declaration of a pod is evaluated once and cloned thereafter — the
+/// load graph re-reads the same pods through many seams
+/// (`validate_loads`, `resolve_pod_env`, `resolve_pod_secrets`,
+/// `pods_loading`, `loaded_contribution`/`declared_contribution`).
+/// Lifetime invariant: **nothing mutates `pod.lua` mid-reconcile** —
+/// `pod add` writes the declaration BEFORE reconciling — so a
+/// reconcile-scoped memo cannot serve a stale declaration. Outside a
+/// guard (every other verb, every test) this passes straight through.
 pub fn load_declaration(root: &Path, pod_name: &str) -> miette::Result<PodDeclaration> {
+    if let Some(hit) = eval_memo::decl_hit(root, pod_name) {
+        return Ok(hit);
+    }
     let path = pod_lua_path(root, pod_name);
     if !path.exists() {
         miette::bail!("pod '{pod_name}' has no declaration at {}", path.display());
     }
-    evaluate_pod_file(&path)
+    let decl = evaluate_pod_file(&path)?;
+    eval_memo::decl_put(root, pod_name, decl.clone());
+    Ok(decl)
+}
+
+/// The reconcile-lifetime eval memo (sync-speed plan item 5): one
+/// thread-local slot holding the declaration map, the recipe-meta map,
+/// and the hit/eval counters. Installed by [`reconcile_pod_scoped`] via
+/// [`install_eval_memo`]; the guard's Drop removes it, so the memo
+/// structurally cannot outlive the reconcile (one process per verb
+/// makes the per-sync lifetime even stronger). Keyed by (root, name) /
+/// (name, constraint) so tests with several temp roots in one process
+/// never collide.
+mod eval_memo {
+    use super::{Path, PodDeclaration};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    pub(super) struct EvalMemo {
+        decls: HashMap<(std::path::PathBuf, String), PodDeclaration>,
+        metas: HashMap<(String, Option<String>), crate::snap::SnapMeta>,
+        /// Calls served from the memo (the "second call did not
+        /// re-eval" proof seam for tests).
+        pub(super) hits: u64,
+        /// Evals that actually ran (misses).
+        pub(super) evals: u64,
+    }
+
+    thread_local! {
+        static MEMO: RefCell<Option<EvalMemo>> = const { RefCell::new(None) };
+    }
+
+    /// Install the memo for the current thread's reconcile; the returned
+    /// guard removes it on Drop (including on early `?` returns).
+    pub(super) fn install() -> EvalMemoGuard {
+        MEMO.with(|m| *m.borrow_mut() = Some(EvalMemo::default()));
+        EvalMemoGuard
+    }
+
+    pub(super) struct EvalMemoGuard;
+
+    impl Drop for EvalMemoGuard {
+        fn drop(&mut self) {
+            MEMO.with(|m| *m.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn decl_hit(root: &Path, pod_name: &str) -> Option<PodDeclaration> {
+        MEMO.with(|m| {
+            let mut slot = m.borrow_mut();
+            let memo = slot.as_mut()?;
+            let key = (root.to_path_buf(), pod_name.to_string());
+            let decl = memo.decls.get(&key)?;
+            memo.hits += 1;
+            Some(decl.clone())
+        })
+    }
+
+    pub(super) fn decl_put(root: &Path, pod_name: &str, decl: PodDeclaration) {
+        MEMO.with(|m| {
+            if let Some(memo) = m.borrow_mut().as_mut() {
+                memo.evals += 1;
+                memo.decls
+                    .insert((root.to_path_buf(), pod_name.to_string()), decl);
+            }
+        });
+    }
+
+    pub(super) fn meta_hit(name: &str, constraint: Option<&str>) -> Option<crate::snap::SnapMeta> {
+        MEMO.with(|m| {
+            let mut slot = m.borrow_mut();
+            let memo = slot.as_mut()?;
+            let meta = memo
+                .metas
+                .get(&(name.to_string(), constraint.map(str::to_string)))?;
+            memo.hits += 1;
+            Some(meta.clone())
+        })
+    }
+
+    pub(super) fn meta_put(name: &str, constraint: Option<&str>, meta: crate::snap::SnapMeta) {
+        MEMO.with(|m| {
+            if let Some(memo) = m.borrow_mut().as_mut() {
+                memo.evals += 1;
+                memo.metas
+                    .insert((name.to_string(), constraint.map(str::to_string)), meta);
+            }
+        });
+    }
+
+    /// `(hits, evals)` since the install — the test seam.
+    #[cfg(test)]
+    pub(super) fn stats() -> (u64, u64) {
+        MEMO.with(|m| {
+            m.borrow()
+                .as_ref()
+                .map(|memo| (memo.hits, memo.evals))
+                .unwrap_or((0, 0))
+        })
+    }
+
+    /// True when no guard is installed (pass-through mode).
+    #[cfg(test)]
+    pub(super) fn is_inactive() -> bool {
+        MEMO.with(|m| m.borrow().is_none())
+    }
 }
 
 /// What one loaded pod contributes to the loading pod's composition:
@@ -1837,6 +1957,9 @@ pub fn add_snap_pod(
         payload_path: payload.to_path_buf(),
         layer: payload_layer(&decl, &name),
         meta_digest: None,
+        // Sideload: bytes this process never observed at write time —
+        // the install-time re-verify stays (issue #116).
+        provenance: crate::runtime::SnapProvenance::Fetched,
     };
     let install = store.install_batch(
         &[pending],
@@ -3148,9 +3271,12 @@ fn held_at_pin(
 /// store content was built from THIS recipe, so a plain sync can hold.
 /// `None` on the installed side never matches — pre-#113 manifests
 /// rebuild once, record their digest, and hold from then on. Floating
-/// packages never hold: float mode follows upstream content drift at a
-/// constant recipe (ADR-0017) — its sync re-resolves the closure and
-/// repins, which a hold would silently skip.
+/// packages never hold HERE — their content identity is not the recipe
+/// digest (which is computed against the rebased seed and would skew) —
+/// but they hold on OBSERVED input identity instead: the Decision 4a
+/// hold in [`build_own_package`] keeps a float whose re-resolved tuple
+/// (version, observed source sha256, resolved deps hash) equals the
+/// recorded one, with the drift observation never skipped.
 fn held_at_content(
     active: Option<&crate::runtime::Generation>,
     meta: &crate::snap::SnapMeta,
@@ -3211,21 +3337,54 @@ fn hold_plain_sync(
     OwnScope::Held
 }
 
-/// Verify the recorded deps-closure blob of a content-held package
-/// (issue #125): the hold skips the build that would otherwise hash the
-/// blob (issue #113), so a corrupted or missing store entry would ride
-/// along silently — the held sync instead fails loud, fail-closed like
-/// [`crate::dep_fetch::materialize_deps_entry`]. Packages without a
-/// recorded deps pin (no `deps` declaration, store/pull installs) skip
-/// cleanly: nothing to verify.
-fn verify_held_deps_blob(ctx: &ReconcileCtx<'_>, name: &str) -> miette::Result<()> {
-    let hash = ctx
+/// Queue the held-sync deps-blob verification of `name`'s recorded pin
+/// (issue #125) onto the reconcile build. The (name, blob, expected
+/// hash) triple is COLLECTED here in lockfile iteration order; the
+/// hashing itself runs ONCE, in parallel over every queued triple,
+/// after collection ([`verify_held_blobs`], sync-speed plan item 4).
+/// No recorded deps pin (no `deps` declaration, store/pull installs):
+/// nothing to verify, skip cleanly.
+fn queue_held_deps_verify(ctx: &ReconcileCtx<'_>, name: &str, build: &mut ReconcileBuild) {
+    let Some(hash) = ctx
         .lock
         .packages
         .get(name)
         .and_then(|e| e.deps.as_ref())
-        .map(|d| d.deps_hash.as_str());
-    verify_deps_blob_hash(ctx.store, name, hash)
+        .map(|d| d.deps_hash.clone())
+    else {
+        return;
+    };
+    let blob = ctx.store.blob_path(&hash);
+    build.held_blob_verifies.push(HeldBlobVerify {
+        name: name.to_string(),
+        blob,
+        expected_hash: hash,
+    });
+}
+
+/// The loaded twin of [`queue_held_deps_verify`] (ADR-0048): the pin
+/// resolves from the DECLARING pod's lockfile
+/// ([`declaring_pod_deps_pin`]); no declaring pod or no pin there:
+/// nothing resolvable to verify, skip cleanly. An unreadable lockfile
+/// stays an IMMEDIATE error — we cannot know whether a pin exists, so
+/// this is not a blob mismatch to batch.
+fn queue_held_loaded_deps_verify(
+    ctx: &ReconcileCtx<'_>,
+    source_pod: Option<&str>,
+    name: &str,
+    build: &mut ReconcileBuild,
+) -> miette::Result<()> {
+    let hash = declaring_pod_deps_pin(ctx, source_pod, name)?.map(|d| d.deps_hash);
+    let Some(hash) = hash else {
+        return Ok(());
+    };
+    let blob = ctx.store.blob_path(&hash);
+    build.held_blob_verifies.push(HeldBlobVerify {
+        name: name.to_string(),
+        blob,
+        expected_hash: hash,
+    });
+    Ok(())
 }
 
 /// The deps pin a LOADED member's declaring pod carries for `name`
@@ -3246,41 +3405,81 @@ fn declaring_pod_deps_pin(
     Ok(lock.and_then(|l| l.packages.get(name).and_then(|e| e.deps.clone())))
 }
 
-/// Re-verify the recorded deps-closure blob of a content-held LOADED
-/// member (ADR-0048; the [`verify_held_deps_blob`] shape): the hold
-/// skips the build that would otherwise hash the blob, so a corrupted
-/// store entry would ride the hold silently. The pin resolves from the
-/// DECLARING pod's lockfile ([`declaring_pod_deps_pin`]); no declaring
-/// pod or no pin there: nothing resolvable to verify, skip cleanly.
-fn verify_held_loaded_deps_blob(
-    ctx: &ReconcileCtx<'_>,
-    source_pod: Option<&str>,
-    name: &str,
-) -> miette::Result<()> {
-    let hash = declaring_pod_deps_pin(ctx, source_pod, name)?.map(|d| d.deps_hash);
-    verify_deps_blob_hash(ctx.store, name, hash.as_deref())
+/// One queued held-blob verification (issue #125 + ADR-0048, parallel
+/// pass per sync-speed plan item 4): the package whose hold recorded
+/// the pin, the blob path, and the expected sha256. Triples queue in
+/// lockfile iteration order; the pass reports the FIRST failure in that
+/// order.
+#[derive(Debug)]
+struct HeldBlobVerify {
+    name: String,
+    blob: PathBuf,
+    expected_hash: String,
+}
+
+/// The parallel held-blob verify (sync-speed plan item 4): hash every
+/// triple queued during collection with `std::thread::scope` and a
+/// work-stealing cursor (no rayon — the workspace carries no rayon and
+/// gains none). ALL results are collected before anything fails, then
+/// the FIRST failure in the ORIGINAL lockfile iteration order bails
+/// with the eager check's message verbatim
+/// ([`check_held_blob`]). A panic in any worker propagates through the
+/// scope — a corrupted worker can never surface as a silent pass.
+fn verify_held_blobs(build: &ReconcileBuild) -> miette::Result<()> {
+    let triples = &build.held_blob_verifies;
+    if triples.is_empty() {
+        return Ok(());
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failures: std::sync::Mutex<BTreeMap<usize, String>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    let workers = triples
+        .len()
+        .min(std::thread::available_parallelism().map_or(1, |n| n.get()));
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if i >= triples.len() {
+                    break;
+                }
+                let triple = &triples[i];
+                if let Err(e) = check_held_blob(&triple.name, &triple.blob, &triple.expected_hash) {
+                    failures
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(i, format!("{e}"));
+                }
+            });
+        }
+        // Every handle is joined by the scope; a worker panic re-raises
+        // here (std::thread::scope propagates it after the closure).
+    });
+    let failures = failures.into_inner().unwrap_or_else(|p| p.into_inner());
+    // First mismatch in lock order wins, message verbatim.
+    if let Some((_, message)) = failures.into_iter().next() {
+        miette::bail!("{message}");
+    }
+    Ok(())
 }
 
 /// The blob check both hold paths share (issue #125, ADR-0048): one
 /// stat + one streaming hash of the already-local blob; no fetch, no
 /// unpack, no auto-heal. A missing or tampered entry fails the sync
 /// loud, fail-closed like [`crate::dep_fetch::materialize_deps_entry`].
-fn verify_deps_blob_hash(
-    store: &crate::runtime::RuntimeStore,
-    name: &str,
-    hash: Option<&str>,
-) -> miette::Result<()> {
-    let Some(hash) = hash else {
-        return Ok(());
-    };
-    let blob = store.blob_path(hash);
+/// The hash rides the process-lifetime blob memo (sync-speed plan item
+/// 6a): a blob this sync already hashed (a write, another hold's pin on
+/// the same closure) costs no second read. This is ALSO the worker body
+/// of [`verify_held_blobs`] — the error messages here are the sync's
+/// held-verify contract, verbatim.
+fn check_held_blob(name: &str, blob: &Path, hash: &str) -> miette::Result<()> {
     if !blob.exists() {
         miette::bail!(
             "held package '{name}': dependency closure {hash:.12}… is missing from the pod \
              store — the held sync refuses to proceed; run `nau deps fetch` to fetch it"
         );
     }
-    let actual = crate::dep_fetch::sha256_file(&blob)?;
+    let actual = nau_core::blob_memo::memoized_sha256_file(blob)?;
     if actual != hash {
         miette::bail!(
             "held package '{name}': dependency closure hash mismatch: expected {hash}, \
@@ -3575,10 +3774,11 @@ fn scope_own_package(
     if !drifted && !scoped && !overlay && held_at_content(ctx.active, meta) {
         // Content hold (issue #113): the installed record was built
         // from this exact recipe — plain sync keeps its store content.
-        // The hold never reads the deps blob, so re-verify the recorded
-        // closure pin first (issue #125): corrupted or missing store
-        // content fails the sync loud instead of riding along.
-        verify_held_deps_blob(ctx, &meta.name)?;
+        // The hold never reads the deps blob, so queue the recorded
+        // closure pin's re-verification (issue #125): the parallel pass
+        // after collection fails the sync loud on corrupted or missing
+        // store content instead of riding along.
+        queue_held_deps_verify(ctx, &meta.name, build);
         return Ok(hold_plain_sync(ctx, meta, build));
     }
     // Pin-bridge hold (issue #331, plain sync only): the pin and the
@@ -3592,13 +3792,20 @@ fn scope_own_package(
     // mismatches still rebuilds (the strict #113 check), and `pod
     // refresh` / `pod rebuild` remain the deliberate moves; the deps
     // blob re-verifies fail-closed like every hold (issue #125).
+    //
+    // FLOATING packages are excluded: the pin is a float's resolution
+    // only when the re-resolved inputs say so (ADR-0017 Decision 4a) —
+    // a float with a digest-None record rebuilds ONCE (acquiring the
+    // digest and the observed tuple) and then takes the float hold,
+    // which — unlike this bridge — observes upstream every sync.
     if !drifted
         && !scoped
         && !overlay
+        && !meta.floating
         && build.refresh_members.is_empty()
         && held_at_undigested_pin(ctx.lock, &meta.name, &meta.version, ctx.active)
     {
-        verify_held_deps_blob(ctx, &meta.name)?;
+        queue_held_deps_verify(ctx, &meta.name, build);
         return Ok(hold_plain_sync(ctx, meta, build));
     }
     // `pod refresh` baselining (issue #142): a drifted member the verb
@@ -3824,16 +4031,47 @@ fn reconcile_pod_scoped(
     opts: &ReconcileOpts<'_>,
     tools: &crate::runtime::RuntimeTools,
 ) -> miette::Result<(PodSyncReport, bool)> {
+    // Reconcile-lifetime eval memo (sync-speed plan item 5): pod.lua
+    // declarations and recipe metas evaluate once and clone thereafter.
+    // The guard drops with the function — the memo structurally cannot
+    // outlive the reconcile. Sound because nothing mutates pod.lua or
+    // the recipes mid-reconcile (`pod add` writes the declaration
+    // BEFORE reconciling).
+    let _eval_memo = eval_memo::install();
+    // Phase timing for perf work: `NAU_SYNC_TRACE=1` prints one wall-time
+    // line per reconcile phase to stderr.
+    fn trace(name: &str, since: std::time::Instant) {
+        if std::env::var_os("NAU_SYNC_TRACE").is_some() {
+            eprintln!("[sync-trace] {name}: {:?}", since.elapsed());
+        }
+    }
+    let t = std::time::Instant::now();
     let mut state = prepare_reconcile(root, pod_name, opts.allow_degraded, tools)?;
+    trace("prepare_reconcile", t);
+    let t = std::time::Instant::now();
     let (env_vars, secrets, svc_overrides) =
         resolve_pure_inputs(&state.root, &state.pod_name, &state.decl)?;
+    trace("resolve_pure_inputs", t);
     let mut build = ReconcileBuild {
         rebuild_unstamped: opts.rebuild_unstamped,
         refresh_members: opts.refresh.iter().cloned().collect(),
         ..Default::default()
     };
+    let t = std::time::Instant::now();
     collect_pending(&mut state, opts, &mut build)?;
+    trace("collect_pending", t);
+    // Parallel held-blob verify (issue #125 + ADR-0048, sync-speed plan
+    // item 4): every hold queued its (package, blob, pin) triple during
+    // collection; hash them all in one work-stealing pass and fail on
+    // the FIRST mismatch in lock order. Runs BEFORE any install — a
+    // corrupted store entry still stops the sync before it mutates.
+    let t = std::time::Instant::now();
+    verify_held_blobs(&build)?;
+    trace("held_blob_verify", t);
+    let t = std::time::Instant::now();
     let installed = install_pending(&mut state, &mut build)?;
+    trace("install_pending", t);
+    let t = std::time::Instant::now();
 
     // Overlay-driven repins (issue #6) and moved dependency-closure pins
     // (ADR-0017): applied only after the installs succeeded, so a failed
@@ -3847,9 +4085,13 @@ fn reconcile_pod_scoped(
         &build.source_repins,
         &state.lock_path,
     )?;
+    trace("apply_pin_updates", t);
+    let t = std::time::Instant::now();
     // Remove store packages the declaration dropped.
     let removed = remove_undeclared(&state.store, &state.tools, &build.declared_names)?;
-    present_and_reconcile(
+    trace("remove_undeclared", t);
+    let t = std::time::Instant::now();
+    let report = present_and_reconcile(
         &state,
         pod_name,
         &env_vars,
@@ -3873,7 +4115,9 @@ fn reconcile_pod_scoped(
             },
             build.deps_moved,
         )
-    })
+    });
+    trace("present_and_reconcile", t);
+    report
 }
 
 /// Present whatever is now active and run the service reconcile tail
@@ -3894,6 +4138,7 @@ fn present_and_reconcile(
     Option<PathBuf>,
     crate::services::ServiceReconcileReport,
 )> {
+    let t = std::time::Instant::now();
     let (generation, farm) = present_active(
         &state.store,
         &state.dir,
@@ -3903,10 +4148,17 @@ fn present_and_reconcile(
         svc_overrides,
         secrets_cache_base,
     )?;
+    if std::env::var_os("NAU_SYNC_TRACE").is_some() {
+        eprintln!("[sync-trace] present_active: {:?}", t.elapsed());
+    }
+    let t = std::time::Instant::now();
     let services = match generation {
         Some(_) => crate::services::reconcile(&state.store, &state.dir, pod_name, tools)?,
         None => crate::services::reconcile_empty(&state.dir, pod_name, tools)?,
     };
+    if std::env::var_os("NAU_SYNC_TRACE").is_some() {
+        eprintln!("[sync-trace] services_reconcile: {:?}", t.elapsed());
+    }
     Ok((generation, farm, services))
 }
 
@@ -4172,6 +4424,11 @@ struct ReconcileBuild {
     /// `pod refresh <member…>` (issue #142): the members to rebuild from
     /// current recipes regardless of declared-ness.
     refresh_members: std::collections::BTreeSet<String>,
+    /// Held-blob verifications queued during collection (issue #125 +
+    /// ADR-0048, sync-speed plan item 4): (package, blob, expected sha256)
+    /// triples in lockfile iteration order, hashed once — in parallel —
+    /// by [`verify_held_blobs`] after collection completes.
+    held_blob_verifies: Vec<HeldBlobVerify>,
     /// Declared packages whose recipe closure drifted (issue #142):
     /// rebuilt at their pins EVEN at an unchanged version.
     recipe_drift: std::collections::BTreeSet<String>,
@@ -4221,13 +4478,34 @@ fn loaded_contributions(
     Ok((loaded_versions, loaded_overlays))
 }
 
+/// [`crate::deps::load_meta_for`] behind the reconcile-lifetime memo
+/// (sync-speed plan item 5): the eval runs in a bounded subprocess
+/// worker per call, so the ~76 redundant re-evals of the same
+/// (name, constraint) across a sync's resolvers (collection, collision
+/// classifiers, service walks, build prefixes, requires closure) cost
+/// one worker spawn. Same lifetime rule as [`load_declaration`]: the
+/// memo lives inside [`reconcile_pod_scoped`]'s guard — nothing mutates
+/// recipes mid-reconcile — and is dropped with it. Errors are NOT
+/// memoized (a failed eval aborts the reconcile anyway).
+fn load_meta_memoized(
+    name: &str,
+    constraint: Option<&str>,
+) -> miette::Result<crate::snap::SnapMeta> {
+    if let Some(hit) = eval_memo::meta_hit(name, constraint) {
+        return Ok(hit);
+    }
+    let meta = crate::deps::load_meta_for(name, constraint)?;
+    eval_memo::meta_put(name, constraint, meta.clone());
+    Ok(meta)
+}
+
 /// Load a declared spec's meta with its constraint threaded into the
 /// recipe eval (ADR-0047 Decision 4): `node@22` evaluates pkgs/n/node.lua
 /// with `constraint = "22"` so the recipe selects the declared line.
 /// `node` (no constraint) evaluates unconstrained — the recipe's own
 /// default line.
 fn load_spec_meta(spec: &PodPackageSpec) -> miette::Result<crate::snap::SnapMeta> {
-    crate::deps::load_meta_for(&spec.name, spec.constraint.as_deref())
+    load_meta_memoized(&spec.name, spec.constraint.as_deref())
 }
 
 /// Resolve one declared own package through the collection + the pod's
@@ -4287,9 +4565,11 @@ fn resolve_own_meta(
 /// build-input seed at the recorded pin instead. A source the lock
 /// never saw keeps the recipe hash as its TOFU seed. LOCKED
 /// (non-floating) sources are untouched: their recipe pin is enforced
-/// exactly and must never be masked by a lock entry. Floating metas
-/// never take the content hold (`held_at_content` is false for
-/// floating), so the rebased build-input digest has no hold to skew.
+/// exactly and must never be masked by a lock entry. The rebased
+/// build-input digest has no hold to skew: the float hold (ADR-0017
+/// Decision 4a) compares OBSERVED hashes against the lock's records and
+/// never reads the rebased digest — a moved asset under a stale tag
+/// cannot hold through it.
 fn rebase_floating_source_pin(meta: &mut crate::snap::SnapMeta, lock: &LockFile) {
     if !meta.floating {
         return;
@@ -4372,7 +4652,16 @@ fn collect_own_packages(
             build,
         )?;
         if let OwnScope::Build = scope {
-            build_own_package(ctx, &spec, &meta, layer, opts.float_deps && selected, build)?;
+            build_own_package(
+                ctx,
+                &spec,
+                &meta,
+                layer,
+                opts.float_deps && selected,
+                opts.only.is_some(),
+                overlay,
+                build,
+            )?;
         }
         // Issue #142, incremental stamping: this package's contribution
         // (a successful build, or a hold that keeps its content) is
@@ -4414,17 +4703,185 @@ fn commit_pending_recipe_stamp(
     Ok(())
 }
 
+// ── Float hold on observed input identity (ADR-0017 Decision 4a) ──
+
+/// Cheap preconditions of the float hold (ADR-0017 Decision 4a): the
+/// guards that bypass it — the exact set gating [`held_at_content`]
+/// (scoped rebuild, overlay-applied members, recipe drift, `pod
+/// refresh`/`--latest` members) — plus the records it needs: an
+/// installed record carrying a build-input digest and a lock entry.
+/// Gating the source OBSERVATION on these keeps a rebuild-bound float
+/// from paying a probe download it would never compare.
+fn float_hold_guards_open(
+    ctx: &ReconcileCtx<'_>,
+    meta: &crate::snap::SnapMeta,
+    build: &ReconcileBuild,
+    scoped: bool,
+    overlay: bool,
+) -> bool {
+    if !meta.floating || scoped || overlay {
+        return false;
+    }
+    if build.recipe_drift.contains(&meta.name) || build.refresh_members.contains(&meta.name) {
+        return false;
+    }
+    let installed_present = ctx
+        .active
+        .and_then(|g| g.packages.get(&meta.name))
+        .is_some_and(|p| p.meta_digest.is_some());
+    installed_present && ctx.lock.packages.contains_key(&meta.name)
+}
+
+/// The float hold's SOURCE tuple member (ADR-0017 Decision 4a): the
+/// OBSERVED sha256 under the floating ref — computed by this sync's
+/// re-resolve, never the rebased build-input seed — equals the lockfile's
+/// restamped record (what the active generation's content was built
+/// from). A source with no observed hash (no source, non-http,
+/// multi-source) or a url the lock never restamped cannot prove input
+/// identity: no source member comparison fails open, toward rebuilding.
+fn float_source_member_holds(
+    lock: &LockFile,
+    source: Option<&crate::snap::SourceSpec>,
+    observed: Option<&str>,
+) -> bool {
+    match (source, observed) {
+        (None, _) => true,
+        (Some(spec), Some(observed)) => lock.lookup_source(spec.url()) == Some(observed),
+        (Some(_), None) => false,
+    }
+}
+
+/// The float hold's DEPS tuple member (ADR-0017 Decision 4a): the
+/// freshly resolved closure hash equals the recorded pin's. A deps
+/// declaration without a fresh resolution or without a recorded pin
+/// fails toward rebuilding.
+fn float_deps_member_holds(
+    deps: Option<&nau_core::snap_types::PackageDeps>,
+    fresh: Option<&crate::lock::PackageDepsLock>,
+    recorded: Option<&crate::lock::PackageDepsLock>,
+) -> bool {
+    match (deps, fresh, recorded) {
+        (None, _, _) => true,
+        (Some(_), Some(fresh), Some(recorded)) => fresh.deps_hash == recorded.deps_hash,
+        _ => false,
+    }
+}
+
+/// True when a freshly re-resolved FLOATING package would be HELD at its
+/// installed content because its observed input tuple equals the tuple
+/// recorded at its last build (ADR-0017 Decision 4a). The tuple:
+///
+/// 1. **Observed this sync** — the resolved version, the source sha256
+///    observed under the floating ref by this sync's re-resolve (a real
+///    download; floats never take the source cache), and the freshly
+///    resolved deps closure hash. The observation is NEVER skipped:
+///    float still means re-resolve (Decision 4) — only the rebuild and
+///    install are skipped.
+/// 2. **Recorded at the last build** — the pod lockfile's entry for the
+///    package: the version pin, the `sources` map restamp (url →
+///    sha256), and the deps pin. A crash between install and
+///    [`apply_pin_updates`] leaves this record stale — the next sync
+///    then compares fresh observations against the stale record and
+///    holds only when upstream genuinely did not move (in which case
+///    the content is identical anyway); any real move rebuilds. The
+///    failure direction is a wasted rebuild, never stale content.
+///
+/// The rebased build-input digest is deliberately NOT compared
+/// anywhere here: it is computed against the lockfile's last-known pin,
+/// so a moved upstream asset under a stale tag would compare equal and
+/// hold WRONGLY. The guard set matches [`held_at_content`] exactly
+/// ([`float_hold_guards_open`]). A `meta_digest: None` installed record
+/// (pre-#113) never matches — it rebuilds ONCE to acquire the tuple,
+/// then holds from then on (the migration bridge).
+fn held_float_at_observed_inputs(
+    ctx: &ReconcileCtx<'_>,
+    meta: &crate::snap::SnapMeta,
+    fresh_deps: Option<&crate::lock::PackageDepsLock>,
+    observed_source: Option<&str>,
+    build: &ReconcileBuild,
+    scoped: bool,
+    overlay: bool,
+) -> bool {
+    if !float_hold_guards_open(ctx, meta, build, scoped, overlay) {
+        return false;
+    }
+    let Some(installed) = ctx.active.and_then(|g| g.packages.get(&meta.name)) else {
+        return false;
+    };
+    if installed.version != meta.version {
+        return false;
+    }
+    let Some(entry) = ctx.lock.packages.get(&meta.name) else {
+        return false;
+    };
+    if entry.version != meta.version {
+        return false;
+    }
+    let source_holds = float_source_member_holds(ctx.lock, meta.source.as_ref(), observed_source);
+    let deps_holds = float_deps_member_holds(meta.deps.as_ref(), fresh_deps, entry.deps.as_ref());
+    source_holds && deps_holds
+}
+
 /// Build one own package that survived scoping: contribute its claims,
 /// ensure its dependency closure, record pin movements, and queue the
-/// pending build (issue #3/#15).
+/// pending build (issue #3/#15). A floating package whose observed
+/// input tuple still matches its recorded tuple holds instead
+/// (ADR-0017 Decision 4a): the re-resolve ran (observation never
+/// skipped), but no build, no install, no pin movement, and no
+/// `fetched_at`/source restamp happen — the recorded pin is kept
+/// wholesale. `scoped`/`overlay` ride in from the scoping decision:
+/// both bypass the hold.
+#[allow(clippy::too_many_arguments)]
 fn build_own_package(
     ctx: &ReconcileCtx<'_>,
     spec: &PodPackageSpec,
     meta: &crate::snap::SnapMeta,
     layer: crate::farm::ClaimLayer,
     force_float: bool,
+    scoped: bool,
+    overlay: bool,
     build: &mut ReconcileBuild,
 ) -> miette::Result<()> {
+    // The float hold observes BEFORE deciding (ADR-0017 Decision 4a):
+    // the deps closure re-resolves in ensure_own_deps (the deps drift
+    // probe), the source is observed by that fetch or — for floats
+    // without a deps closure — by the probe below (a real download;
+    // floats never take the source cache). The observation is never
+    // skipped; only the rebuild/install is.
+    let hold_possible = float_hold_guards_open(ctx, meta, build, scoped, overlay);
+    let (deps_pin, observed_from_deps) =
+        ensure_own_deps(ctx.store, ctx.lock, meta, &spec.name, force_float).map_err(|e| {
+            miette::miette!("cannot fetch dependency closure for '{}': {e}", spec.name)
+        })?;
+    if hold_possible {
+        let observed_source = match observed_from_deps {
+            Some(sha) => Some(sha),
+            None => crate::snap::observe_source(meta)?,
+        };
+        if held_float_at_observed_inputs(
+            ctx,
+            meta,
+            deps_pin.as_ref(),
+            observed_source.as_deref(),
+            build,
+            scoped,
+            overlay,
+        ) {
+            // Held (ADR-0017 Decision 4a): the re-resolve reproduced the
+            // recorded input tuple — keep the installed content. The hold
+            // never reads the deps blob, so queue the recorded closure
+            // pin's re-verification (issue #125): the parallel pass after
+            // collection fails the sync loud on corrupted or missing
+            // store content instead of riding along. The
+            // recorded pin is kept WHOLESALE: no repin, no deps-pin
+            // movement, no source restamp (the closure re-fetch that
+            // reproduced the pin left its fetched_at untouched — the
+            // ensure_pod_deps reproduced-pin arm).
+            queue_held_deps_verify(ctx, &meta.name, build);
+            hold_plain_sync(ctx, meta, build);
+            return Ok(());
+        }
+    }
     push_meta_desktop_claims(&mut build.desktop_claims, meta, layer);
     push_meta_binary_claims(&mut build.binary_claims, meta, layer);
     push_meta_service_claims(&mut build.service_claims, meta, layer);
@@ -4432,8 +4889,6 @@ fn build_own_package(
     // BEFORE the sandboxed offline build consumes it. `force_float`
     // floats the closure regardless of the meta's own float mode
     // (issue #15 --latest).
-    let deps_pin = ensure_own_deps(ctx.store, ctx.lock, meta, &spec.name, force_float)
-        .map_err(|e| miette::miette!("cannot fetch dependency closure for '{}': {e}", spec.name))?;
     let prev_entry = ctx.lock.packages.get(&spec.name);
     if deps_pin_moved(force_float, prev_entry, deps_pin.as_ref()) {
         build.deps_moved = true;
@@ -4488,7 +4943,7 @@ fn resolve_loaded_meta(
     loaded_patch: Option<&serde_json::Value>,
     own_patch: Option<&serde_json::Value>,
 ) -> miette::Result<crate::snap::SnapMeta> {
-    let mut meta = crate::deps::load_meta_for(name, constraint).map_err(|e| {
+    let mut meta = load_meta_memoized(name, constraint).map_err(|e| {
         miette::miette!("loaded package '{name}' from pod '{pod_name}' cannot be resolved: {e}")
     })?;
     if let Some(patch) = loaded_patch {
@@ -4583,7 +5038,9 @@ fn pin_loaded_version(meta: &mut crate::snap::SnapMeta, contributed: &Contribute
 /// the freshly resolved recipe (the [`held_at_content`] contract, one
 /// layer down — `None` digests never match), the member is not a
 /// `pod refresh` target and not a recipe-drift rebuild, and it is not
-/// floating. Returns the installed record to materialize claims from.
+/// floating. FLOATING members hold through the Decision 4a tuple
+/// instead — [`loaded_float_hold_record`]. Returns the installed
+/// record to materialize claims from.
 ///
 /// Content-identity hold (issue #331): a drifted re-resolution alone
 /// must not rebuild a member whose content the DECLARING pod's active
@@ -4603,11 +5060,12 @@ fn loaded_hold_record<'a>(
     meta: &crate::snap::SnapMeta,
     build: &ReconcileBuild,
 ) -> miette::Result<Option<&'a crate::runtime::InstalledPackage>> {
-    if meta.floating
-        || build.refresh_members.contains(&meta.name)
-        || build.recipe_drift_members.contains(&meta.name)
+    if build.refresh_members.contains(&meta.name) || build.recipe_drift_members.contains(&meta.name)
     {
         return Ok(None);
+    }
+    if meta.floating {
+        return loaded_float_hold_record(ctx, source_pod, own_overlay, meta);
     }
     let installed = match ctx.active.and_then(|g| g.packages.get(&meta.name)) {
         Some(installed) => installed,
@@ -4639,6 +5097,117 @@ fn loaded_hold_record<'a>(
     }
 }
 
+/// The LOADED arm of the float hold on observed input identity (ADR-0017
+/// Decision 4a): a floating loaded member holds when its observed input
+/// tuple equals the tuple recorded in the DECLARING pod's state — the
+/// same predicate as the own arm, with the recorded tuple (and the
+/// deps pin) resolving from the declaring pod's lockfile, the same
+/// pattern as [`declaring_pod_deps_pin`]. Guards match the loaded
+/// content hold: this pod's own overlay on the member, a `pod refresh`
+/// target, and a recipe-drift rebuild all bypass.
+///
+/// The three tuple members:
+///
+/// 1. **Version** — the freshly resolved (contribution-pinned) version
+///    equals the declaring pod's lock entry version AND the installed
+///    version.
+/// 2. **Source** — the OBSERVED sha256 under the floating ref (a real
+///    download via [`crate::snap::observe_source`]; never skipped —
+///    float still means re-resolve) equals the declaring pod's
+///    restamped `sources` record. A source the lock never restamped
+///    cannot prove identity.
+/// 3. **Deps closure** — the closure resolves in the pod that DECLARES
+///    the package (ADR-0048; the loading pod never re-fetches it), so
+///    the fresh-closure comparison of the own arm has no local
+///    counterpart here. Its observation is the DECLARING pod's active
+///    generation instead: if the closure moved upstream, the declaring
+///    pod's own sync rebuilt the member and its generation now carries
+///    different content, so the identity check below fails and this
+///    pod rebuilds; while the declaring pod holds, this pod executes
+///    exactly that pod's content (the composition contract). Until the
+///    declaring pod syncs, the loading pod deliberately keeps executing
+///    the content the declaring pod still runs.
+///
+/// The identity check (issue #331 shape): the declaring pod's active
+/// generation must carry the member at the same version, payload hash,
+/// and build-input digest this pod's installed record carries. A
+/// `meta_digest: None` installed record rebuilds ONCE to acquire the
+/// tuple, then holds (the migration bridge). Failure direction: stale
+/// lock or unsynced declaring pod → at worst a wasted rebuild here,
+/// never stale content ahead of the declaring pod.
+fn loaded_float_hold_record<'a>(
+    ctx: &ReconcileCtx<'a>,
+    source_pod: Option<&str>,
+    own_overlay: bool,
+    meta: &crate::snap::SnapMeta,
+) -> miette::Result<Option<&'a crate::runtime::InstalledPackage>> {
+    if own_overlay {
+        return Ok(None);
+    }
+    let Some(installed) = ctx.active.and_then(|g| g.packages.get(&meta.name)) else {
+        return Ok(None);
+    };
+    if installed.meta_digest.is_none() || installed.version != meta.version {
+        return Ok(None);
+    }
+    let Some(pod) = source_pod else {
+        return Ok(None);
+    };
+    // The declaring pod's lockfile is the recorded tuple. An unreadable
+    // lockfile is an error (the declaring_pod_deps_pin contract): we
+    // cannot know whether the inputs moved, so a silent skip could let
+    // a drift ride a hold.
+    let lock = match LockFile::load(&pod_lock_path(ctx.root, pod))? {
+        Some(lock) => lock,
+        None => return Ok(None),
+    };
+    // The source drift probe — NEVER skipped (Decision 4): observe the
+    // floating ref, compare against the declaring pod's restamped record.
+    let observed = crate::snap::observe_source(meta)?;
+    if !float_lock_tuple_holds(&lock, meta, observed.as_deref()) {
+        return Ok(None);
+    }
+    // The declaring pod still executes byte-identical content — the
+    // deps-closure observation proxy (see the doc above).
+    let Some(recorded) = declaring_pod_member_record(ctx, Some(pod), &meta.name)? else {
+        return Ok(None);
+    };
+    if !same_declaring_content(&recorded, installed) {
+        return Ok(None);
+    }
+    Ok(Some(installed))
+}
+
+/// The declaring lockfile's tuple members (ADR-0017 Decision 4a, loaded
+/// arm): an entry for the member must exist, agree on the version, and
+/// — when the meta declares a source — carry a restamped record equal to
+/// the OBSERVED sha256 under the floating ref.
+fn float_lock_tuple_holds(
+    lock: &LockFile,
+    meta: &crate::snap::SnapMeta,
+    observed: Option<&str>,
+) -> bool {
+    let Some(entry) = lock.packages.get(&meta.name) else {
+        return false;
+    };
+    if entry.version != meta.version {
+        return false;
+    }
+    float_source_member_holds(lock, meta.source.as_ref(), observed)
+}
+
+/// The identity half of the issue #331 content check: the declaring
+/// pod's generation must carry the member at the same version, payload
+/// hash, and build-input digest this pod's installed record carries.
+fn same_declaring_content(
+    recorded: &crate::runtime::InstalledPackage,
+    installed: &crate::runtime::InstalledPackage,
+) -> bool {
+    recorded.version == installed.version
+        && recorded.sha3_384 == installed.sha3_384
+        && recorded.meta_digest == installed.meta_digest
+}
+
 /// The declaring pod's active-generation record for one contributed
 /// member (issue #331): the content identity the member must still
 /// match for the loaded hold to skip its rebuild. `None` when there is
@@ -4659,9 +5228,10 @@ fn declaring_pod_member_record(
         .and_then(|g| g.packages.get(name).cloned()))
 }
 
-/// The loaded-member hold body (ADR-0048): re-verify the recorded deps
-/// blob where the declaring pod resolves a pin (a corrupted closure
-/// must not ride the hold), record the hold, and contribute the
+/// The loaded-member hold body (ADR-0048): queue the recorded deps
+/// blob's re-verification where the declaring pod resolves a pin (a
+/// corrupted closure must not ride the hold — the parallel pass after
+/// collection fails the sync loud), record the hold, and contribute the
 /// installed record's claims at the `Loaded` layer so the generation
 /// still presents the member's desktop IDs and binaries.
 fn hold_loaded_member(
@@ -4671,7 +5241,7 @@ fn hold_loaded_member(
     meta: &crate::snap::SnapMeta,
     build: &mut ReconcileBuild,
 ) -> miette::Result<()> {
-    verify_held_loaded_deps_blob(ctx, source_pod, &meta.name)?;
+    queue_held_loaded_deps_verify(ctx, source_pod, &meta.name, build)?;
     build.held.push(meta.name.clone());
     hold_style_skip_claims(
         &mut build.desktop_claims,
@@ -4825,7 +5395,7 @@ fn install_requires_closure(
             build.declared_names.insert(name);
             continue;
         }
-        let dep_meta = crate::deps::load_meta_for(&name, constraint.as_deref())?;
+        let dep_meta = load_meta_memoized(&name, constraint.as_deref())?;
         let payload = ensure_pod_dep_payload(
             ctx.store,
             &name,
@@ -4833,7 +5403,10 @@ fn install_requires_closure(
             &mut building,
             drifted || refresh,
         )?;
-        let sha3_384 = crate::store::sha3_384_file(&payload)?;
+        // Memo hit: the ensure above already hashed this payload (its
+        // verify or fresh-build record) — the per-sync memo makes the
+        // second hash free (sync-speed plan item 6a).
+        let sha3_384 = sha3_384_file_memoized(&payload)?;
         if refresh {
             // The refreshed member joins the composition with its
             // claims COLLECTED (the closure-member gap, issue #142):
@@ -5228,7 +5801,7 @@ fn push_loaded_binary_claims(
         if declared || name == new_name {
             continue;
         }
-        let meta = crate::deps::load_meta_for(&name, constraint.as_deref()).map_err(|e| {
+        let meta = load_meta_memoized(&name, constraint.as_deref()).map_err(|e| {
             miette::miette!("cannot check loaded '{}' for a binary collision: {e}", name)
         })?;
         push_meta_binary_claims(claims, &meta, crate::farm::ClaimLayer::Loaded);
@@ -5425,7 +5998,7 @@ fn push_loaded_service_claims(
         if declared || name == new_name {
             continue;
         }
-        let meta = crate::deps::load_meta_for(&name, constraint.as_deref()).map_err(|e| {
+        let meta = load_meta_memoized(&name, constraint.as_deref()).map_err(|e| {
             miette::miette!(
                 "cannot check loaded '{}' for a service collision: {e}",
                 name
@@ -5704,7 +6277,7 @@ fn walk_post_state_services(
         if own {
             continue;
         }
-        let meta = crate::deps::load_meta_for(&name, constraint.as_deref()).map_err(|e| {
+        let meta = load_meta_memoized(&name, constraint.as_deref()).map_err(|e| {
             miette::miette!("cannot validate service overrides against loaded '{name}': {e}")
         })?;
         resolve_service_overrides_against_meta(overrides, &meta, pod_name)?;
@@ -5751,11 +6324,20 @@ fn resolve_service_overrides_against_meta(
 /// Degraded-mode banner for `pod add` when the squashfs pair is absent:
 /// the declaration is written, the install is deferred to
 /// `nau pod sync` once the tools exist.
-/// Epoch stamped into pod-built payloads so the same content builds to
-/// the same bytes on every sync (mksquashfs embeds build time otherwise
-/// — verified: two builds of an identical tree differ without this, and
-/// match with it). The no-op detection compares payload sha3-384s, so
-/// reproducibility IS the idempotency guarantee.
+/// Epoch stamped into pod-built payloads to make builds REPRODUCIBLE-BY-
+/// CONSTRUCTION-in-intent (mksquashfs embeds build time otherwise). The
+/// output-compare paths treat reproducibility as an ASSUMPTION: the
+/// install_batch no-op skip and the churn guard compare payload sha3-
+/// 384s, which is only sound if two builds of an identical tree produce
+/// identical bytes. Measured 2026-10-02: reproducibility is UNRELIABLE
+/// today — hermes-agent v2026.8.31 (a stable tag, unchanged upstream)
+/// produced payload digests 9caea2… → 92b0ac… → 9caea2… across three
+/// consecutive syncs. Idempotency therefore rests on INPUT-identity
+/// holds, not output compares: the #113/#331 recipe-digest holds and the
+/// ADR-0017 Decision 4a float hold (observed input tuple) keep content
+/// installed without trusting a digest flip. A gate test ("same tree
+/// twice ⇒ identical sha3") must restore and pin output reproducibility
+/// before any output-compare path is treated as load-bearing again.
 const POD_BUILD_EPOCH: &str = "946684800";
 
 /// Stamp the pod build epoch unless the user chose one. Called by every
@@ -5838,11 +6420,30 @@ fn build_pending_snap(
         bypass_source_cache,
     )?;
     let payload = downloads.join(&result.snap_filename);
-    let sha3_384 = crate::store::sha3_384_file(&payload)?;
+    // The build just (re)wrote these bytes: any memo entry for the path
+    // predates the overwrite, and the fresh digest is the Built
+    // provenance proof prepare_snap will rely on (item 6b).
+    nau_core::blob_memo::invalidate(&payload);
+    let sha3_384 = sha3_384_file_memoized(&payload)?;
     Ok((
         build_pending_snap_at(meta, &payload, sha3_384, layer),
         result.source_infos,
     ))
+}
+
+/// [`crate::store::sha3_384_file`] behind the process-lifetime blob memo
+/// (sync-speed plan item 6a): a payload hashed once this sync (a
+/// reuse-verify, another member's ensure) never re-hashes — same bytes,
+/// same process, same hash. Any caller that just (re)WROTE the path
+/// must [`nau_core::blob_memo::invalidate`] first: a recorded digest of
+/// the overwritten bytes must never serve.
+fn sha3_384_file_memoized(path: &Path) -> miette::Result<String> {
+    if let Some(hash) = nau_core::blob_memo::lookup(path) {
+        return Ok(hash);
+    }
+    let hash = crate::store::sha3_384_file(path)?;
+    nau_core::blob_memo::record(path, &hash);
+    Ok(hash)
 }
 
 /// The deps-closure gate refusal, fail-loud (ADR-0048 Decision 1): a
@@ -5894,7 +6495,7 @@ fn pod_build_prefix(
     let closure = crate::deps::resolve_dep_specs(&seeds, true)?;
     let mut payloads = Vec::new();
     for member in closure {
-        let dep_meta = crate::deps::load_meta_for(&member.name, member.constraint.as_deref())?;
+        let dep_meta = load_meta_memoized(&member.name, member.constraint.as_deref())?;
         let snap = ensure_pod_dep_payload(store, &member.name, &dep_meta, building, false)?;
         payloads.push(crate::build_prefix::Payload {
             pkg: member.name,
@@ -5925,6 +6526,14 @@ fn pod_build_prefix(
 /// recursing forever. `force_build` (issue #142) skips the cached
 /// downloads hit: a recipe-drifted member must rebuild from its recipe,
 /// and the fresh payload overwrites the stale cache entry.
+///
+/// A cached hit is VERIFIED before reuse (sync-speed plan item 6e): a
+/// dep payload is a build input, and `exists()` alone would feed a
+/// corrupted cached file into every build prefix silently. The check is
+/// stat + sha3-384 against the digest recorded at build time
+/// ([`dep_payload_digest_path`] sidecar), through the per-sync blob memo
+/// so a payload this sync already hashed costs nothing. Own fail-closed
+/// check — deliberately NOT folded into the #125 deps-blob story.
 fn ensure_pod_dep_payload(
     store: &crate::runtime::RuntimeStore,
     name: &str,
@@ -5943,6 +6552,7 @@ fn ensure_pod_dep_payload(
         crate::snap::host_arch()
     ));
     if existing.exists() && !force_build {
+        verify_cached_dep_payload(&existing, name)?;
         return Ok(existing);
     }
 
@@ -5967,7 +6577,7 @@ fn ensure_pod_dep_payload(
     // Same pod-store treatment as any pod build (issue #9 wrappers,
     // #12 ELF repair): the payload may expose host-run binaries. The
     // build path takes the `nau_core::blob_store` seam handle (issue
-    // #326 PR 2), not the runtime store itself.
+    // // #326 PR 2), not the runtime store itself.
     let blob_store = store.blob_store();
     let result = crate::snap::build_snap(
         dep_meta,
@@ -5983,24 +6593,100 @@ fn ensure_pod_dep_payload(
         false,
     )?;
     building.pop();
-    Ok(downloads.join(&result.snap_filename))
+    let fresh = downloads.join(&result.snap_filename);
+    // Fresh bytes at a possibly-reused path: drop any memo record of the
+    // overwritten content, hash the new bytes, and record the digest the
+    // next sync's reuse check verifies against.
+    nau_core::blob_memo::invalidate(&fresh);
+    let sha3_384 = sha3_384_file_memoized(&fresh)?;
+    record_dep_payload_digest(&fresh, &sha3_384)?;
+    Ok(fresh)
+}
+
+/// The sidecar carrying a built dep payload's recorded sha3-384 (the
+/// reuse check's expected digest): `<payload>.sha3-384` beside the
+/// payload in the downloads dir.
+fn dep_payload_digest_path(payload: &Path) -> PathBuf {
+    let mut name = payload.as_os_str().to_os_string();
+    name.push(".sha3-384");
+    PathBuf::from(name)
+}
+
+/// Verify a cached dep payload against its recorded digest before a
+/// build consumes it (sync-speed plan item 6e, fail-closed):
+///
+/// - sidecar present: a hash mismatch is a named refusal — the cached
+///   file is corrupted or tampered with, and a build prefix would feed
+///   it into every consumer silently. Remedy: delete the payload and
+///   re-run the sync (it rebuilds).
+/// - sidecar absent (payloads written before digest recording existed,
+///   or by a path that records no sidecar): ADOPT — hash now, record the
+///   digest for every later sync. The first post-upgrade reuse rides at
+///   the old trust level once; strictly improved from then on.
+///
+/// The hash rides the per-sync blob memo, so a payload already hashed
+/// this sync (a previous member's ensure, the build's own record)
+/// verifies at zero cost.
+fn verify_cached_dep_payload(payload: &Path, name: &str) -> miette::Result<()> {
+    let digest_path = dep_payload_digest_path(payload);
+    let recorded = match std::fs::read_to_string(&digest_path) {
+        Ok(recorded) => recorded.trim().to_string(),
+        Err(_) => {
+            let actual = sha3_384_file_memoized(payload)?;
+            record_dep_payload_digest(payload, &actual)?;
+            return Ok(());
+        }
+    };
+    let actual = sha3_384_file_memoized(payload)?;
+    if actual != recorded {
+        miette::bail!(
+            "cached build payload '{name}' hash mismatch: expected {recorded}, found {actual} — \
+             the cached payload is corrupted or tampered with; refusing to build against it — \
+             delete {} and re-run the sync",
+            payload.display()
+        );
+    }
+    Ok(())
+}
+
+/// Record a dep payload's sha3-384 into its sidecar (atomic: temp file +
+/// rename, the [`write_pod_declaration`] pattern — no torn digest).
+fn record_dep_payload_digest(payload: &Path, sha3_384: &str) -> miette::Result<()> {
+    let digest_path = dep_payload_digest_path(payload);
+    let tmp = payload.with_file_name(format!(
+        ".{}.tmp-{}",
+        digest_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("payload.sha3-384"),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, sha3_384)
+        .map_err(|e| miette::miette!("writing {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &digest_path)
+        .map_err(|e| miette::miette!("finalizing {}: {e}", digest_path.display()))?;
+    Ok(())
 }
 
 /// Fetch (or verify the cached) dependency closure for an own pod package
 /// BEFORE the sandboxed build consumes it (ADR-0017 Decision 7: add/sync
 /// auto-fetch). `force_float` floats the closure regardless of the
 /// meta's own float mode — the `pod rebuild --latest` seam (issue #15,
-/// ADR-0017 Decision 5). Returns the pin to merge into the lockfile;
-/// `None` when the package declares no deps.
+/// ADR-0017 Decision 5). Returns the pin to merge into the lockfile plus
+/// the OBSERVED sha256 of the source tarball when the closure
+/// re-resolve downloaded one (the float hold's drift observation,
+/// ADR-0017 Decision 4a — reused so the sync never downloads the source
+/// twice); `None` when the package declares no deps or nothing was
+/// fetched.
 fn ensure_own_deps(
     store: &crate::runtime::RuntimeStore,
     lock: &LockFile,
     meta: &crate::snap::SnapMeta,
     pkg_name: &str,
     force_float: bool,
-) -> miette::Result<Option<crate::lock::PackageDepsLock>> {
+) -> miette::Result<(Option<crate::lock::PackageDepsLock>, Option<String>)> {
     if meta.deps.is_none() {
-        return Ok(None);
+        return Ok((None, None));
     }
     let prev = lock.packages.get(pkg_name).and_then(|e| e.deps.clone());
     let floating = force_float || meta.floating;
@@ -6012,7 +6698,7 @@ fn ensure_own_deps(
         floating,
         recipe_dir.as_deref(),
     )
-    .map(Some)
+    .map(|(pin, observed_source)| (Some(pin), observed_source))
     .map_err(|e| miette::miette!("package '{pkg_name}': {e}"))
 }
 
@@ -6021,6 +6707,12 @@ fn ensure_own_deps(
 /// `Own` default. The resolved recipe's build-input digest rides along
 /// (issue #113) — the install records it so a plain sync can hold
 /// recipe-identical packages instead of rebuilding them.
+///
+/// Provenance is [`crate::runtime::SnapProvenance::Built`] (sync-speed
+/// plan item 6b): the caller hashed the sha3-384 over these exact bytes
+/// in this process immediately after the build wrote them, so
+/// `prepare_snap` skips the redundant re-hash. Every non-build origin
+/// keeps `Fetched` and the full fail-closed verify (issue #116).
 fn build_pending_snap_at(
     meta: &crate::snap::SnapMeta,
     payload_path: &Path,
@@ -6034,6 +6726,7 @@ fn build_pending_snap_at(
         payload_path: payload_path.to_path_buf(),
         layer,
         meta_digest: Some(meta.build_input_digest()),
+        provenance: crate::runtime::SnapProvenance::Built,
     }
 }
 
@@ -6177,7 +6870,7 @@ pub fn fetch_pod_deps(
         }
         let old_hash = prev.as_ref().map(|p| p.deps_hash.clone());
         let recipe_dir = crate::deps::recipe_dir(&spec.name);
-        let pin = crate::dep_fetch::ensure_pod_deps(
+        let (pin, _observed_source) = crate::dep_fetch::ensure_pod_deps(
             &store.blob_store(),
             &meta,
             prev.as_ref(),
@@ -6209,6 +6902,27 @@ pub fn fetch_pod_deps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reconcile-lifetime eval memo (sync-speed plan item 5): a
+    /// declaration put under the guard is served by the second lookup
+    /// (hits advance, evals do not), and dropping the guard removes the
+    /// memo entirely — nothing survives the reconcile.
+    #[test]
+    fn eval_memo_serves_the_second_lookup_and_dies_with_the_guard() {
+        assert!(eval_memo::is_inactive(), "no memo before a reconcile");
+        let _guard = eval_memo::install();
+        let root = std::env::temp_dir();
+        let decl = load_declaration(&root, "nonexistent-pod-for-memo-test")
+            .unwrap_or_else(|_| PodDeclaration::default());
+        eval_memo::decl_put(&root, "memo-test", decl);
+        assert!(eval_memo::decl_hit(&root, "memo-test").is_some());
+        assert!(eval_memo::decl_hit(&root, "memo-test").is_some());
+        let (hits, evals) = eval_memo::stats();
+        assert_eq!((hits, evals), (2, 1), "second lookup must not re-eval");
+        drop(_guard);
+        assert!(eval_memo::is_inactive(), "the guard drop clears the memo");
+        assert!(eval_memo::decl_hit(&root, "memo-test").is_none());
+    }
 
     #[test]
     fn test_render_roundtrip() {
@@ -6986,7 +7700,14 @@ pod {
         let mut fixture = hold_fixture(installed_tool(Some(
             bare_meta("tool", "1.0").build_input_digest(),
         )));
-        verify_held_deps_blob(&fixture.ctx(), "tool").unwrap();
+        let mut build = ReconcileBuild::default();
+        queue_held_deps_verify(&fixture.ctx(), "tool", &mut build);
+        assert!(
+            build.held_blob_verifies.is_empty(),
+            "no recorded pin must queue no verification: {:?}",
+            build.held_blob_verifies
+        );
+        verify_held_blobs(&build).unwrap();
     }
 
     /// An intact deps blob verifies cleanly on the held sync — the
@@ -7006,11 +7727,13 @@ pod {
         std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
         std::fs::write(&blob, content).unwrap();
         pin_tool_deps(&mut fixture, &hash);
-        verify_held_deps_blob(&fixture.ctx(), "tool").unwrap();
+        let mut build = ReconcileBuild::default();
+        queue_held_deps_verify(&fixture.ctx(), "tool", &mut build);
+        verify_held_blobs(&build).unwrap();
     }
 
     /// A MISSING deps blob fails the held sync loud: the hold never
-    /// reads the blob, so the sync itself must (issue #125).
+    /// reads the blob, so the parallel verify pass must (issue #125).
     #[test]
     fn test_held_sync_fails_loud_when_the_recorded_deps_blob_is_missing() {
         let mut fixture = hold_fixture(installed_tool(Some(
@@ -7018,7 +7741,9 @@ pod {
         )));
         let hash = "a1".repeat(32);
         pin_tool_deps(&mut fixture, &hash);
-        let err = verify_held_deps_blob(&fixture.ctx(), "tool").unwrap_err();
+        let mut build = ReconcileBuild::default();
+        queue_held_deps_verify(&fixture.ctx(), "tool", &mut build);
+        let err = verify_held_blobs(&build).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("missing from the pod store"),
@@ -7042,7 +7767,9 @@ pod {
         std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
         std::fs::write(&blob, b"not the closure").unwrap();
         pin_tool_deps(&mut fixture, &hash);
-        let err = verify_held_deps_blob(&fixture.ctx(), "tool").unwrap_err();
+        let mut build = ReconcileBuild::default();
+        queue_held_deps_verify(&fixture.ctx(), "tool", &mut build);
+        let err = verify_held_blobs(&build).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("hash mismatch"),
@@ -7056,8 +7783,9 @@ pod {
     }
 
     /// The wiring: a plain sync whose content hold hits a tampered deps
-    /// blob fails the SCOPING loud — the hold is never recorded
-    /// (issue #125).
+    /// blob records the hold (the failure is deferred to the verify
+    /// pass) and the parallel pass then fails the SYNC loud — corrupted
+    /// store content can never ride a hold (issue #125).
     #[test]
     fn test_content_hold_fails_loud_when_the_deps_blob_is_tampered() {
         let mut meta = bare_meta("tool", "1.0");
@@ -7070,16 +7798,16 @@ pod {
         std::fs::write(&blob, b"not the closure").unwrap();
         pin_tool_deps(&mut fixture, &hash);
         let mut build = ReconcileBuild::default();
-        let err = scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build)
-            .unwrap_err();
+        scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build).unwrap();
+        assert_eq!(build.held, vec!["tool".to_string()]);
+        assert!(
+            !build.held_blob_verifies.is_empty(),
+            "the hold must queue its deps re-verification"
+        );
+        let err = verify_held_blobs(&build).unwrap_err();
         assert!(
             format!("{err}").contains("hash mismatch"),
-            "the content hold must refuse loud: {err}"
-        );
-        assert!(
-            build.held.is_empty(),
-            "a refused hold must not be recorded: {:?}",
-            build.held
+            "the verify pass must refuse loud: {err}"
         );
     }
 
@@ -7167,9 +7895,11 @@ pod {
         );
     }
 
-    /// A floating loaded member never holds: float mode follows
-    /// upstream content drift at a constant recipe — a hold would
-    /// silently skip the re-resolve.
+    /// A floating loaded member with no recorded tuple to compare
+    /// against rebuilds: float mode still re-resolves on every sync
+    /// (ADR-0017 Decision 4a) — it holds only when the DECLARING pod's
+    /// tuple agrees (see the float-hold tests below; no declaring pod
+    /// means no tuple, so fail closed toward rebuilding).
     #[test]
     fn test_floating_loaded_member_never_holds() {
         let mut meta = bare_meta("tool", "1.0");
@@ -7180,7 +7910,7 @@ pod {
             loaded_hold_record(&fixture.ctx(), None, false, &meta, &build)
                 .unwrap()
                 .is_none(),
-            "a floating loaded member must rebuild"
+            "a floating loaded member without a declaring tuple must rebuild"
         );
     }
 
@@ -7451,6 +8181,461 @@ pod {
         assert!(build.held.is_empty());
     }
 
+    // ── Float hold on observed input identity (ADR-0017 Decision 4a) ──
+
+    /// A floating bare meta with no source and no deps: every tuple
+    /// member but the version compares trivially, so the unit tests run
+    /// fully offline (no download, no closure fetch).
+    fn floating_meta(version: &str) -> crate::snap::SnapMeta {
+        let mut meta = bare_meta("tool", version);
+        meta.floating = true;
+        meta
+    }
+
+    /// A deps-closure pin with an optional fetched_at stamp.
+    fn deps_lock(hash: &str, fetched_at: Option<&str>) -> crate::lock::PackageDepsLock {
+        crate::lock::PackageDepsLock {
+            deps_hash: hash.to_string(),
+            fetched_at: fetched_at.map(|s| s.to_string()),
+            lock_sha256: None,
+        }
+    }
+
+    /// The sha256 of the closure bytes [`pin_float_tuple`] materializes.
+    fn closure_hash() -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(b"closure bytes")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Record the float's RECORDED tuple on the fixture's lock entry:
+    /// version pin plus a deps pin (with its original fetched_at) whose
+    /// closure blob is materialized in the fixture store — a REAL
+    /// content-addressed blob, so the issue #125 held-sync verify that
+    /// guards the hold passes.
+    fn pin_float_tuple(fixture: &mut HoldFixture, hash: Option<&str>) {
+        use sha2::{Digest, Sha256};
+        let entry = fixture.lock.packages.get_mut("tool").unwrap();
+        entry.deps = hash.map(|h| deps_lock(h, Some("2026-01-01")));
+        if let Some(h) = hash {
+            let content = b"closure bytes";
+            let real: String = Sha256::digest(content)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(real, h, "test wants the pinned hash to match the blob");
+            let blob = fixture.store.blob_path(h);
+            std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+            std::fs::write(&blob, content).unwrap();
+        }
+    }
+
+    /// The OBSERVED tuple equals the RECORDED tuple → the float HELDS:
+    /// no build, no install, the hold recorded, claims from the
+    /// installed record. Driven through [`build_own_package`] with a
+    /// source-less deps-less meta so the whole path stays offline (the
+    /// version member is the only live comparison).
+    #[test]
+    fn test_own_float_holds_when_the_observed_tuple_matches() {
+        let meta = floating_meta("1.0");
+        // The loaded-shape record carries an app + desktop entry so the
+        // hold's installed-record claims are observable.
+        let mut fixture = hold_fixture(installed_loaded_tool(Some(meta.build_input_digest())));
+        pin_float_tuple(&mut fixture, Some(&closure_hash()));
+        let mut build = ReconcileBuild::default();
+        let spec = parse_pod_package("tool").unwrap();
+        build_own_package(
+            &fixture.ctx(),
+            &spec,
+            &meta,
+            crate::farm::ClaimLayer::Own,
+            false,
+            false,
+            false,
+            &mut build,
+        )
+        .unwrap();
+        assert_eq!(build.held, vec!["tool".to_string()]);
+        assert!(
+            build.pending.is_empty(),
+            "a held float must not queue a build: {:?}",
+            build.pending
+        );
+        assert!(
+            build.desktop_claims.iter().any(|c| c.app_id == "tooldesk"
+                && c.pkg == "tool"
+                && c.layer == crate::farm::ClaimLayer::Own),
+            "claims must come from the installed record at the Own layer: {:?}",
+            build.desktop_claims
+        );
+    }
+
+    /// The predicate against a fully-populated tuple: source member and
+    /// deps member compared against the lock's records.
+    #[test]
+    fn test_float_predicate_holds_on_a_matching_tuple() {
+        let url = "https://example.invalid/tool.tar.gz";
+        let mut meta = floating_meta("1.0");
+        meta.source = Some(crate::snap::SourceSpec::Pinned {
+            url: url.to_string(),
+            sha256: "seed".to_string(),
+        });
+        meta.deps = Some(nau_core::snap_types::PackageDeps {
+            npm: None,
+            pip: None,
+            cargo: None,
+            go: None,
+        });
+        let mut fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
+        pin_float_tuple(&mut fixture, Some(&closure_hash()));
+        fixture.lock.sources.insert(
+            url.to_string(),
+            crate::lock::SourceLockEntry {
+                sha256: "observed-sha".to_string(),
+            },
+        );
+        let build = ReconcileBuild::default();
+        let held = held_float_at_observed_inputs(
+            &fixture.ctx(),
+            &meta,
+            Some(&deps_lock(&closure_hash(), None)),
+            Some("observed-sha"),
+            &build,
+            false,
+            false,
+        );
+        assert!(held, "an equal observed tuple must hold");
+    }
+
+    /// The observed source sha moved under the floating ref → rebuild.
+    #[test]
+    fn test_float_rebuilds_when_the_source_hash_moved() {
+        let url = "https://example.invalid/tool.tar.gz";
+        let mut meta = floating_meta("1.0");
+        meta.source = Some(crate::snap::SourceSpec::Pinned {
+            url: url.to_string(),
+            sha256: "seed".to_string(),
+        });
+        let mut fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
+        fixture.lock.sources.insert(
+            url.to_string(),
+            crate::lock::SourceLockEntry {
+                sha256: "recorded-sha".to_string(),
+            },
+        );
+        let build = ReconcileBuild::default();
+        let held = held_float_at_observed_inputs(
+            &fixture.ctx(),
+            &meta,
+            None,
+            Some("moved-sha"),
+            &build,
+            false,
+            false,
+        );
+        assert!(!held, "a moved source must rebuild");
+        // A url the lock never restamped cannot prove identity either.
+        let mut meta_unseen = floating_meta("1.0");
+        meta_unseen.source = Some(crate::snap::SourceSpec::Pinned {
+            url: "https://example.invalid/unseen.tar.gz".to_string(),
+            sha256: "seed".to_string(),
+        });
+        let held = held_float_at_observed_inputs(
+            &fixture.ctx(),
+            &meta_unseen,
+            None,
+            Some("observed-sha"),
+            &build,
+            false,
+            false,
+        );
+        assert!(!held, "an unrestamped source record must rebuild");
+    }
+
+    /// The freshly resolved deps closure moved → rebuild.
+    #[test]
+    fn test_float_rebuilds_when_the_deps_closure_moved() {
+        let mut meta = floating_meta("1.0");
+        meta.deps = Some(nau_core::snap_types::PackageDeps {
+            npm: None,
+            pip: None,
+            cargo: None,
+            go: None,
+        });
+        let mut fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
+        pin_float_tuple(&mut fixture, Some(&closure_hash()));
+        let build = ReconcileBuild::default();
+        let held = held_float_at_observed_inputs(
+            &fixture.ctx(),
+            &meta,
+            Some(&deps_lock("moved-hash", None)),
+            None,
+            &build,
+            false,
+            false,
+        );
+        assert!(!held, "a moved closure must rebuild");
+        // No recorded pin at all: fail toward rebuilding.
+        let mut fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
+        pin_float_tuple(&mut fixture, None);
+        let held = held_float_at_observed_inputs(
+            &fixture.ctx(),
+            &meta,
+            Some(&deps_lock(&closure_hash(), None)),
+            None,
+            &build,
+            false,
+            false,
+        );
+        assert!(!held, "a deps float without a recorded pin must rebuild");
+    }
+
+    /// The resolved version moved → rebuild (the pin owns version moves;
+    /// `pod update` is the deliberate verb).
+    #[test]
+    fn test_float_rebuilds_when_the_version_moved() {
+        let meta = floating_meta("2.0");
+        let mut fixture = hold_fixture(installed_tool(Some(
+            bare_meta("tool", "1.0").build_input_digest(),
+        )));
+        let build = ReconcileBuild::default();
+        let held =
+            held_float_at_observed_inputs(&fixture.ctx(), &meta, None, None, &build, false, false);
+        assert!(!held, "a version move must rebuild");
+    }
+
+    /// The guard set that gates the content hold bypasses the float
+    /// hold too: scoped rebuild, overlay, refresh member, recipe drift.
+    #[test]
+    fn test_float_hold_bypassed_by_scoped_overlay_refresh_and_drift() {
+        let meta = floating_meta("1.0");
+        let mut fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
+        let ctx = fixture.ctx();
+        let build = ReconcileBuild::default();
+        assert!(
+            !held_float_at_observed_inputs(&ctx, &meta, None, None, &build, true, false),
+            "a scoped rebuild must bypass the float hold"
+        );
+        assert!(
+            !held_float_at_observed_inputs(&ctx, &meta, None, None, &build, false, true),
+            "an overlay float must bypass the float hold"
+        );
+        let build = ReconcileBuild {
+            refresh_members: std::collections::BTreeSet::from(["tool".to_string()]),
+            ..Default::default()
+        };
+        assert!(
+            !held_float_at_observed_inputs(&ctx, &meta, None, None, &build, false, false),
+            "a refresh/--latest member must bypass the float hold"
+        );
+        let build = ReconcileBuild {
+            recipe_drift: std::collections::BTreeSet::from(["tool".to_string()]),
+            ..Default::default()
+        };
+        assert!(
+            !held_float_at_observed_inputs(&ctx, &meta, None, None, &build, false, false),
+            "a recipe-drifted float must rebuild"
+        );
+    }
+
+    /// A digest-None (pre-#113) installed record rebuilds ONCE to
+    /// acquire the tuple: the float never takes the #331 undigested-pin
+    /// bridge (the pin is a float's resolution only when the observed
+    /// inputs say so), and the Decision 4a predicate refuses the hold
+    /// until the digest exists.
+    #[test]
+    fn test_undigested_float_rebuilds_once() {
+        let mut meta = floating_meta("1.0");
+        // The #331 bridge must NOT catch the float (locked twins hold).
+        let mut fixture = hold_fixture(installed_tool(None));
+        let mut build = ReconcileBuild::default();
+        let scope =
+            scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build).unwrap();
+        assert!(
+            matches!(scope, OwnScope::Build),
+            "the float must rebuild once"
+        );
+        assert!(build.held.is_empty());
+        // The Decision 4a predicate refuses until the digest exists.
+        let held =
+            held_float_at_observed_inputs(&fixture.ctx(), &meta, None, None, &build, false, false);
+        assert!(!held, "an undigested record must rebuild before it holds");
+    }
+
+    /// A held float keeps the recorded pin WHOLESALE: the on-disk lock
+    /// after the hold carries the same deps hash and the ORIGINAL
+    /// fetched_at (no restamp — the reproduced-pin arm of
+    /// ensure_pod_deps left it untouched, and the hold records no pin
+    /// movement), and no source repin is queued.
+    #[test]
+    fn test_held_float_keeps_the_recorded_pin_verbatim() {
+        let meta = floating_meta("1.0");
+        let mut fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
+        pin_float_tuple(&mut fixture, Some(&closure_hash()));
+        let lock_path = fixture._dir.path().join("pod.lock");
+        fixture.lock.save(&lock_path).unwrap();
+        let mut build = ReconcileBuild::default();
+        let spec = parse_pod_package("tool").unwrap();
+        build_own_package(
+            &fixture.ctx(),
+            &spec,
+            &meta,
+            crate::farm::ClaimLayer::Own,
+            false,
+            false,
+            false,
+            &mut build,
+        )
+        .unwrap();
+        assert_eq!(build.held, vec!["tool".to_string()]);
+        assert!(
+            build.deps_pins.is_empty() && build.source_repins.is_empty() && build.repins.is_empty(),
+            "a held float must record no pin movement: {:?} {:?} {:?}",
+            build.repins,
+            build.deps_pins,
+            build.source_repins
+        );
+        let on_disk = LockFile::load(&lock_path).unwrap().unwrap();
+        let entry = &on_disk.packages["tool"];
+        assert_eq!(entry.version, "1.0", "the version pin is untouched");
+        let deps = entry.deps.as_ref().unwrap();
+        assert_eq!(
+            deps.deps_hash,
+            closure_hash(),
+            "the closure pin is untouched"
+        );
+        assert_eq!(
+            deps.fetched_at.as_deref(),
+            Some("2026-01-01"),
+            "no fetched_at restamp on a held float"
+        );
+    }
+
+    /// The LOADED arm (ADR-0048 composition, Decision 4a): a floating
+    /// loaded member holds via the DECLARING pod's recorded tuple —
+    /// its lock entry agrees on the version and its active generation
+    /// still executes byte-identical content (the deps-closure
+    /// observation proxy). A source-less meta keeps the probe offline.
+    #[test]
+    fn test_loaded_float_holds_via_the_declaring_pods_lock() {
+        let meta = floating_meta("1.0");
+        let installed = installed_loaded_tool(Some(meta.build_input_digest()));
+        let mut fixture = hold_fixture(installed.clone());
+        pin_declaring_pod_deps_hash(&fixture, "upstream", "closure-hash");
+        pin_declaring_pod_generation(&fixture, "upstream", &installed);
+        let build = ReconcileBuild::default();
+        let held =
+            loaded_hold_record(&fixture.ctx(), Some("upstream"), false, &meta, &build).unwrap();
+        assert!(
+            held.is_some(),
+            "a loaded float whose declaring tuple agrees must hold"
+        );
+    }
+
+    /// Save a declaring pod's lockfile whose entry for `tool` pins
+    /// `version` and (when set) the deps closure — the RECORDED tuple a
+    /// floating loaded member compares against.
+    fn pin_declaring_pod_deps_hash(fixture: &HoldFixture, pod: &str, hash: &str) {
+        let mut lock = LockFile::empty();
+        lock.packages.insert(
+            "tool".to_string(),
+            PodPackageLockEntry {
+                version: "1.0".into(),
+                constraint: None,
+                deps: Some(deps_lock(hash, Some("2026-01-01"))),
+                recipe_sha256: None,
+                recipe_digest_scheme: None,
+            },
+        );
+        std::fs::create_dir_all(fixture._dir.path().join(pod)).unwrap();
+        lock.save(&pod_lock_path(fixture._dir.path(), pod)).unwrap();
+    }
+
+    /// The loaded float's guards and tuple refusals: this pod's own
+    /// overlay on the member, a version move in the declaring lock, and
+    /// a declaring pod whose generation moved — each rebuilds.
+    #[test]
+    fn test_loaded_float_rebuilds_on_overlay_version_or_generation_move() {
+        let meta = floating_meta("1.0");
+        let installed = installed_loaded_tool(Some(meta.build_input_digest()));
+
+        // Own overlay on the member.
+        let mut fixture = hold_fixture(installed.clone());
+        pin_declaring_pod_deps_hash(&fixture, "upstream", "closure-hash");
+        pin_declaring_pod_generation(&fixture, "upstream", &installed);
+        let build = ReconcileBuild::default();
+        assert!(
+            loaded_hold_record(&fixture.ctx(), Some("upstream"), true, &meta, &build)
+                .unwrap()
+                .is_none(),
+            "an own-overlaid float must rebuild"
+        );
+
+        // The declaring pod's lock entry pins a moved version.
+        let mut fixture = hold_fixture(installed.clone());
+        pin_declaring_pod_deps_hash(&fixture, "upstream", "closure-hash");
+        let lock_path = pod_lock_path(fixture._dir.path(), "upstream");
+        let mut lock = LockFile::load(&lock_path).unwrap().unwrap();
+        lock.packages.get_mut("tool").unwrap().version = "2.0".into();
+        lock.save(&lock_path).unwrap();
+        pin_declaring_pod_generation(&fixture, "upstream", &installed);
+        assert!(
+            loaded_hold_record(&fixture.ctx(), Some("upstream"), false, &meta, &build)
+                .unwrap()
+                .is_none(),
+            "a declaring version move must rebuild the member"
+        );
+
+        // The declaring pod's generation moved (its own sync rebuilt
+        // the float — the closure moved upstream): this pod follows.
+        let mut fixture = hold_fixture(installed.clone());
+        pin_declaring_pod_deps_hash(&fixture, "upstream", "closure-hash");
+        let mut moved = installed.clone();
+        moved.meta_digest = Some("moved-build-inputs".into());
+        pin_declaring_pod_generation(&fixture, "upstream", &moved);
+        assert!(
+            loaded_hold_record(&fixture.ctx(), Some("upstream"), false, &meta, &build)
+                .unwrap()
+                .is_none(),
+            "a moved declaring generation must rebuild the member"
+        );
+    }
+
+    /// Without a declaring pod (or its lockfile), a floating loaded
+    /// member has no recorded tuple to compare against and rebuilds —
+    /// fail-closed (the Decision 4a refinement of the old
+    /// floats-never-hold rule: floats hold only WITH a recorded tuple).
+    #[test]
+    fn test_loaded_float_rebuilds_without_a_declaring_tuple() {
+        let meta = floating_meta("1.0");
+        let mut fixture = hold_fixture(installed_loaded_tool(Some(meta.build_input_digest())));
+        let build = ReconcileBuild::default();
+        assert!(
+            loaded_hold_record(&fixture.ctx(), None, false, &meta, &build)
+                .unwrap()
+                .is_none(),
+            "no declaring pod → no recorded tuple → rebuild"
+        );
+        // A declaring pod whose lockfile lacks the member entirely.
+        pin_declaring_pod_generation(
+            &fixture,
+            "upstream",
+            &installed_loaded_tool(Some(meta.build_input_digest())),
+        );
+        std::fs::create_dir_all(fixture._dir.path().join("upstream")).unwrap();
+        LockFile::empty()
+            .save(&pod_lock_path(fixture._dir.path(), "upstream"))
+            .unwrap();
+        assert!(
+            loaded_hold_record(&fixture.ctx(), Some("upstream"), false, &meta, &build)
+                .unwrap()
+                .is_none(),
+            "a lockfile without the member must rebuild"
+        );
+    }
+
     /// The declared_names trap (ADR-0048): the hold flow records the
     /// member into `declared_names` BEFORE the hold decision, so
     /// `remove_undeclared` keeps its store content — a held loaded
@@ -7579,7 +8764,8 @@ pod {
         hold_loaded_member(&ctx, Some("upstream"), installed, &meta, &mut build).unwrap();
         assert_eq!(build.held, vec!["tool".to_string()]);
 
-        // Tampered blob → the hold refuses loud.
+        // Tampered blob → the hold records + queues, and the verify
+        // pass fails the sync loud (the deferred #125 contract).
         let mut fixture = hold_fixture(installed_loaded_tool(Some(meta.build_input_digest())));
         let blob = fixture.store.blob_path(&hash);
         std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
@@ -7589,17 +8775,17 @@ pod {
         let mut build = ReconcileBuild::default();
         let installed = loaded_hold_record(&ctx, None, false, &meta, &build)
             .unwrap()
-            .expect("the tampered blob fails in the hold body, not the decision");
-        let err =
-            hold_loaded_member(&ctx, Some("upstream"), installed, &meta, &mut build).unwrap_err();
+            .expect("the hold decision carries; the blob check defers to the pass");
+        hold_loaded_member(&ctx, Some("upstream"), installed, &meta, &mut build).unwrap();
+        assert_eq!(build.held, vec!["tool".to_string()]);
+        assert!(
+            !build.held_blob_verifies.is_empty(),
+            "the loaded hold must queue its deps re-verification"
+        );
+        let err = verify_held_blobs(&build).unwrap_err();
         assert!(
             format!("{err}").contains("hash mismatch"),
-            "the loaded hold must refuse loud on a tampered closure: {err}"
-        );
-        assert!(
-            build.held.is_empty(),
-            "a refused hold must not be recorded: {:?}",
-            build.held
+            "the verify pass must refuse loud on a tampered closure: {err}"
         );
     }
 

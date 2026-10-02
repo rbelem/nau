@@ -92,6 +92,15 @@ pub enum Command {
         #[arg(long)]
         fix: bool,
 
+        /// Deep-verify every content-addressed blob in the pod store:
+        /// full streaming sha256 per blob, compared against its own
+        /// content address. The on-demand corruption sweep — a held sync
+        /// never re-reads store content (ADR-0017 4a), so this verb is
+        /// where bit-rot gets caught. With --pod NAME, sweeps only that
+        /// pod.
+        #[arg(long)]
+        verify: bool,
+
         /// With --fix: provision from a local directory of pre-fetched
         /// artifacts (offline; identical sha256 verify path) instead of
         /// the pinned release URLs.
@@ -4425,12 +4434,18 @@ mod tests {
             .unwrap()
             .command
         {
-            Command::Doctor { pod, fix, from } => {
+            Command::Doctor {
+                pod,
+                fix,
+                from,
+                verify,
+            } => {
                 // Bare `--pod`: the scope flag with NO pod identity —
                 // the pre-#231 surface, byte-for-byte.
                 assert_eq!(pod, Some(None));
                 assert!(!fix);
                 assert_eq!(from, None);
+                assert!(!verify);
             }
             _ => panic!("expected Doctor"),
         }
@@ -4475,10 +4490,16 @@ mod tests {
             .unwrap()
             .command
         {
-            Command::Doctor { pod, fix, from } => {
+            Command::Doctor {
+                pod,
+                fix,
+                from,
+                verify,
+            } => {
                 assert_eq!(pod, None);
                 assert!(fix);
                 assert_eq!(from, None);
+                assert!(!verify);
             }
             _ => panic!("expected Doctor"),
         }
