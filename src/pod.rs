@@ -2794,20 +2794,21 @@ pub fn rollback_pod_with(
 
 /// Garbage-collect a pod's content store: the shared mark-sweep over
 /// every pod generation manifest (issue #3's per-pod store, no parallel
-/// implementation). With `--prune`, all but the pod's current +
-/// previous generations are dropped first — their exclusive blobs then
-/// sweep free, while blobs shared with (or referenced by) live
-/// generations survive. System generations are never eligible: the
-/// store root is the pod's own state directory.
+/// implementation). `opts.prune` drops all but the pod's current +
+/// previous generations first — their exclusive blobs then sweep free,
+/// while blobs shared with (or referenced by) live generations survive.
+/// `opts.downloads` also sweeps the pod's re-fetchable downloads
+/// staging cache. System generations are never eligible: the store
+/// root is the pod's own state directory.
 pub fn gc_pod(
     root: &Path,
     pod_name: &str,
-    prune: bool,
+    opts: crate::runtime::GcOpts,
 ) -> miette::Result<crate::runtime::GcReport> {
     validate_pod_name(pod_name)?;
     let dir = pod_dir(root, pod_name);
     let store = pod_store(&dir);
-    store.gc(prune)
+    store.gc(opts)
 }
 
 /// Report for the pod reconcile (`nau pod sync`, and the tail of
