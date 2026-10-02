@@ -25,6 +25,7 @@ pub mod snap;
 pub mod snap_types;
 pub mod store;
 pub mod units;
+pub mod worker_types;
 
 /// The parallel build-phase worker budget (ADR-0022). The constant is
 /// vocabulary shared by the build scheduler and the chart eval engine's

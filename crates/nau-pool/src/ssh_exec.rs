@@ -55,10 +55,10 @@ use std::time::{Duration, Instant};
 
 use miette::WrapErr;
 
-use crate::command::{exit_code, CommandRunner};
-use crate::lua::WorkerConfig;
 use crate::provision::SQUASHFS_TOOLS_VERSION;
 use crate::worker::{CapabilityDoc, JobManifest, JobResult, WORKER_PROTOCOL_VERSION};
+use nau_core::worker_types::WorkerConfig;
+use nau_infra::command::{exit_code, CommandRunner};
 
 /// The SSH channel itself died: ssh/scp could not be spawned, or exited
 /// nonzero (connection refused, dropped session, keepalive deadline). The
@@ -246,7 +246,7 @@ fn parse_address(addr: &str) -> miette::Result<AddressParts> {
 }
 
 /// One Worker over one SSH channel. `R` is the command seam: production
-/// passes [`RealRunner`](crate::command::RealRunner), hermetic tests
+/// passes [`RealRunner`](nau_infra::command::RealRunner), hermetic tests
 /// inject a loopback fake that plays the worker side.
 pub struct SshExecutor<R: CommandRunner> {
     worker: WorkerConfig,
@@ -353,7 +353,7 @@ impl<R: CommandRunner> SshExecutor<R> {
         self.worker
             .arch
             .as_deref()
-            .and_then(crate::snap::triplet_arch)
+            .and_then(nau_core::snap_types::triplet_arch)
     }
 
     /// The ingest directory for `manifest`: `<cache>/remote/<jm1_<hex>>/`
@@ -411,7 +411,7 @@ impl<R: CommandRunner> SshExecutor<R> {
     /// The CA form: verify the ceremony CA's public half against the pin,
     /// resolve the machine linkage, and build the `@cert-authority` line.
     fn resolve_ca_pin(&self, pin: &str) -> miette::Result<ResolvedPin> {
-        let public = crate::ca::ca_public_path(&self.ceremony_home);
+        let public = nau_infra::ssh_ca::ca_public_path(&self.ceremony_home);
         let text = std::fs::read_to_string(&public).map_err(|_| {
             miette::miette!(
                 "preflight host-key: worker '{}' pins host CA fingerprint '{pin}' but the \
@@ -429,7 +429,7 @@ impl<R: CommandRunner> SshExecutor<R> {
                 public.display()
             ));
         }
-        let got = crate::ca::key_fingerprint(&self.runner, &public).map_err(|e| {
+        let got = nau_infra::ssh_ca::key_fingerprint(&self.runner, &public).map_err(|e| {
             miette::miette!("preflight host-key: worker '{}': {e}", self.worker.address)
         })?;
         if got != pin {
@@ -615,7 +615,7 @@ impl<R: CommandRunner> SshExecutor<R> {
     }
 
     fn known_hosts_slug(&self) -> String {
-        crate::oci::sha256_hex(self.worker.address.as_bytes())[..16].to_string()
+        nau_core::cache_key::sha256_hex(self.worker.address.as_bytes())[..16].to_string()
     }
 
     /// The known_hosts path ssh is driven against — exposed for tests and
@@ -903,7 +903,7 @@ impl<R: CommandRunner> SshExecutor<R> {
             return Ok(None);
         };
         for art in &result.artifacts {
-            match crate::oci::sha256_file(&dir.join(&art.filename)) {
+            match nau_core::cache_key::sha256_file(&dir.join(&art.filename)) {
                 Ok(h) if h == art.sha256 => {}
                 _ => return Ok(None),
             }
@@ -947,7 +947,7 @@ impl<R: CommandRunner> SshExecutor<R> {
             .worker
             .arch
             .as_deref()
-            .and_then(crate::snap::triplet_arch)
+            .and_then(nau_core::snap_types::triplet_arch)
             .map(str::to_string);
         let target = (manifest.cross_target.is_none()).then_some(manifest.target.as_str());
         let arch_expect = match (&declared, target) {
@@ -1245,7 +1245,7 @@ impl<R: CommandRunner> SshExecutor<R> {
                 &dst,
             )
             .wrap_err_with(|| format!("collect: cannot fetch artifact '{}'", art.filename))?;
-            let got = crate::oci::sha256_file(&dst).map_err(|e| {
+            let got = nau_core::cache_key::sha256_file(&dst).map_err(|e| {
                 miette::miette!("collect: cannot hash artifact '{}': {e}", art.filename)
             })?;
             if got != art.sha256 {

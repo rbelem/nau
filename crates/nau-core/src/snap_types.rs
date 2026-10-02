@@ -761,6 +761,30 @@ pub fn resolve_archs(meta: &SnapMeta, cli_archs: &[String]) -> Vec<String> {
     }
 }
 
+/// Host architecture in snapd naming ("amd64", "arm64", …). Rust's
+/// `consts::ARCH` passes through unchanged for other targets.
+pub fn host_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
+/// Leading-component architecture of a GNU target triplet.
+/// "aarch64-linux-gnu" → Some("arm64"), "x86_64-linux-gnu" → Some("amd64"),
+/// "arm-linux-gnueabihf" → Some("armhf"). Unknown vendor/OS suffixes are not
+/// interpreted: the first component maps by the rules above, else identity.
+pub fn triplet_arch(triplet: &str) -> Option<&str> {
+    let first = triplet.split('-').next()?;
+    match first {
+        "x86_64" | "amd64" => Some("amd64"),
+        "aarch64" | "arm64" => Some("arm64"),
+        "arm" => Some("armhf"),
+        other => Some(other),
+    }
+}
+
 /// Host path roots bound read-only into the build sandbox (see the
 /// build crate's `bind_system_ro_paths`). This is the sandbox's entire
 /// view of the host filesystem apart from the resolver/trust files of

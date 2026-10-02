@@ -62,13 +62,13 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::command::{exit_code, CommandRunner};
 use crate::provision::publish::PublishChannel;
 use crate::provision::{
     append_worker_entry, evict_worker_entry, iso8601_utc, now_epoch_secs, render_user_data,
     require_ca_pin, require_publish, PinPlan, ProvisionPlan, ProvisionRequest, ProvisionedWorker,
     Provisioner, UserDataParams, PLAN_MACHINE_IDENTITY, PLAN_PUBLISH_TOKEN, PLAN_PUBLISH_URL,
 };
+use nau_infra::command::{exit_code, CommandRunner};
 
 /// The worker presence tag nau stamps at create time — the key
 /// shared with the #269 v2 TTL contract (Hetzner writer, cross-provider
@@ -190,7 +190,7 @@ impl<R: CommandRunner> Provisioner for ScalewayProvisioner<R> {
             binary_url: &self.binary_url,
             ttl_expiry_epoch: expiry_epoch,
         });
-        let user_data_sha256 = crate::oci::sha256_hex(user_data.as_bytes());
+        let user_data_sha256 = nau_core::cache_key::sha256_hex(user_data.as_bytes());
 
         if req.dry_run {
             // Deliberately BEFORE the credentials check: a plan needs no
@@ -289,7 +289,7 @@ impl<R: CommandRunner> Provisioner for ScalewayProvisioner<R> {
         match evict_worker_entry(config, &address_for(&ip)) {
             Ok(true) => Ok(true),
             Ok(false) => {
-                crate::output::warn(format!(
+                nau_infra::output::warn(format!(
                     "destroy: server '{name}' deleted, but no managed workers entry pins {} — \
                      config left untouched",
                     address_for(&ip)
@@ -507,7 +507,7 @@ fn warn_surviving_block_volumes(name: &str, doc: &Value) {
         })
         .unwrap_or(0);
     if sbs > 0 {
-        crate::output::warn(format!(
+        nau_infra::output::warn(format!(
             "destroy: server '{name}' still has {sbs} block-storage volume(s) — a server \
              delete only DETACHES them and the storage keeps billing; delete them by hand"
         ));
@@ -533,20 +533,20 @@ fn instance_name(i: u32) -> String {
 }
 
 fn print_plan(plan: &ProvisionPlan) {
-    crate::output::info("provision plan (dry run — no API call was made):");
-    crate::output::info("  provider:         scaleway");
-    crate::output::info(format!("  type:             {}", plan.server_type));
-    crate::output::info(format!("  zone:             {}", plan.location));
-    crate::output::info(format!("  base image:       {}", plan.image));
-    crate::output::info(format!("  count:            {}", plan.count));
-    crate::output::info(format!(
+    nau_infra::output::info("provision plan (dry run — no API call was made):");
+    nau_infra::output::info("  provider:         scaleway");
+    nau_infra::output::info(format!("  type:             {}", plan.server_type));
+    nau_infra::output::info(format!("  zone:             {}", plan.location));
+    nau_infra::output::info(format!("  base image:       {}", plan.image));
+    nau_infra::output::info(format!("  count:            {}", plan.count));
+    nau_infra::output::info(format!(
         "  ttl:              {}s (expiry {})",
         plan.ttl_secs, plan.ttl_expiry_iso
     ));
-    crate::output::info(format!("  binary url:       {}", plan.binary_url));
-    crate::output::info("  class:            on-demand (no spot product on scaleway)");
-    crate::output::info(format!("  user-data sha256: {}", plan.user_data_sha256));
-    crate::output::info(format!(
+    nau_infra::output::info(format!("  binary url:       {}", plan.binary_url));
+    nau_infra::output::info("  class:            on-demand (no spot product on scaleway)");
+    nau_infra::output::info(format!("  user-data sha256: {}", plan.user_data_sha256));
+    nau_infra::output::info(format!(
         "  tags:             {WORKER_TAG} + {WORKER_TTL_TAG}=<ttl epoch>"
     ));
 }

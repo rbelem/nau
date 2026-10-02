@@ -53,13 +53,13 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::command::{exit_code, CommandRunner};
 use crate::provision::publish::PublishChannel;
 use crate::provision::{
     append_worker_entry, evict_worker_entry, iso8601_utc, now_epoch_secs, render_user_data,
     require_ca_pin, require_publish, PinPlan, ProvisionPlan, ProvisionRequest, ProvisionedWorker,
     Provisioner, UserDataParams, PLAN_MACHINE_IDENTITY, PLAN_PUBLISH_TOKEN, PLAN_PUBLISH_URL,
 };
+use nau_infra::command::{exit_code, CommandRunner};
 
 /// The worker presence label nau stamps at create time — the key
 /// shared with the #269 v2 TTL contract (Hetzner writer, cross-provider
@@ -187,7 +187,7 @@ impl<R: CommandRunner> Provisioner for GcpProvisioner<R> {
             binary_url: &self.binary_url,
             ttl_expiry_epoch: expiry_epoch,
         });
-        let user_data_sha256 = crate::oci::sha256_hex(user_data.as_bytes());
+        let user_data_sha256 = nau_core::cache_key::sha256_hex(user_data.as_bytes());
 
         if req.dry_run {
             // Deliberately BEFORE the credentials check: a plan needs no
@@ -278,7 +278,7 @@ impl<R: CommandRunner> Provisioner for GcpProvisioner<R> {
         match evict_worker_entry(config, &address_for(&ip)) {
             Ok(true) => Ok(true),
             Ok(false) => {
-                crate::output::warn(format!(
+                nau_infra::output::warn(format!(
                     "destroy: instance '{name}' deleted, but no managed workers entry pins {} — \
                      config left untouched",
                     address_for(&ip)
@@ -424,7 +424,7 @@ fn warn_surviving_disks(name: &str, doc: &Value) {
         .map(|ds| ds.iter().filter(|d| d["autoDelete"] != true).count())
         .unwrap_or(0);
     if attached > 0 {
-        crate::output::warn(format!(
+        nau_infra::output::warn(format!(
             "destroy: instance '{name}' still has {attached} attached disk(s) that will NOT be \
              deleted with it (auto-delete off) — the storage keeps billing; delete them by hand"
         ));
@@ -468,24 +468,24 @@ fn instance_name(i: u32) -> String {
 }
 
 fn print_plan(plan: &ProvisionPlan, preemptible: bool) {
-    crate::output::info("provision plan (dry run — no API call was made):");
-    crate::output::info("  provider:         gcp");
-    crate::output::info(format!("  type:             {}", plan.server_type));
-    crate::output::info(format!("  zone:             {}", plan.location));
-    crate::output::info(format!("  base image:       {}", plan.image));
-    crate::output::info(format!("  count:            {}", plan.count));
-    crate::output::info(format!(
+    nau_infra::output::info("provision plan (dry run — no API call was made):");
+    nau_infra::output::info("  provider:         gcp");
+    nau_infra::output::info(format!("  type:             {}", plan.server_type));
+    nau_infra::output::info(format!("  zone:             {}", plan.location));
+    nau_infra::output::info(format!("  base image:       {}", plan.image));
+    nau_infra::output::info(format!("  count:            {}", plan.count));
+    nau_infra::output::info(format!(
         "  ttl:              {}s (expiry {})",
         plan.ttl_secs, plan.ttl_expiry_iso
     ));
-    crate::output::info(format!("  binary url:       {}", plan.binary_url));
+    nau_infra::output::info(format!("  binary url:       {}", plan.binary_url));
     if preemptible {
-        crate::output::info("  class:            preemptible (eviction: T5 worker loss)");
+        nau_infra::output::info("  class:            preemptible (eviction: T5 worker loss)");
     } else {
-        crate::output::info("  class:            on-demand");
+        nau_infra::output::info("  class:            on-demand");
     }
-    crate::output::info(format!("  user-data sha256: {}", plan.user_data_sha256));
-    crate::output::info(format!(
+    nau_infra::output::info(format!("  user-data sha256: {}", plan.user_data_sha256));
+    nau_infra::output::info(format!(
         "  labels:           {WORKER_LABEL} + {WORKER_TTL_LABEL}=<ttl epoch>"
     ));
 }

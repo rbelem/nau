@@ -23,7 +23,7 @@
 //!   callback URL with `Authorization: Bearer <token>`. The URL is
 //!   operator-supplied (`NAU_PUBLISH_URL`) — provider-independent,
 //!   so one shape serves all five clouds. A TLS-terminating front that
-//!   hands the payload + bearer token to [`crate::provision::workers_main`]'s
+//!   hands the payload + bearer token to `crate::provision::workers_main`'s
 //!   `receive-publish` verb (payload on stdin, token in
 //!   `NAU_PUBLISH_TOKEN`) completes the channel in front of the
 //!   pending store; the in-tree listener is sub-task 3's surface (it must
@@ -63,7 +63,7 @@
 //! - **Issuance + delivery back (#295 sub-task 3)**: the operator (or
 //!   the provisioner loop) runs `nau workers issue` — the host CA
 //!   signs a SHORT-LIVED certificate per pending entry behind the
-//!   [`crate::command::CommandRunner`] seam (`ssh-keygen -s <ca> -h -I
+//!   [`nau_infra::command::CommandRunner`] seam (`ssh-keygen -s <ca> -h -I
 //!   <identity> -n <principals> -V <validity>`), principals bind the
 //!   machine identity PLUS the provider instance-identity content
 //!   (Decision 3's rule; default validity [`HOST_CERT_VALIDITY_DEFAULT`],
@@ -88,7 +88,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::command::CommandRunner;
+use nau_infra::command::CommandRunner;
 
 /// The one-time publish token's validity window, from issue: an older
 /// token is refused even if never consumed — tokens leak through
@@ -101,7 +101,7 @@ const TOKEN_BYTES: usize = 32;
 
 /// The pending store root: `<home>/.config/nau/ca/pending/`.
 pub fn pending_dir(home: &Path) -> PathBuf {
-    crate::ca::ca_dir(home).join("pending")
+    nau_infra::ssh_ca::ca_dir(home).join("pending")
 }
 
 /// The one-time token registry (token SHA-256 → identity + stamps).
@@ -119,14 +119,14 @@ fn registry_path(home: &Path) -> PathBuf {
 /// form is the machine identity, and the linkage is the only
 /// address→identity map that exists.
 pub fn machines_dir(home: &Path) -> PathBuf {
-    crate::ca::ca_dir(home).join("machines")
+    nau_infra::ssh_ca::ca_dir(home).join("machines")
 }
 
 /// The filesystem slug for an address's linkage record: the same
 /// sha256-truncated form the executor's known_hosts files use, so both
 /// sides derive the same name from the same address string.
 fn machine_link_slug(address: &str) -> String {
-    crate::oci::sha256_hex(address.as_bytes())[..16].to_string()
+    nau_core::cache_key::sha256_hex(address.as_bytes())[..16].to_string()
 }
 
 /// One provision-time machine linkage: the pinned workers address and
@@ -323,7 +323,7 @@ pub fn mint_publish_token() -> miette::Result<String> {
 /// Registry key for a bearer token: its SHA-256 — the registry never
 /// stores the live bearer.
 fn token_fingerprint(token: &str) -> String {
-    crate::oci::sha256_hex(token.as_bytes())
+    nau_core::cache_key::sha256_hex(token.as_bytes())
 }
 
 fn load_registry(home: &Path) -> miette::Result<Registry> {
@@ -447,7 +447,7 @@ pub fn parse_publish_payload(bytes: &[u8]) -> miette::Result<PublishPayload> {
              the full `<keytype> <base64>` half"
         ));
     }
-    crate::lua::validate_public_key_line(public_key)
+    nau_infra::ssh_ca::validate_public_key_line(public_key)
         .map_err(|e| miette::miette!("publish: 'public_key' fails the public-key grammar: {e}"))?;
     let instance_identity = obj
         .get("instance_identity")
@@ -647,7 +647,7 @@ pub struct IssuedIdentity {
 
 /// The issued store root: `<home>/.config/nau/ca/issued/`.
 pub fn issued_dir(home: &Path) -> PathBuf {
-    crate::ca::ca_dir(home).join("issued")
+    nau_infra::ssh_ca::ca_dir(home).join("issued")
 }
 
 fn issued_path(home: &Path, identity: &str) -> PathBuf {
@@ -834,25 +834,25 @@ pub fn issue_certificate(
     // The CA must exist with BOTH halves: issuance signs with the
     // private half; the fingerprint (which root vouches) rides the
     // issued record.
-    let ca = crate::ca::inspect(runner, home)?.ok_or_else(|| {
+    let ca = nau_infra::ssh_ca::inspect(runner, home)?.ok_or_else(|| {
         miette::miette!(
             "issue: no host CA at {} — run 'nau ca keygen' first; issuance signs with \
              its private half (ADR-0045 amendment)",
-            crate::ca::ca_secret_path(home).display()
+            nau_infra::ssh_ca::ca_secret_path(home).display()
         )
     })?;
     if !ca.secret_present {
         return Err(miette::miette!(
             "issue: the host CA's private half {} is missing — its fingerprint is known but \
              nothing can be signed; restore the keypair or re-key with 'nau ca keygen --force'",
-            crate::ca::ca_secret_path(home).display()
+            nau_infra::ssh_ca::ca_secret_path(home).display()
         ));
     }
 
     // Defense at the trust boundary: the pending store is on-disk state
     // a crash or tamper could have mangled — re-check the key grammar
     // before putting it in front of ssh-keygen.
-    crate::lua::validate_public_key_line(&entry.public_key).map_err(|e| {
+    nau_infra::ssh_ca::validate_public_key_line(&entry.public_key).map_err(|e| {
         miette::miette!(
             "issue: pending entry for '{}' carries a malformed public key — refusing to sign \
              it: {e}",
@@ -882,7 +882,7 @@ pub fn issue_certificate(
     let argv = vec![
         "ssh-keygen".to_string(),
         "-s".to_string(),
-        crate::ca::ca_secret_path(home)
+        nau_infra::ssh_ca::ca_secret_path(home)
             .to_string_lossy()
             .into_owned(),
         "-h".to_string(),
@@ -897,7 +897,7 @@ pub fn issue_certificate(
     let out = runner.run(&argv).map_err(|e| {
         miette::miette!("issue: cannot run ssh-keygen (is openssh installed?): {e}")
     })?;
-    if crate::command::exit_code(&out) != 0 {
+    if nau_infra::command::exit_code(&out) != 0 {
         return Err(miette::miette!(
             "issue: ssh-keygen refused to sign '{}' (principals {}): {}",
             entry.machine_identity,
@@ -1095,7 +1095,7 @@ pub fn pickup_certificate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::RunnerOutput;
+    use nau_infra::command::RunnerOutput;
     use std::io;
     use std::sync::{Arc, Mutex};
 
@@ -1356,9 +1356,13 @@ mod tests {
     const CA_FPR: &str = "SHA256:CAFAKE";
 
     fn ca_on_disk(home: &Path) {
-        std::fs::create_dir_all(crate::ca::ca_dir(home)).unwrap();
-        std::fs::write(crate::ca::ca_secret_path(home), "test-ca-secret").unwrap();
-        std::fs::write(crate::ca::ca_public_path(home), format!("{CA_PUB}\n")).unwrap();
+        std::fs::create_dir_all(nau_infra::ssh_ca::ca_dir(home)).unwrap();
+        std::fs::write(nau_infra::ssh_ca::ca_secret_path(home), "test-ca-secret").unwrap();
+        std::fs::write(
+            nau_infra::ssh_ca::ca_public_path(home),
+            format!("{CA_PUB}\n"),
+        )
+        .unwrap();
     }
 
     /// The full intake flow up to issuance: mint + record a token, then
@@ -1482,7 +1486,7 @@ mod tests {
         let i = sign.iter().position(|a| a == "-s").unwrap();
         assert_eq!(
             Path::new(&sign[i + 1]),
-            crate::ca::ca_secret_path(home),
+            nau_infra::ssh_ca::ca_secret_path(home),
             "-s targets the contract CA secret"
         );
         // Principals: machine identity FIRST, then the fixture's
@@ -1570,7 +1574,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         enroll_with_ca(home, IDENTITY);
-        std::fs::remove_file(crate::ca::ca_secret_path(home)).unwrap();
+        std::fs::remove_file(nau_infra::ssh_ca::ca_secret_path(home)).unwrap();
 
         // inspect() fingerprints the public half (a legitimate -lf run);
         // the refusal must still fire BEFORE any signing (-s) happens.
@@ -1579,7 +1583,11 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("private half"), "{msg}");
         assert!(
-            msg.contains(&crate::ca::ca_secret_path(home).display().to_string()),
+            msg.contains(
+                &nau_infra::ssh_ca::ca_secret_path(home)
+                    .display()
+                    .to_string()
+            ),
             "names the missing half: {msg}"
         );
         assert!(
@@ -1868,7 +1876,7 @@ mod link_tests {
             path,
             machines_dir(home).join(format!(
                 "machine-{}.json",
-                &crate::oci::sha256_hex(address.as_bytes())[..16]
+                &nau_core::cache_key::sha256_hex(address.as_bytes())[..16]
             ))
         );
         let link = machine_link(home, address).unwrap().expect("linked");
