@@ -787,6 +787,8 @@ fn plan_objects_resolve_the_source_pins_like_dispatch() {
         "https://example.test/srv.tgz".to_string(),
         nau::lock::SourceLockEntry {
             sha256: sha256_hex(b"the hash the lockfile saw"),
+            etag: None,
+            validated_at: None,
         },
     );
     assert_eq!(

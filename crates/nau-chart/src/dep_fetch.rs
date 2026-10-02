@@ -38,9 +38,9 @@ use std::path::{Path, PathBuf};
 use base64::Engine;
 use sha2::{Digest, Sha256, Sha512};
 
-use crate::lock::PackageDepsLock;
+use crate::lock::{PackageDepsLock, SourceValidators};
 use nau_core::blob_store::BlobStore;
-use nau_core::snap_types::{DepsLockSpec, SnapMeta};
+use nau_core::snap_types::{DepsLockSpec, SnapMeta, SourceSpec};
 
 /// Default PyPI simple index for pip resolvers (overridable per resolver
 /// via `deps.pip.index` — tests point it at a loopback server).
@@ -61,12 +61,53 @@ pub const DEFAULT_GO_PROXY: &str = "https://proxy.golang.org";
 
 // ── Orchestration ──
 
+/// The OBSERVED sha256 of a fetched source tarball plus the validator
+/// state the observation carries. `etag` is the entity tag the server
+/// returned for THESE bytes (verbatim; `None` when it sent none or the
+/// observation was a 304, which re-certifies the recorded etag instead
+/// of producing a new one). `unchanged` is true for a 304 short-circuit:
+/// `sha256` is then the RECORDED pin — no bytes were downloaded, no
+/// extraction happened, and per the co-write invariant nothing may be
+/// written from this observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceObserved {
+    pub sha256: String,
+    pub etag: Option<String>,
+    pub unchanged: bool,
+}
+
+/// What one dependency-closure fetch produced (the pin to record plus
+/// the source observation the float hold reuses — ADR-0017 Decision 4a).
+#[derive(Debug, Clone)]
+pub struct DepsFetch {
+    /// SHA-256 (hex) of the canonical closure archive = the store blob.
+    pub hash: String,
+    /// The recipe-shipped lockfile's sha256 when the lock resolved from
+    /// the recipe directory; `None` for source-tree locks.
+    pub lock_sha256: Option<String>,
+    /// The observed source tarball when this call downloaded (or 304-
+    /// certified) one; `None` when every lock was recipe-local.
+    pub source: Option<SourceObserved>,
+}
+
+/// The outcome of [`fetch_deps_closure`]: either the closure was
+/// re-resolved and stored, or the conditional probe returned 304 — the
+/// source tree is byte-identical to the recorded pin, so the lock-driven
+/// re-resolve is skipped and the recorded pin stands (bounded by the
+/// validators' TTL: expired stamps never reach this path).
+#[derive(Debug, Clone)]
+pub enum DepsFetchOutcome {
+    Resolved(DepsFetch),
+    Unchanged(SourceObserved),
+}
+
 /// Ensure the package's dependency closure is fetched and cached in the
 /// pod store, returning the pin to record in `nau.lock` plus the
-/// OBSERVED sha256 of the source tarball when this call downloaded one
-/// (`None` when a cached pin was honored or every lock was recipe-local —
-/// ADR-0017 Decision 4a: the float hold compares this observation against
-/// the lockfile's restamped source pin instead of rebuilding).
+/// OBSERVED sha256 of the source tarball when this call downloaded (or
+/// 304-certified) one (`None` when a cached pin was honored or every
+/// lock was recipe-local — ADR-0017 Decision 4a: the float hold compares
+/// this observation against the lockfile's restamped source pin instead
+/// of rebuilding).
 ///
 /// Locked packages (`floating == false`) with a cached store entry never
 /// re-fetch — bit-reproducible. A locked package whose store entry went
@@ -76,13 +117,19 @@ pub const DEFAULT_GO_PROXY: &str = "https://proxy.golang.org";
 /// every call, record the new hash and a fresh `fetched_at` date tag, and
 /// keep the last-known pin intact until the caller commits the new one —
 /// rollback stays hash-pinned either way (ADR-0017 Decision 5).
+///
+/// `validators` (the lock's recorded etag + stamp for the source URL,
+/// only ever passed for floating packages) turn the source observation
+/// into a conditional GET: a 304 short-circuits the whole re-resolve and
+/// returns the recorded pin untouched.
 pub fn ensure_pod_deps(
     store: &BlobStore,
     meta: &SnapMeta,
     prev: Option<&PackageDepsLock>,
     floating: bool,
     recipe_dir: Option<&Path>,
-) -> miette::Result<(PackageDepsLock, Option<String>)> {
+    validators: Option<SourceValidators>,
+) -> miette::Result<(PackageDepsLock, Option<SourceObserved>)> {
     let Some(deps) = &meta.deps else {
         miette::bail!(
             "internal: ensure_pod_deps called for '{}' which declares no deps",
@@ -102,51 +149,70 @@ pub fn ensure_pod_deps(
         }
     }
 
-    let (hash, lock_sha256, observed_source) = fetch_deps_closure(store, meta, deps, recipe_dir)?;
+    // A 304 short-circuit needs a pin to stand: without a recorded
+    // closure pin there is nothing to return, so a pinless caller
+    // probes with a full GET.
+    let validators = if pinned.is_some() { validators } else { None };
 
-    Ok((
-        match pinned {
-            // The re-fetch reproduced the pin (locked entry rebuilt after GC,
-            // or a float whose upstream closure did not move): keep the pin —
-            // and its original fetched_at — untouched.
-            Some(old) if old == hash => prev.expect("pinned implies prev").clone(),
-            Some(old) => {
-                if !floating {
-                    miette::bail!(
-                        "dependency closure for '{}' changed upstream ({:.12} → {:.12}) \
-                         but the package is locked and its cached store entry was missing — \
-                         refusing to move the pin; run `nau deps fetch --latest` to move it deliberately",
-                        meta.name,
-                        old,
-                        hash
-                    );
-                }
-                nau_infra::output::warn(format!(
-                    "floating package '{}': dependency closure changed ({:.12} → {:.12})",
-                    meta.name, old, hash
-                ));
-                PackageDepsLock {
-                    deps_hash: hash,
-                    fetched_at: Some(today()),
-                    lock_sha256,
-                }
-            }
-            None => {
-                // TOFU (ADR-0017 Decision 3): print the hash; the lockfile IS
-                // the pin record.
-                nau_infra::output::ok(format!(
-                    "pinned dependency closure for '{}': {:.12}… (recorded in nau.lock)",
-                    meta.name, hash
-                ));
-                PackageDepsLock {
-                    deps_hash: hash,
-                    fetched_at: Some(today()),
-                    lock_sha256,
-                }
-            }
-        },
-        observed_source,
-    ))
+    match fetch_deps_closure(store, meta, deps, recipe_dir, validators.as_ref())? {
+        DepsFetchOutcome::Unchanged(observed) => {
+            // The 304 IS the observation: the source tree — and with it
+            // the lock-driven closure — is byte-identical to the pin's.
+            // The recorded pin stands wholesale (fetched_at untouched,
+            // nothing written anywhere).
+            Ok((
+                prev.expect("guarded above: validators imply pinned")
+                    .clone(),
+                Some(observed),
+            ))
+        }
+        DepsFetchOutcome::Resolved(fetched) => {
+            let observed_source = fetched.source;
+            Ok((
+                match pinned {
+                    // The re-fetch reproduced the pin (locked entry rebuilt after GC,
+                    // or a float whose upstream closure did not move): keep the pin —
+                    // and its original fetched_at — untouched.
+                    Some(old) if old == fetched.hash => prev.expect("pinned implies prev").clone(),
+                    Some(old) => {
+                        if !floating {
+                            miette::bail!(
+                                "dependency closure for '{}' changed upstream ({:.12} → {:.12}) \
+                                 but the package is locked and its cached store entry was missing — \
+                                 refusing to move the pin; run `nau deps fetch --latest` to move it deliberately",
+                                meta.name,
+                                old,
+                                fetched.hash
+                            );
+                        }
+                        nau_infra::output::warn(format!(
+                            "floating package '{}': dependency closure changed ({:.12} → {:.12})",
+                            meta.name, old, fetched.hash
+                        ));
+                        PackageDepsLock {
+                            deps_hash: fetched.hash,
+                            fetched_at: Some(today()),
+                            lock_sha256: fetched.lock_sha256,
+                        }
+                    }
+                    None => {
+                        // TOFU (ADR-0017 Decision 3): print the hash; the lockfile IS
+                        // the pin record.
+                        nau_infra::output::ok(format!(
+                            "pinned dependency closure for '{}': {:.12}… (recorded in nau.lock)",
+                            meta.name, fetched.hash
+                        ));
+                        PackageDepsLock {
+                            deps_hash: fetched.hash,
+                            fetched_at: Some(today()),
+                            lock_sha256: fetched.lock_sha256,
+                        }
+                    }
+                },
+                observed_source,
+            ))
+        }
+    }
 }
 
 /// Fetch + materialize the closure and store it as one content-addressed
@@ -157,13 +223,15 @@ pub fn ensure_pod_deps(
 /// tarball when this call downloaded one (ADR-0017 Decision 4a — the
 /// float-hold's drift observation, reused so the sync never downloads
 /// the source twice). `None` when every lock was recipe-local and no
-/// source was read.
+/// source was read. `validators` (lock-recorded etag + stamp) turn the
+/// source fetch conditional: a 304 short-circuits the whole re-resolve.
 fn fetch_deps_closure(
     store: &BlobStore,
     meta: &SnapMeta,
     deps: &nau_core::snap_types::PackageDeps,
     recipe_dir: Option<&Path>,
-) -> miette::Result<(String, Option<String>, Option<String>)> {
+    validators: Option<&SourceValidators>,
+) -> miette::Result<DepsFetchOutcome> {
     let work = tempfile::tempdir().map_err(|e| miette::miette!("tempdir: {e}"))?;
     // All-recipe-local closures never read a source tree: every lock
     // resolves against the recipe directory, so there is nothing to
@@ -173,7 +241,16 @@ fn fetch_deps_closure(
     let (src_root, observed_source) = if deps.all_locks_recipe_local() {
         (work.path().to_path_buf(), None)
     } else {
-        fetch_source_tree(meta, work.path())?
+        match fetch_source_tree(meta, work.path(), validators)? {
+            SourceTree::Unchanged { recorded_sha256 } => {
+                return Ok(DepsFetchOutcome::Unchanged(SourceObserved {
+                    sha256: recorded_sha256,
+                    etag: None,
+                    unchanged: true,
+                }));
+            }
+            SourceTree::Fetched { root, observed } => (root, Some(observed)),
+        }
     };
     // Resolve the declared locks once up front: fails fast on a missing
     // recipe lock (before any download), and records the recipe-shipped
@@ -184,7 +261,11 @@ fn fetch_deps_closure(
     fetch_all_resolvers(deps, &src_root, recipe_dir, &tree, work.path())?;
     let bytes = pack_canonical(&tree)?;
     let hash = store.write_blob(&bytes)?;
-    Ok((hash, lock_sha256, observed_source))
+    Ok(DepsFetchOutcome::Resolved(DepsFetch {
+        hash,
+        lock_sha256,
+        source: observed_source,
+    }))
 }
 
 /// The scratch dir the materialized closure tree is packed from.
@@ -251,51 +332,86 @@ pub fn materialize_deps_entry(
 
 // ── Source tree ──
 
+/// What [`fetch_source_tree`] produced for the declared source.
+#[derive(Debug)]
+enum SourceTree {
+    /// 304: the source is byte-identical to the recorded pin — no
+    /// tarball landed, nothing was extracted, nothing may be written.
+    Unchanged { recorded_sha256: String },
+    /// Fresh bytes: the extracted tree plus the observation.
+    Fetched {
+        root: PathBuf,
+        observed: SourceObserved,
+    },
+}
+
 /// Download + extract the package's source tarball and return its source
 /// root plus the OBSERVED tarball sha256 (ADR-0017 Decision 4a: the
 /// float-hold's drift observation rides this fetch so the closure
 /// re-resolve never downloads the source twice). Lockfiles resolve from
 /// this tree first (plain `lock` values), or from the package recipe
 /// directory (`recipe/` values — see [`lock_candidates`]).
-fn fetch_source_tree(meta: &SnapMeta, work: &Path) -> miette::Result<(PathBuf, Option<String>)> {
+///
+/// `validators` (the lock's recorded etag + validation stamp, passed
+/// only for floating sources) turn the observation into a conditional
+/// GET: a strong etag + fresh stamp send `If-None-Match`, and a 304
+/// returns the RECORDED sha as the observation without downloading,
+/// hashing, or extracting anything — the 304 IS the observation. Every
+/// other path still rides the same curl seam with no condition, so the
+/// server's etag is captured for free and a later probe can use it.
+fn fetch_source_tree(
+    meta: &SnapMeta,
+    work: &Path,
+    validators: Option<&SourceValidators>,
+) -> miette::Result<SourceTree> {
     let spec = meta.source.as_ref().ok_or_else(|| {
         miette::miette!(
             "package '{}': deps requires source — the lockfile resolves from the source tree",
             meta.name
         )
     })?;
+    fetch_tree_for_spec(&meta.name, spec, meta.floating, work, validators)
+}
+
+/// The fetchable core of [`fetch_source_tree`], split so tests can drive
+/// it with a bare [`SourceSpec`] (a full [`SnapMeta`] carries ~30
+/// build-time fields no fetch path reads).
+fn fetch_tree_for_spec(
+    name: &str,
+    spec: &SourceSpec,
+    floating: bool,
+    work: &Path,
+    validators: Option<&SourceValidators>,
+) -> miette::Result<SourceTree> {
     let url = spec.url();
     if !url.starts_with("http://") && !url.starts_with("https://") {
-        miette::bail!(
-            "package '{}': deps requires an http(s) source URL, got {url}",
-            meta.name
-        );
+        miette::bail!("package '{name}': deps requires an http(s) source URL, got {url}");
     }
     let filename = url.rsplit('/').next().unwrap_or("source.tar.gz");
     let tarball = work.join(filename);
     let spinner = nau_infra::output::spinner(&format!(
-        "fetching dependency closure for {} (downloading source)...",
-        meta.name
+        "fetching dependency closure for {name} (downloading source)..."
     ));
-    http_get_to_file(url, &tarball)?;
-    let sha = sha256_file(&tarball)?;
-    if let Some(expected) = spec.expected_sha256() {
-        if sha != expected {
-            // Issue #175: a floating source's recorded pin is a moving
-            // target by design — re-resolve (TOFU-record the new hash)
-            // exactly like the rebuild path does, never enforce the
-            // stale pin.
-            if !meta.floating {
-                return Err(miette::miette!(
-                    "SHA-256 mismatch for {url}:\n  expected: {expected}\n  got:      {sha}"
-                ));
-            }
-            nau_infra::output::warn(format!(
-                "floating source of {} re-resolved: {:.12}… → {:.12}… (restamping the pin)",
-                meta.name, expected, sha
-            ));
-        }
+    // Conditional probe (float-304 plan): a weak etag (`W/` prefix) is
+    // rejected → treated as absent — never sent as a condition.
+    let if_none_match = validators
+        .filter(|v| !v.etag.starts_with("W/"))
+        .map(|v| v.etag.as_str());
+    let fetch = http_get_conditional(url, &tarball, if_none_match)?;
+    if let Some(recorded) = probe_unchanged(&fetch, if_none_match, validators, &tarball, url)? {
+        nau_infra::output::info(format!("drift probe '{name}': 304 (unchanged, 0 bytes)"));
+        nau_infra::output::finish_ok(&spinner, &format!("source of {name} unchanged (304)"));
+        return Ok(SourceTree::Unchanged {
+            recorded_sha256: recorded,
+        });
     }
+    if fetch.code != 200 {
+        let _ = std::fs::remove_file(&tarball);
+        nau_infra::output::finish_err(&spinner, &format!("source of {name} failed"));
+        miette::bail!("failed to download {url} (HTTP {})", fetch.code);
+    }
+    let sha = sha256_file(&tarball)?;
+    verify_observed_source(name, spec, floating, url, &sha)?;
     let src_dir = work.join("src");
     std::fs::create_dir_all(&src_dir)
         .map_err(|e| miette::miette!("creating {}: {e}", src_dir.display()))?;
@@ -303,8 +419,68 @@ fn fetch_source_tree(meta: &SnapMeta, work: &Path) -> miette::Result<(PathBuf, O
     // never at the mercy of the caller PATH's `tar` binary.
     nau_infra::archive::extract_tarball(&tarball, &src_dir)
         .map_err(|e| e.wrap_err(format!("failed to extract {filename}")))?;
-    nau_infra::output::finish_ok(&spinner, &format!("fetched source of {}", meta.name));
-    Ok((find_source_root(&src_dir), Some(sha)))
+    nau_infra::output::finish_ok(&spinner, &format!("fetched source of {name}"));
+    Ok(SourceTree::Fetched {
+        root: find_source_root(&src_dir),
+        observed: SourceObserved {
+            sha256: sha,
+            etag: fetch.etag,
+            unchanged: false,
+        },
+    })
+}
+
+/// The 304 arm of the probe: when the server answered `304 Not Modified`
+/// to our conditional GET, delete the zero-byte tmp curl left behind
+/// (the recorded bytes stand untouched) and return the RECORDED sha as
+/// the observation. A 304 to anything but our own recorded-validator
+/// condition is a server bug — named refusal.
+fn probe_unchanged(
+    fetch: &CdnFetch,
+    if_none_match: Option<&str>,
+    validators: Option<&SourceValidators>,
+    tarball: &Path,
+    url: &str,
+) -> miette::Result<Option<String>> {
+    if fetch.code != 304 {
+        return Ok(None);
+    }
+    let _ = std::fs::remove_file(tarball);
+    let recorded = match (if_none_match, validators) {
+        (Some(condition), Some(v)) if v.etag == condition => v.recorded_sha256.clone(),
+        _ => miette::bail!("server answered 304 to an unconditional GET of {url}"),
+    };
+    Ok(Some(recorded))
+}
+
+/// The declared-pin check of an observed source (issue #175): a locked
+/// source refuses moved bytes; a FLOATING source re-resolves — its pin
+/// is a moving target by design, so the new hash is TOFU-recorded (the
+/// caller restamps the lock once the rebuild lands) and only warned
+/// about.
+fn verify_observed_source(
+    name: &str,
+    spec: &SourceSpec,
+    floating: bool,
+    url: &str,
+    sha: &str,
+) -> miette::Result<()> {
+    let Some(expected) = spec.expected_sha256() else {
+        return Ok(());
+    };
+    if sha == expected {
+        return Ok(());
+    }
+    if !floating {
+        return Err(miette::miette!(
+            "SHA-256 mismatch for {url}:\n  expected: {expected}\n  got:      {sha}"
+        ));
+    }
+    nau_infra::output::warn(format!(
+        "floating source of {name} re-resolved: {:.12}… → {:.12}… (restamping the pin)",
+        expected, sha
+    ));
+    Ok(())
 }
 
 /// The single top-level directory after extraction, if there is exactly
@@ -2123,29 +2299,153 @@ fn curl_tool() -> miette::Result<PathBuf> {
     })
 }
 
-/// curl download (the codebase's one network mechanism). A User-Agent is
-/// mandatory registry etiquette — crates.io 403s requests without one.
-fn http_get_to_file(url: &str, dest: &Path) -> miette::Result<()> {
+/// The User-Agent every registry-facing GET sends (crates.io 403s
+/// requests without one).
+const FETCH_USER_AGENT: &str = concat!(
+    "nau/",
+    env!("CARGO_PKG_VERSION"),
+    " (dependency-closure fetch)"
+);
+
+/// The result of one GET through the curl seam: the final HTTP status
+/// code (after redirects) plus the entity tag the final hop returned,
+/// when any. The etag is captured verbatim — never normalized.
+#[derive(Debug)]
+pub struct CdnFetch {
+    pub code: u16,
+    pub etag: Option<String>,
+}
+
+/// One curl GET writing the body to `dest_tmp`, optionally conditional
+/// on `if_none_match` (the raw `If-None-Match` header value, quoted form
+/// included). NO `-f`: the caller branches explicitly on the returned
+/// code — 304 means curl left a zero-byte `dest_tmp` that the caller
+/// must delete, 200 means the caller renames `dest_tmp` over its
+/// destination, anything else is an error naming the code. With `-L` the
+/// redirect hops concatenate their headers, so the ETag is parsed from
+/// the LAST HTTP block (github.com 302s to codeload.github.com, which
+/// serves the real ETag). Curl exit nonzero or a `000` code (no HTTP
+/// response at all) bails loud.
+fn http_get_conditional(
+    url: &str,
+    dest_tmp: &Path,
+    if_none_match: Option<&str>,
+) -> miette::Result<CdnFetch> {
     let curl = curl_tool()?;
-    let status = std::process::Command::new(&curl)
-        .args([
-            "-fsSL",
-            "-A",
-            concat!(
-                "nau/",
-                env!("CARGO_PKG_VERSION"),
-                " (dependency-closure fetch)"
-            ),
-            "-o",
-        ])
-        .arg(dest)
-        .arg(url)
-        .status()
-        .map_err(|e| miette::miette!("curl not found: {e}"))?;
-    if !status.success() {
-        miette::bail!("failed to download {url}");
+    let header_file = dest_tmp.with_file_name(format!(
+        ".{}.headers-{}",
+        dest_tmp
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("body"),
+        std::process::id()
+    ));
+    let result = run_curl_get(&curl, url, dest_tmp, &header_file, if_none_match);
+    let _ = std::fs::remove_file(&header_file);
+    result
+}
+
+/// The curl invocation of [`http_get_conditional`], split so the
+/// header-dump cleanup above always runs.
+fn run_curl_get(
+    curl: &Path,
+    url: &str,
+    dest_tmp: &Path,
+    header_file: &Path,
+    if_none_match: Option<&str>,
+) -> miette::Result<CdnFetch> {
+    let mut cmd = std::process::Command::new(curl);
+    cmd.args(["-sSL", "-D"]).arg(header_file);
+    if let Some(etag) = if_none_match {
+        cmd.arg("-H").arg(format!("If-None-Match: {etag}"));
     }
-    Ok(())
+    let out = cmd
+        .arg("-o")
+        .arg(dest_tmp)
+        .arg("-w")
+        .arg("%{http_code}")
+        .args(["-A", FETCH_USER_AGENT])
+        .arg(url)
+        .output()
+        .map_err(|e| miette::miette!("curl not found: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr = stderr.trim();
+        miette::bail!(
+            "failed to download {url}: curl exit {}{}",
+            out.status,
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        );
+    }
+    let code = parse_http_code(&out.stdout, url)?;
+    Ok(CdnFetch {
+        code,
+        etag: parse_last_etag(header_file),
+    })
+}
+
+/// Parse curl's `-w %{http_code}` output. `000` (no HTTP response —
+/// connection refused, TLS failure, …) bails loud like a nonzero exit.
+fn parse_http_code(stdout: &[u8], url: &str) -> miette::Result<u16> {
+    let text = String::from_utf8_lossy(stdout);
+    let code = text
+        .trim()
+        .parse::<u16>()
+        .map_err(|e| miette::miette!("failed to download {url}: unreadable curl status: {e}"))?;
+    if code == 0 {
+        miette::bail!("failed to download {url}: no HTTP response (curl code 000)");
+    }
+    Ok(code)
+}
+
+/// The ETag header of the LAST HTTP block in a curl `-D` header dump
+/// (with `-L` the hops concatenate; the final hop serves the body). Each
+/// new status line resets the capture; a missing or unreadable dump
+/// yields `None` — the fetch succeeds, only the free etag capture is
+/// lost.
+fn parse_last_etag(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut etag = None;
+    for line in text.lines() {
+        if line.starts_with("HTTP/") {
+            etag = None;
+        } else if line.len() > 5 && line[..5].eq_ignore_ascii_case("etag:") {
+            etag = Some(line[5..].trim().to_string());
+        }
+    }
+    etag
+}
+
+/// curl download (the codebase's one network mechanism): an unconditional
+/// GET routed through [`http_get_conditional`] so the etag is captured
+/// for free on every full fetch. The body lands via a sibling temp file
+/// renamed over `dest` only on a 200 — a failure never leaves a partial
+/// or empty file at the destination.
+fn http_get_to_file(url: &str, dest: &Path) -> miette::Result<()> {
+    let tmp = dest.with_file_name(format!(
+        ".{}.tmp-{}",
+        dest.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("download"),
+        std::process::id()
+    ));
+    let result = http_get_conditional(url, &tmp, None).and_then(|fetch| match fetch.code {
+        200 => std::fs::rename(&tmp, dest)
+            .map_err(|e| miette::miette!("finalizing {}: {e}", dest.display())),
+        code => {
+            let _ = std::fs::remove_file(&tmp);
+            miette::bail!("failed to download {url} (HTTP {code})");
+        }
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// GET a small text resource (index pages) via a temp file.
@@ -3241,5 +3541,402 @@ require github.com/only/one v0.1.0
         }
         out.sort();
         out
+    }
+
+    // ── Conditional drift probe (float-304 plan) ──
+
+    /// A minimal tar.gz with one member `pkg/data.txt`, so a 200 source
+    /// fetch extracts cleanly and `find_source_root` sees one top dir.
+    fn tiny_tarball(body: &str) -> Vec<u8> {
+        let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut tar = tar::Builder::new(enc);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "pkg/data.txt", body.as_bytes())
+            .unwrap();
+        tar.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// A throwaway loopback HTTP/1.1 server: `respond` builds one raw
+    /// response per request from the raw request bytes (headers
+    /// included, so tests branch on `If-None-Match`). Every response
+    /// closes the connection, so each curl hop is one fresh accept. The
+    /// accept loop exits when the returned flag is set; leftover threads
+    /// die with the test process.
+    fn spawn_http_server(
+        respond: impl Fn(&[u8]) -> Vec<u8> + Send + 'static,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let sd = shutdown.clone();
+        std::thread::spawn(move || {
+            let _ = listener.set_nonblocking(true);
+            loop {
+                if sd.load(Ordering::Relaxed) {
+                    return;
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut req = Vec::new();
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            match std::io::Read::read(&mut stream, &mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    req.extend_from_slice(&buf[..n]);
+                                    if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        let head_end = req
+                            .windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                            .map(|p| p + 4)
+                            .unwrap_or(req.len());
+                        let response = respond(&req[..head_end]);
+                        let _ = std::io::Write::write_all(&mut stream, &response);
+                        let _ = std::io::Write::flush(&mut stream);
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+        });
+        (format!("http://{addr}/src.tar.gz"), shutdown)
+    }
+
+    /// The loopback test server responses are raw bytes like curl's -w
+    /// contract expects; keep one builder so the Content-Length math is
+    /// written once.
+    fn http_response(status_line: &str, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+        let mut head = format!("{status_line}\r\n");
+        for (name, value) in headers {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        head.push_str("Connection: close\r\n\r\n");
+        let mut out = head.into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn curl_available() -> bool {
+        match nau_infra::tools::ensure(nau_infra::tools::ToolName::Curl) {
+            Ok(_) => true,
+            Err(e) => {
+                // Loopback curl tests are the gate's contract; a machine
+                // without curl skips rather than fails.
+                eprintln!("skipping curl-backed probe test: {e}");
+                false
+            }
+        }
+    }
+
+    fn validators(etag: &str, recorded_sha256: &str) -> Option<SourceValidators> {
+        Some(SourceValidators {
+            etag: etag.to_string(),
+            recorded_sha256: recorded_sha256.to_string(),
+        })
+    }
+
+    fn unverified_spec(url: &str) -> SourceSpec {
+        SourceSpec::Unverified(url.to_string())
+    }
+
+    #[test]
+    fn http_get_conditional_captures_etag_and_body_on_200() {
+        if !curl_available() {
+            return;
+        }
+        let body = b"payload-bytes".to_vec();
+        let (url, shutdown) = spawn_http_server(move |_req| {
+            http_response("HTTP/1.1 200 OK", &[("ETag", "\"v2\"")], &body)
+        });
+        let work = tempfile::tempdir().unwrap();
+        let tmp = work.path().join("out.bin");
+        let fetch = http_get_conditional(&url, &tmp, None).unwrap();
+        assert_eq!(fetch.code, 200);
+        // The etag is stored verbatim — quoted form included.
+        assert_eq!(fetch.etag.as_deref(), Some("\"v2\""));
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"payload-bytes");
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A server dying mid-body (Content-Length promises more than it
+    /// sends, connection drops) must fail the fetch loud AND leave a
+    /// pre-existing dest byte-identical — the sibling-tmp + rename-on-200
+    /// contract means a partial transfer can never replace real bytes
+    /// (council test plan: mid-transfer kill leaves dest intact).
+    #[test]
+    fn http_get_conditional_mid_transfer_kill_leaves_dest_intact() {
+        if !curl_available() {
+            return;
+        }
+        let (url, shutdown) = spawn_http_server(move |_req| {
+            // Promises 100 bytes, sends 5, closes: curl exits 18/23.
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort".to_vec()
+        });
+        let work = tempfile::tempdir().unwrap();
+        let dest = work.path().join("out.bin");
+        std::fs::write(&dest, b"original-bytes").unwrap();
+        let err = http_get_to_file(&url, &dest).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("failed to download"),
+            "mid-transfer kill must bail loud: {msg}"
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"original-bytes",
+            "a partial transfer must never replace dest bytes"
+        );
+        let tmp = dest.with_file_name(format!(
+            ".{}.tmp-{}",
+            dest.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("download"),
+            std::process::id()
+        ));
+        assert!(!tmp.exists(), "a failed transfer must not leave its tmp");
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn http_get_conditional_304_leaves_tmp_deletion_to_the_caller() {
+        if !curl_available() {
+            return;
+        }
+        let (url, shutdown) = spawn_http_server(move |req| {
+            if req.windows(14).any(|w| w == b"If-None-Match:") {
+                http_response("HTTP/1.1 304 Not Modified", &[("ETag", "\"v1\"")], b"")
+            } else {
+                http_response("HTTP/1.1 500 Internal Server Error", &[], b"")
+            }
+        });
+        let work = tempfile::tempdir().unwrap();
+        let tmp = work.path().join("out.bin");
+        std::fs::write(&tmp, b"stale").unwrap();
+        let fetch = http_get_conditional(&url, &tmp, Some("\"v1\"")).unwrap();
+        assert_eq!(fetch.code, 304);
+        // The seam's raw contract: a 304 has no body, so curl leaves the
+        // tmp's existing bytes untouched (and creates nothing when absent)
+        // — deleting it and keeping the recorded bytes standing is the
+        // CALLER's move.
+        assert!(tmp.exists(), "curl must leave the tmp for the caller");
+        assert_eq!(
+            std::fs::read(&tmp).unwrap(),
+            b"stale",
+            "a 304 never touches existing bytes"
+        );
+        let recorded = probe_unchanged(
+            &fetch,
+            Some("\"v1\""),
+            validators("\"v1\"", "recorded-sha").as_ref(),
+            &tmp,
+            &url,
+        )
+        .unwrap();
+        assert_eq!(recorded.as_deref(), Some("recorded-sha"));
+        assert!(!tmp.exists(), "the caller deletes the tmp");
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn http_get_conditional_bails_loud_without_an_http_response() {
+        if !curl_available() {
+            return;
+        }
+        // A port nothing listens on: curl exits nonzero (connection
+        // refused) — bail loud.
+        let work = tempfile::tempdir().unwrap();
+        let tmp = work.path().join("out.bin");
+        let err = http_get_conditional("http://127.0.0.1:9/src.tar.gz", &tmp, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("failed to download"),
+            "bail must keep the download-failure wording: {msg}"
+        );
+    }
+
+    #[test]
+    fn http_get_to_file_surfaces_the_status_code_and_never_writes_dest() {
+        if !curl_available() {
+            return;
+        }
+        let (url, shutdown) =
+            spawn_http_server(move |_req| http_response("HTTP/1.1 404 Not Found", &[], b""));
+        let work = tempfile::tempdir().unwrap();
+        let dest = work.path().join("src.tar.gz");
+        let err = http_get_to_file(&url, &dest).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("failed to download") && msg.contains("404"),
+            "bail must keep today's wording plus the status: {msg}"
+        );
+        assert!(!dest.exists(), "a failed GET never leaves a file at dest");
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn parse_last_etag_reads_the_final_redirect_hop() {
+        if !curl_available() {
+            return;
+        }
+        // github.com 302s to codeload.github.com; both hops carry an
+        // ETag and the LAST block's is the real one.
+        let (url, shutdown) = spawn_http_server(move |req| {
+            let path = std::str::from_utf8(req).unwrap_or("");
+            if path.contains("GET /src.tar.gz ") {
+                let body = b"redirected".to_vec();
+                http_response(
+                    "HTTP/1.1 302 Found",
+                    &[("Location", "/real"), ("ETag", "\"hop-etag\"")],
+                    &body,
+                )
+            } else {
+                let body = b"real-bytes".to_vec();
+                http_response("HTTP/1.1 200 OK", &[("ETag", "\"real-etag\"")], &body)
+            }
+        });
+        let work = tempfile::tempdir().unwrap();
+        let tmp = work.path().join("out.bin");
+        let fetch = http_get_conditional(&url, &tmp, None).unwrap();
+        assert_eq!(fetch.code, 200);
+        assert_eq!(
+            fetch.etag.as_deref(),
+            Some("\"real-etag\""),
+            "with -L the redirect hops concatenate; the LAST block's etag wins"
+        );
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn fetch_tree_304_short_circuits_without_extraction() {
+        if !curl_available() {
+            return;
+        }
+        let (url, shutdown) = spawn_http_server(move |req| {
+            if req.windows(14).any(|w| w == b"If-None-Match:") {
+                http_response("HTTP/1.1 304 Not Modified", &[("ETag", "\"v1\"")], b"")
+            } else {
+                http_response("HTTP/1.1 500 Internal Server Error", &[], b"")
+            }
+        });
+        let work = tempfile::tempdir().unwrap();
+        let validators = validators("\"v1\"", "recorded-sha");
+        let out = fetch_tree_for_spec(
+            "tool",
+            &unverified_spec(&url),
+            true,
+            work.path(),
+            validators.as_ref(),
+        )
+        .unwrap();
+        match out {
+            SourceTree::Unchanged { recorded_sha256 } => {
+                assert_eq!(recorded_sha256, "recorded-sha");
+            }
+            SourceTree::Fetched { .. } => panic!("a 304 must short-circuit, not fetch"),
+        }
+        assert!(
+            !work.path().join("src.tar.gz").exists(),
+            "the zero-byte tmp is deleted; no tarball remains"
+        );
+        assert!(!work.path().join("src").exists(), "a 304 never extracts");
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn fetch_tree_condition_ignored_full_get_has_no_false_drift() {
+        if !curl_available() {
+            return;
+        }
+        let archive = tiny_tarball("same-bytes");
+        let recorded_sha = hex_sha256(&archive);
+        let (url, shutdown) = spawn_http_server(move |_req| {
+            // The server IGNORES If-None-Match and re-serves identical
+            // bytes under a refreshed etag.
+            http_response("HTTP/1.1 200 OK", &[("ETag", "\"v2\"")], &archive)
+        });
+        let work = tempfile::tempdir().unwrap();
+        let validators = validators("\"v1\"", &recorded_sha);
+        let out = fetch_tree_for_spec(
+            "tool",
+            &unverified_spec(&url),
+            true,
+            work.path(),
+            validators.as_ref(),
+        )
+        .unwrap();
+        let SourceTree::Fetched { root, observed } = out else {
+            panic!("a 200 must fetch and extract");
+        };
+        assert_eq!(observed.sha256, recorded_sha, "no false drift");
+        assert!(!observed.unchanged);
+        assert_eq!(observed.etag.as_deref(), Some("\"v2\""), "etag refreshed");
+        let data = root.join("data.txt");
+        assert_eq!(std::fs::read_to_string(&data).unwrap(), "same-bytes");
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn fetch_tree_weak_etag_is_never_sent_as_a_condition() {
+        if !curl_available() {
+            return;
+        }
+        let archive = tiny_tarball("fresh-bytes");
+        let sha = hex_sha256(&archive);
+        let (url, shutdown) = spawn_http_server(move |req| {
+            if req.windows(14).any(|w| w == b"If-None-Match:") {
+                // Would 304 if the weak etag leaked into the request.
+                http_response("HTTP/1.1 304 Not Modified", &[], b"")
+            } else {
+                http_response("HTTP/1.1 200 OK", &[("ETag", "\"v2\"")], &archive)
+            }
+        });
+        let work = tempfile::tempdir().unwrap();
+        // Weak validators are rejected → treated as absent: the fetch is
+        // unconditional and the recorded sha plays no part.
+        let validators = validators("W/\"weak-1\"", "not-the-sha");
+        let out = fetch_tree_for_spec(
+            "tool",
+            &unverified_spec(&url),
+            true,
+            work.path(),
+            validators.as_ref(),
+        )
+        .unwrap();
+        let SourceTree::Fetched { observed, .. } = out else {
+            panic!("a weak etag must full-GET, not 304");
+        };
+        assert_eq!(observed.sha256, sha);
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn fetch_tree_non_200_bails_naming_the_code() {
+        if !curl_available() {
+            return;
+        }
+        let (url, shutdown) = spawn_http_server(move |_req| {
+            http_response("HTTP/1.1 500 Internal Server Error", &[], b"")
+        });
+        let work = tempfile::tempdir().unwrap();
+        let err = fetch_tree_for_spec("tool", &unverified_spec(&url), true, work.path(), None)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("failed to download") && msg.contains("500"),
+            "bail must keep today's wording plus the status: {msg}"
+        );
+        assert!(!work.path().join("src").exists());
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }

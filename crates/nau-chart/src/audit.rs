@@ -1154,6 +1154,8 @@ mod tests {
                 url.to_string(),
                 SourceLockEntry {
                     sha256: sha.to_string(),
+                    etag: None,
+                    validated_at: None,
                 },
             );
         }
