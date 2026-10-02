@@ -112,6 +112,18 @@ clap_complete = "4"
 # small. The guest never needs symbols: the boot units exec it headlessly.
 strip = true
 
+# Pod verbs hash dependency blobs with sha2/sha3 (held-verify, sync
+# hold checks): unoptimized, those hashes run ~20 MB/s against the
+# release SHA-NI path's 1-2 GB/s, so a debug `pod sync` takes minutes.
+# Optimize just the hash crates in dev builds; everything else keeps
+# the fast debug compile. Release stays the supported path for real
+# syncs (the pod-verb entry warns when it is not).
+[profile.dev.package."sha2"]
+opt-level = 2
+
+[profile.dev.package."sha3"]
+opt-level = 2
+
 [dev-dependencies]
 # The sysupdate/pgp unit tests that stayed root (issue #326 PR 8) use the
 # pgp crate directly; the production primitives live in nau-infra::pgp,

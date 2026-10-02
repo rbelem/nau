@@ -39,6 +39,13 @@ impl BlobStore {
     /// Write `bytes` into the store content-addressed by their sha256
     /// (atomic: temp file + rename). Returns the hash. Idempotent: an
     /// already-present blob short-circuits.
+    ///
+    /// A completed write RECORDS the digest in the process-lifetime blob
+    /// memo (`crate::blob_memo`): the bytes this call hashed are the
+    /// exact bytes the rename installed at `path`, so a same-process
+    /// verifier can trust the record and skip the re-read. The
+    /// short-circuit arm records nothing — an existing file's bytes were
+    /// never observed here.
     pub fn write_blob(&self, bytes: &[u8]) -> miette::Result<String> {
         use std::io::Write;
 
@@ -68,6 +75,7 @@ impl BlobStore {
         }
         std::fs::rename(&tmp, &path)
             .map_err(|e| miette::miette!("finalizing {}: {e}", path.display()))?;
+        crate::blob_memo::record(&path, &hash);
         Ok(hash)
     }
 }

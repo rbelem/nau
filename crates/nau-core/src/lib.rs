@@ -9,6 +9,7 @@
 //! in its lib) so every pre-existing `crate::snap_types::` /
 //! `crate::manifest_ir::` path keeps resolving without churn.
 
+pub mod blob_memo;
 pub mod blob_store;
 pub mod cache_key;
 pub mod channels;

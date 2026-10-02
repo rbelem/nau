@@ -586,29 +586,50 @@ fn build_one_image(
 
 // ── Doctor command ──
 
-pub fn cmd_doctor(
-    pod: Option<Option<String>>,
-    fix: bool,
-    from: Option<&str>,
-) -> miette::Result<()> {
-    if from.is_some() && !fix {
-        miette::bail!("--from requires --fix: doctor only provisions with explicit consent");
+/// The `doctor --verify` mode: the deep store sweep (sync-speed plan
+/// item 6d). Its own verb shape — long-running, per-blob output,
+/// nonzero exit on any corrupt blob. Composes with neither --fix nor
+/// the readiness table.
+fn run_doctor_verify(pod: Option<Option<String>>) -> miette::Result<()> {
+    let pod_name = pod.flatten();
+    let root = crate::pod::pod_root(None);
+    println!(
+        "deep-verifying pod store content under {}...",
+        root.display()
+    );
+    let corrupt = crate::doctor::deep_verify_blobs(&root, pod_name.as_deref())?;
+    if corrupt > 0 {
+        println!("  ✗ {corrupt} corrupt blob(s) — restore from a peer or reinstall");
+        std::process::exit(1);
     }
-    if fix {
-        let source = match from {
-            Some(dir) => crate::tools::ProvisionSource::FromDir(PathBuf::from(dir)),
-            None => crate::tools::ProvisionSource::Fetch,
-        };
-        println!("provisioning floor tools (issue #101)...");
-        let installed = crate::tools::provision(source)
-            .into_diagnostic()
-            .wrap_err("floor-tool provisioning failed")?;
-        println!(
-            "  ✓ floor tools provisioned — tools v{} active in {}",
-            installed.tools_version,
-            installed.bin_dir.display()
-        );
-    }
+    println!("  ✓ every content-addressed blob matches its address");
+    Ok(())
+}
+
+/// The `doctor --fix` mode: provision the floor tools (issue #101),
+/// from `--from DIR` when given, then report what became active.
+fn run_doctor_fix(from: Option<&str>) -> miette::Result<()> {
+    let source = match from {
+        Some(dir) => crate::tools::ProvisionSource::FromDir(PathBuf::from(dir)),
+        None => crate::tools::ProvisionSource::Fetch,
+    };
+    println!("provisioning floor tools (issue #101)...");
+    let installed = crate::tools::provision(source)
+        .into_diagnostic()
+        .wrap_err("floor-tool provisioning failed")?;
+    println!(
+        "  ✓ floor tools provisioned — tools v{} active in {}",
+        installed.tools_version,
+        installed.bin_dir.display()
+    );
+    Ok(())
+}
+
+/// The readiness table tail (`doctor` / `doctor --pod [--fix]`): run
+/// the pod-surface or full check set, push the named pod's failed-unit
+/// scan (issue #231, advisory), print the report, and report whether
+/// everything passed.
+fn run_doctor_readiness(pod: Option<Option<String>>, fix: bool) -> miette::Result<bool> {
     let mut checks = if pod.is_some() || fix {
         crate::doctor::run_pod()
     } else {
@@ -617,14 +638,35 @@ pub fn cmd_doctor(
     // `--pod <name>` (issue #231): the failed-unit scan for the named
     // pod. The name is validated fail-closed at the CLI boundary; the
     // scan itself is advisory (hint-only, never fails the report).
-    if let Some(pod_name) = pod.clone().flatten().as_deref() {
+    if let Some(pod_name) = pod.flatten().as_deref() {
         let (name, _) =
             crate::pod::resolve_pod_dir_under(&crate::pod::pod_root(None), Some(pod_name))?;
         checks.push(crate::doctor::check_pod_failed_units(&name));
     }
     crate::doctor::print_report(&checks);
     crate::doctor::print_notices();
-    if !crate::doctor::all_ok(&checks) {
+    Ok(crate::doctor::all_ok(&checks))
+}
+
+pub fn cmd_doctor(
+    pod: Option<Option<String>>,
+    fix: bool,
+    from: Option<&str>,
+    verify: bool,
+) -> miette::Result<()> {
+    if from.is_some() && !fix {
+        miette::bail!("--from requires --fix: doctor only provisions with explicit consent");
+    }
+    if verify {
+        if fix || from.is_some() {
+            miette::bail!("--verify runs alone: it sweeps store content, not tooling");
+        }
+        return run_doctor_verify(pod);
+    }
+    if fix {
+        run_doctor_fix(from)?;
+    }
+    if !run_doctor_readiness(pod, fix)? {
         std::process::exit(1);
     }
     Ok(())
@@ -1607,7 +1649,39 @@ fn cmd_pod_refresh(root: &Path, pod_name: &str, members: &[String]) -> miette::R
     Ok(())
 }
 
+/// The pod verbs whose runtime is dominated by blob hashing (the
+/// mutate/reconcile family: dependency-closure verify, held-blob
+/// re-hash, payload identity). Read-only verbs — list, shellenv, run,
+/// secrets, rollback, gc — never walk the hash path.
+fn is_hash_heavy_pod_verb(sub: &PodCommand) -> bool {
+    matches!(
+        sub,
+        PodCommand::Add { .. }
+            | PodCommand::Remove { .. }
+            | PodCommand::Sync { .. }
+            | PodCommand::Refresh { .. }
+            | PodCommand::Update { .. }
+            | PodCommand::Rebuild { .. }
+    )
+}
+
+/// Loud one-line warning when a DEBUG build runs a hash-heavy pod verb
+/// (sync-speed plan item E): unoptimized sha256/sha3 run 10-50x slower
+/// than the release SHA-NI path, so a minutes-long sync is the build,
+/// not the pod. Release — the supported path for real syncs — is
+/// silent. Lives here at the verb dispatcher, one call site, never
+/// inside the pod domain.
+fn warn_debug_build_pod_verb(sub: &PodCommand) {
+    if cfg!(debug_assertions) && is_hash_heavy_pod_verb(sub) {
+        crate::output::warn(
+            "debug build: pod verbs run 10-50x slower (unoptimized \
+             sha256/sha3); use a release build for real syncs",
+        );
+    }
+}
+
 pub fn cmd_pod(name: Option<&str>, sub: PodCommand) -> miette::Result<()> {
+    warn_debug_build_pod_verb(&sub);
     // `pod run` carries the legacy `nau run` flag surface: its `--pod`
     // is the run verb's own flag, not the pod-domain `--name`. The
     // pre-verb `--name` still selects the pod, so the two merge
@@ -3095,6 +3169,105 @@ mod tests {
             "ok: 2 output(s): bzip2 1.0.8, hello 2.10"
         );
         assert_eq!(check_ok_message(&[]), "ok: 0 output(s)");
+    }
+
+    /// Sync-speed plan item E: exactly the mutate/reconcile family is
+    /// hash-heavy — the read-only and link-flipping verbs stay silent
+    /// on a debug build.
+    #[test]
+    fn hash_heavy_pod_verbs_cover_the_mutate_reconcile_family() {
+        let target = || crate::cli::PodTarget { name: None };
+        for (verb, sub) in [
+            (
+                "add",
+                PodCommand::Add {
+                    target: target(),
+                    package: None,
+                    snap: None,
+                    ack_unsigned: false,
+                    root: None,
+                },
+            ),
+            (
+                "remove",
+                PodCommand::Remove {
+                    target: target(),
+                    package: "jq".into(),
+                    root: None,
+                },
+            ),
+            (
+                "sync",
+                PodCommand::Sync {
+                    target: target(),
+                    rebuild_unstamped: false,
+                    root: None,
+                },
+            ),
+            (
+                "refresh",
+                PodCommand::Refresh {
+                    target: target(),
+                    members: vec![],
+                    root: None,
+                },
+            ),
+            (
+                "update",
+                PodCommand::Update {
+                    target: target(),
+                    packages: vec![],
+                    root: None,
+                },
+            ),
+            (
+                "rebuild",
+                PodCommand::Rebuild {
+                    target: target(),
+                    package: "jq".into(),
+                    latest: false,
+                    root: None,
+                },
+            ),
+        ] {
+            assert!(is_hash_heavy_pod_verb(&sub), "expected warn: {verb}");
+        }
+        for (verb, sub) in [
+            (
+                "list",
+                PodCommand::List {
+                    target: target(),
+                    root: None,
+                },
+            ),
+            (
+                "shellenv",
+                PodCommand::Shellenv {
+                    target: target(),
+                    json: false,
+                    root: None,
+                },
+            ),
+            (
+                "rollback",
+                PodCommand::Rollback {
+                    target: target(),
+                    generation: None,
+                    root: None,
+                },
+            ),
+            (
+                "gc",
+                PodCommand::Gc {
+                    target: target(),
+                    prune: false,
+                    downloads: false,
+                    root: None,
+                },
+            ),
+        ] {
+            assert!(!is_hash_heavy_pod_verb(&sub), "expected silent: {verb}");
+        }
     }
 
     /// ADR-0049 Decision 3b: the completion generation emits the domain
