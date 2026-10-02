@@ -478,6 +478,140 @@ fn extract_workers_from_lua(lua: &mlua::Lua) -> miette::Result<WorkersConfig> {
     }
 }
 
+// ── servers {} (ADR-0052 Decision 6) ──
+
+/// The `servers` config value types live DOWN in `nau_core::servers`
+/// (ADR-0052 Decision 6, the [`WorkersConfig`] precedent): the pod
+/// declaration, the submit client, and the drain all consume them and a
+/// domain crate must not depend on the chart. Re-exported so every
+/// `crate::lua::` path keeps resolving.
+pub use nau_core::servers::{validate_server_url, ServerFront};
+
+/// Parse one `servers` global entry. An entry is the URL string itself
+/// (`servers { "https://…" }`) or a table carrying `url` plus no unknown
+/// fields (fail-closed, the `workers` entry precedent) — the table form
+/// is where per-front fields land as the request path grows them.
+fn parse_server_entry(value: &mlua::Value, index: usize) -> miette::Result<ServerFront> {
+    match value {
+        mlua::Value::String(s) => {
+            let url = s
+                .to_str()
+                .map_err(|e| miette::miette!("servers[{index}]: non-utf8 url: {e}"))?
+                .to_string();
+            validate_server_url(&url).map_err(|e| miette::miette!("servers[{index}]: {e}"))?;
+            Ok(ServerFront { url })
+        }
+        mlua::Value::Table(table) => {
+            let url = match table.get::<mlua::Value>("url").unwrap_or(mlua::Value::Nil) {
+                mlua::Value::String(s) => s
+                    .to_str()
+                    .map_err(|e| miette::miette!("servers[{index}]: non-utf8 url: {e}"))?
+                    .to_string(),
+                mlua::Value::Nil => {
+                    return Err(miette::miette!(
+                        "servers[{index}]: missing required field 'url'"
+                    ))
+                }
+                other => {
+                    return Err(miette::miette!(
+                        "servers[{index}]: field 'url' must be a string, got {}",
+                        other.type_name()
+                    ))
+                }
+            };
+            validate_server_url(&url).map_err(|e| miette::miette!("servers[{index}]: {e}"))?;
+            for pair in table.pairs::<mlua::Value, mlua::Value>() {
+                let (key, _) = pair.map_err(|e| miette::miette!("servers[{index}]: {e}"))?;
+                let field = match &key {
+                    mlua::Value::String(s) => s
+                        .to_str()
+                        .map(|v| v.to_string())
+                        .map_err(|e| miette::miette!("servers[{index}]: non-utf8 key: {e}"))?,
+                    other => {
+                        return Err(miette::miette!(
+                            "servers[{index}]: keys must be strings, got {}",
+                            other.type_name()
+                        ))
+                    }
+                };
+                if field != "url" {
+                    return Err(miette::miette!(
+                        "servers[{index}]: unknown field '{field}' (known fields: url)"
+                    ));
+                }
+            }
+            Ok(ServerFront { url })
+        }
+        other => Err(miette::miette!(
+            "servers[{index}] must be a url string or a table with 'url', got {}",
+            other.type_name()
+        )),
+    }
+}
+
+/// Extract the global `servers` table from an evaluated Lua state
+/// (ADR-0052 Decision 6): an ordered list of server fronts, kept in
+/// declaration order — the resolution order is the contract. Absent
+/// means an empty list (the resolution error names the remedy).
+fn extract_servers_from_lua(lua: &mlua::Lua) -> miette::Result<Vec<ServerFront>> {
+    let value: mlua::Value = lua
+        .globals()
+        .get("servers")
+        .map_err(|e| miette::miette!("failed to read 'servers' global: {e}"))?;
+    match value {
+        mlua::Value::Nil => Ok(Vec::new()),
+        mlua::Value::Table(table) => {
+            // Array-position order IS the try order (the workers dense
+            // 1..n rule): sparse or mixed numbering would make the
+            // effective order VM-iteration-dependent, so it is a named
+            // refusal, never a silent renumber.
+            let mut entries: Vec<(usize, ServerFront)> = Vec::new();
+            for pair in table.pairs::<mlua::Value, mlua::Value>() {
+                let (key, val) = pair.map_err(|e| miette::miette!("servers entry: {e}"))?;
+                let idx = match key {
+                    mlua::Value::Integer(i) => usize::try_from(i)
+                        .map_err(|_| miette::miette!("servers: negative array index"))?,
+                    mlua::Value::String(s) => s
+                        .to_str()
+                        .map_err(|e| miette::miette!("servers: key name: {e}"))?
+                        .parse::<usize>()
+                        .map_err(|_| {
+                            miette::miette!(
+                                "servers: keys must be array indices (1-based), got string keys"
+                            )
+                        })?,
+                    other => {
+                        return Err(miette::miette!(
+                            "servers: keys must be array indices, got {}",
+                            other.type_name()
+                        ))
+                    }
+                };
+                if idx == 0 {
+                    return Err(miette::miette!(
+                        "servers: array indices are 1-based, got key '{idx}'"
+                    ));
+                }
+                entries.push((idx, parse_server_entry(&val, idx)?));
+            }
+            entries.sort_by_key(|(idx, _)| *idx);
+            for (pos, (idx, _)) in entries.iter().enumerate() {
+                let expected = pos + 1;
+                if *idx != expected {
+                    return Err(miette::miette!(
+                        "servers[{idx}]: array indices must be dense 1..n, expected index {expected} here"
+                    ));
+                }
+            }
+            Ok(entries.into_iter().map(|(_, front)| front).collect())
+        }
+        other => Err(miette::miette!(
+            "'servers' must be a table of server fronts, got {}",
+            other.type_name()
+        )),
+    }
+}
+
 /// True when a worker-serialized output table carries the `node()`
 /// marker — checked on the raw JSON so non-node outputs (the common
 /// case) never pay for a Lua round-trip.
@@ -594,6 +728,9 @@ pub struct EvalOutput {
     /// The `workers` surface (ADR-0040 Decision 3) — empty by default;
     /// absent means zero behavior change.
     pub workers: WorkersConfig,
+    /// The `servers` surface (ADR-0052 Decision 6) — the ordered server
+    /// fronts; empty when the definition declares none.
+    pub servers: Vec<ServerFront>,
 }
 
 /// One validation/eval diagnostic with structured fields (ADR-0010 Decisions
@@ -652,6 +789,8 @@ pub struct CheckedEval {
     pub node: Option<NodeConfig>,
     /// The `workers` surface (ADR-0040 Decision 3).
     pub workers: WorkersConfig,
+    /// The `servers` surface (ADR-0052 Decision 6).
+    pub servers: Vec<ServerFront>,
     pub diagnostics: Vec<CheckDiagnostic>,
     /// Set when the eval failed hard; `outputs`/`global_inputs` are then empty.
     pub error: Option<String>,
@@ -696,6 +835,7 @@ pub fn check_string_with_inputs(label: &str, source: &str) -> CheckedEval {
             global_inputs: HashMap::new(),
             node: None,
             workers: WorkersConfig::default(),
+            servers: Vec::new(),
             diagnostics,
             error: Some(error),
         }
@@ -820,11 +960,32 @@ pub fn check_string_with_inputs(label: &str, source: &str) -> CheckedEval {
         Err(e) => return failed(diagnostics, format!("{e:#}")),
     };
 
+    // Same rehydration for `servers` (ADR-0052 Decision 6): the child
+    // carries the raw global, the parent validates shape so both eval
+    // paths share one parser.
+    let servers_value = match json_to_lua(&lua, &ok.servers) {
+        Ok(v) => v,
+        Err(e) => {
+            return failed(
+                diagnostics,
+                format!("{label}: servers conversion failed: {e}"),
+            )
+        }
+    };
+    if let Err(e) = lua.globals().set("servers", servers_value) {
+        return failed(diagnostics, format!("failed to set servers global: {e}"));
+    }
+    let servers = match extract_servers_from_lua(&lua) {
+        Ok(s) => s,
+        Err(e) => return failed(diagnostics, format!("{e:#}")),
+    };
+
     CheckedEval {
         outputs,
         global_inputs,
         node,
         workers,
+        servers,
         diagnostics,
         error: None,
     }
@@ -841,6 +1002,7 @@ pub fn check_file_with_inputs(path: &str) -> CheckedEval {
             global_inputs: HashMap::new(),
             node: None,
             workers: WorkersConfig::default(),
+            servers: Vec::new(),
             diagnostics: Vec::new(),
             error: Some(format!("could not read {path}: {e}")),
         },
@@ -863,6 +1025,7 @@ pub fn evaluate_string_with_inputs(label: &str, source: &str) -> miette::Result<
         global_inputs: checked.global_inputs,
         node: checked.node,
         workers: checked.workers,
+        servers: checked.servers,
     })
 }
 
@@ -1108,6 +1271,7 @@ fn json_to_lua(lua: &mlua::Lua, v: &serde_json::Value) -> mlua::Result<mlua::Val
 
 #[cfg(test)]
 mod tests {
+    use super::ServerFront;
     use crate::snap_lua::FromLuaValue;
     use mlua::Value;
 
@@ -1971,5 +2135,89 @@ return {
             }"#,
         );
         assert!(result.is_ok(), "a well-formed lines table must validate");
+    }
+
+    // ── servers {} extraction (ADR-0052 Decision 6) ──
+
+    fn extract_servers(src: &str) -> miette::Result<Vec<ServerFront>> {
+        let lua = mlua::Lua::new();
+        lua.load(src).exec().map_err(|e| miette::miette!("{e}"))?;
+        super::extract_servers_from_lua(&lua)
+    }
+
+    #[test]
+    fn servers_absent_is_an_empty_list() {
+        let servers = extract_servers("return 1").expect("no servers global = empty");
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn servers_keep_declaration_order() {
+        let servers = extract_servers(
+            r#"servers = {
+                "https://primary.example/nau",
+                "http://backup.example:7780",
+            }
+            return 1"#,
+        )
+        .expect("string entries parse");
+        assert_eq!(
+            servers,
+            vec![
+                ServerFront {
+                    url: "https://primary.example/nau".into()
+                },
+                ServerFront {
+                    url: "http://backup.example:7780".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn servers_accept_table_entries_and_refuse_unknown_fields() {
+        let servers = extract_servers(
+            r#"servers = { { url = "https://a.example" } }
+            return 1"#,
+        )
+        .expect("table entries parse");
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].url, "https://a.example");
+
+        let err = extract_servers(
+            r#"servers = { { url = "https://a.example", token = "x" } }
+            return 1"#,
+        )
+        .expect_err("unknown fields are fail-closed");
+        assert!(err.to_string().contains("unknown field 'token'"), "{err}");
+    }
+
+    #[test]
+    fn servers_refuse_bad_urls_sparse_and_non_table() {
+        for (src, needle) in [
+            (
+                r#"servers = { "not-a-url" } return 1"#,
+                "must start with http",
+            ),
+            (r#"servers = { "" } return 1"#, "must not be empty"),
+            (
+                r#"servers = { [1] = "https://a.example", [3] = "https://b.example" } return 1"#,
+                "dense 1..n",
+            ),
+            (
+                r#"servers = "https://a.example" return 1"#,
+                "must be a table",
+            ),
+            (
+                r#"servers = { { } } return 1"#,
+                "missing required field 'url'",
+            ),
+        ] {
+            let err = extract_servers(src).expect_err(src);
+            assert!(
+                err.to_string().contains(needle),
+                "'{src}' must refuse naming {needle}: {err}"
+            );
+        }
     }
 }

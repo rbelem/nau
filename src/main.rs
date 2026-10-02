@@ -267,7 +267,23 @@ fn main() -> miette::Result<()> {
             port,
             announce,
             pod,
-        }) => nau::commands::cmd_serve(address.as_deref(), port, announce, pod.as_deref()),
+            token_file,
+            queue_dir,
+        }) => nau::commands::cmd_serve(
+            address.as_deref(),
+            port,
+            announce,
+            pod.as_deref(),
+            token_file.as_deref(),
+            queue_dir.as_deref(),
+        ),
+
+        Command::BuildRequest { command } => match command {
+            nau::cli::BuildRequestCommand::Submit(args) => {
+                nau::commands::cmd_build_request_submit(&args)
+            }
+            nau::cli::BuildRequestCommand::Run(args) => nau::commands::cmd_build_request_run(&args),
+        },
 
         Command::Peers(PeersArgs { secs, json }) => {
             nau::output::set_mode(json);

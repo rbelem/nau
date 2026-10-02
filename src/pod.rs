@@ -289,7 +289,7 @@ fn validate_pod_table(table: &mlua::Table) -> miette::Result<PodDeclaration> {
             other => miette::bail!("pod(): keys must be strings, got {}", lua_type_name(other)),
         };
         match key.as_str() {
-            "loads" | "packages" | "overlay" | "env" | "secrets" | "services" => {
+            "loads" | "packages" | "servers" | "overlay" | "env" | "secrets" | "services" => {
                 if !seen.insert(key.clone()) {
                     miette::bail!("duplicate field '{key}' in pod() declaration");
                 }
@@ -297,7 +297,7 @@ fn validate_pod_table(table: &mlua::Table) -> miette::Result<PodDeclaration> {
             }
             other => miette::bail!(
                 "unknown field '{other}' in pod() declaration \
-                 (allowed: loads, packages, overlay, env, secrets, services)"
+                 (allowed: loads, packages, servers, overlay, env, secrets, services)"
             ),
         }
     }
@@ -326,6 +326,16 @@ fn assign_pod_field(
     match key {
         "loads" => decl.loads = expect_string_list(value, "loads")?,
         "packages" => decl.packages = expect_package_list(value)?,
+        "servers" => {
+            // ADR-0052 Decision 6: the pod's server-front override. Same
+            // string-array grammar as `loads`, each entry additionally a
+            // validated server URL — the order IS the resolution order.
+            decl.servers = expect_string_list(value, "servers")?;
+            for (idx, url) in decl.servers.iter().enumerate() {
+                nau_core::servers::validate_server_url(url)
+                    .map_err(|e| miette::miette!("'servers'[{}]: {e}", idx + 1))?;
+            }
+        }
         "overlay" => decl.overlay = expect_overlay(value)?,
         "env" => decl.env = expect_env(value)?,
         "secrets" => decl.secrets = expect_secrets(value)?,
@@ -6269,9 +6279,46 @@ pod {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("allowed: loads, packages, overlay, env, secrets, services"),
+            err.contains("allowed: loads, packages, servers, overlay, env, secrets, services"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn servers_override_parses_in_order_and_refuses_bad_urls() {
+        // ADR-0052 Decision 6: the pod's `servers` override — same
+        // string-array grammar as `loads`, each entry a validated URL.
+        let decl = evaluate_pod_source(
+            "test",
+            r#"pod {
+                packages = { "jq" },
+                servers = {
+                    "https://primary.example/nau",
+                    "http://backup.example:7780",
+                },
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decl.servers,
+            vec![
+                "https://primary.example/nau".to_string(),
+                "http://backup.example:7780".to_string()
+            ],
+            "declaration order IS the resolution order"
+        );
+
+        for bad in [
+            r#"pod { servers = { "ftp://nope.example" } }"#,
+            r#"pod { servers = { "" } }"#,
+            r#"pod { servers = { "https://has space.example" } }"#,
+        ] {
+            let err = evaluate_pod_source("test", bad).unwrap_err();
+            assert!(
+                err.to_string().contains("'servers'"),
+                "'{bad}' must refuse naming the field: {err}"
+            );
+        }
     }
 
     #[test]

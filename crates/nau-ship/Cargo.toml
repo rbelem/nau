@@ -18,3 +18,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Client scratch space (the packed-bundle staging dir).
 tempfile = "3"
+# release.rs: the payload's meta/snap.yaml (the runtime unpack precedent
+# reads it with the same serde shape — the root pins 0.9).
+serde_yaml = "0.9"
+# release.rs (ADR-0052 Decision 5): SigV4 request signing for the rustfs
+# upload lane — hmac 0.12.1 is already in the lock (transitive via pgp),
+# sha2/sha3 already pinned workspace-wide; hex encoding rides
+# nau_core::sign::to_hex (no hex crate).
+hmac = "0.12"
+sha2 = "0.10"
+sha3 = "0.10"

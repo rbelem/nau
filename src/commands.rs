@@ -2324,12 +2324,17 @@ fn cmd_pull(
 /// overrides to the serve lane. `--announce` forces announcing over the
 /// declaration; the declaration is the source of truth — absent both,
 /// serve does not announce. Absent `--address`, the declared
-/// `serve.address` (or the loopback default) binds.
+/// `serve.address` (or the loopback default) binds. `--token-file`
+/// opens the token-gated `POST /build-requests` route (ADR-0052
+/// Decision 4) over `--queue-dir` (or the XDG default); absent the
+/// token file, the write route is off.
 pub fn cmd_serve(
     address: Option<&str>,
     port: Option<u16>,
     announce_flag: bool,
     pod: Option<&str>,
+    token_file: Option<&str>,
+    queue_dir: Option<&str>,
 ) -> miette::Result<()> {
     let node = load_node_decl()?;
     let announce = announce_flag || node.as_ref().is_some_and(|n| n.serve.announce);
@@ -2346,7 +2351,125 @@ pub fn cmd_serve(
         announce,
         node_name,
         pod,
+        crate::serve::BuildRequestsOptions {
+            token_file: token_file.map(Path::new),
+            queue_dir: queue_dir.map(Path::new),
+        },
     )
+}
+
+// ── Build requests (ADR-0052 Decisions 4+6) ──
+
+/// `nau build-request submit`: resolve the server fronts (`--server`,
+/// else the `servers` config: pod override → system list, in order),
+/// read the bearer token (file or stdin), POST the identity, print the
+/// server's request id.
+pub fn cmd_build_request_submit(args: &crate::cli::BuildRequestSubmitArgs) -> miette::Result<()> {
+    let crate::cli::BuildRequestSubmitArgs {
+        server,
+        package,
+        version,
+        token_file,
+        request_by,
+        file,
+    } = args;
+    let token = match token_file {
+        Some(path) => std::fs::read_to_string(path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("reading the token file {path}"))?,
+        None => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .into_diagnostic()
+                .wrap_err("reading the token from stdin")?;
+            buf
+        }
+    };
+    let fronts: Vec<String> = match server {
+        Some(base) => vec![base.clone()],
+        None => {
+            let pod_list =
+                crate::build_request::load_pod_servers(&crate::pod::pod_root(None), None)?;
+            let system =
+                crate::build_request::load_system_servers(file.as_deref().unwrap_or("nau.lua"))?;
+            crate::build_request::resolve_server_fronts(pod_list.as_deref(), &system, package)?
+                .into_owned()
+        }
+    };
+    let requested_by = request_by
+        .clone()
+        .unwrap_or_else(nau_core::pkg_manifest::hostname);
+    let submitted = crate::build_request::submit(&fronts, package, version, &requested_by, &token)?;
+    crate::output::ok(format!(
+        "build request accepted by {}: id {}",
+        submitted.server, submitted.id
+    ));
+    print_report(&serde_json::json!({
+        "command": "build-request-submit",
+        "id": submitted.id,
+        "server": submitted.server,
+        "package": package,
+        "version": version,
+    }));
+    Ok(())
+}
+
+/// `nau build-request run`: the farm-side drain — claim → evaluate
+/// farm-side → build → release → receipt, looping (or `--once`).
+pub fn cmd_build_request_run(args: &crate::cli::BuildRequestRunArgs) -> miette::Result<()> {
+    let crate::cli::BuildRequestRunArgs {
+        queue_dir,
+        recipes_root,
+        once,
+        signing_key,
+        tree_base,
+        s3_endpoint,
+        s3_bucket,
+        s3_region,
+        s3_access_key,
+        s3_secret_key,
+    } = args;
+    let queue = match queue_dir {
+        Some(dir) => nau_peer::queue::BuildQueue::new(PathBuf::from(dir)),
+        None => nau_peer::queue::BuildQueue::new(nau_peer::queue::BuildQueue::default_dir()),
+    };
+    let release_cfg = crate::build_request::ReleaseConfig {
+        signing_key: signing_key.as_ref().map(PathBuf::from),
+        s3_endpoint: s3_endpoint.clone(),
+        s3_bucket: s3_bucket.clone(),
+        s3_region: s3_region.clone(),
+        s3_access_key: s3_access_key.clone(),
+        s3_secret_key: s3_secret_key.clone(),
+        tree_base: tree_base.clone(),
+    };
+    let drain = crate::build_request::Drain::production(
+        queue,
+        PathBuf::from(recipes_root),
+        release_cfg,
+        *once,
+    );
+    let settled = crate::build_request::run_drain(&drain)?;
+    let rows: Vec<serde_json::Value> = settled
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "package": s.package,
+                "version": s.version,
+                "released": s.released,
+                "manifest_url": s.manifest_url,
+                "blob_urls": s.blob_urls,
+                "error": s.error,
+            })
+        })
+        .collect();
+    print_report(&serde_json::json!({
+        "command": "build-request-run",
+        "settled": rows,
+    }));
+    Ok(())
 }
 
 /// The `node {}` declaration from `./nau.lua`, if the file exists
