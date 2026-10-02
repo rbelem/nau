@@ -1327,11 +1327,12 @@ pub fn cmd_runtime(sub: RuntimeCommand) -> miette::Result<()> {
         }
         RuntimeCommand::Gc {
             prune,
+            downloads,
             state_dir,
             json,
         } => {
             crate::output::set_mode(json);
-            runtime_gc(prune, state_dir)
+            runtime_gc(crate::runtime::GcOpts { prune, downloads }, state_dir)
         }
         RuntimeCommand::Activate { state_dir, json } => {
             crate::output::set_mode(json);
@@ -1686,7 +1687,12 @@ pub fn cmd_pod(name: Option<&str>, sub: PodCommand) -> miette::Result<()> {
         PodCommand::Rollback {
             generation, root, ..
         } => cmd_pod_rollback(pod_name, generation, root),
-        PodCommand::Gc { prune, root, .. } => cmd_pod_gc(pod_name, prune, root),
+        PodCommand::Gc {
+            prune,
+            downloads,
+            root,
+            ..
+        } => cmd_pod_gc(pod_name, crate::runtime::GcOpts { prune, downloads }, root),
         PodCommand::Secrets { command, root, .. } => cmd_pod_secrets(pod_name, command, root),
         // Unreachable: the `pod run` arm returned above (it carries the
         // legacy `nau run` flag surface, not the common `--name` merge).
@@ -2074,9 +2080,13 @@ fn cmd_pod_rollback(
 }
 
 /// `nau pod gc`: report pruned generations and swept blobs.
-fn cmd_pod_gc(pod_name: &str, prune: bool, root: Option<String>) -> miette::Result<()> {
+fn cmd_pod_gc(
+    pod_name: &str,
+    opts: crate::runtime::GcOpts,
+    root: Option<String>,
+) -> miette::Result<()> {
     let root = crate::pod::pod_root(root.as_deref());
-    let report = crate::pod::gc_pod(&root, pod_name, prune)?;
+    let report = crate::pod::gc_pod(&root, pod_name, opts)?;
     if !report.generations_removed.is_empty() {
         crate::output::ok(format!(
             "pruned generation(s): {}",
@@ -2095,6 +2105,16 @@ fn cmd_pod_gc(pod_name: &str, prune: bool, root: Option<String>) -> miette::Resu
             "swept {} blob(s), {} bytes reclaimed",
             report.blobs_removed, report.bytes_reclaimed
         ));
+    }
+    if opts.downloads {
+        if report.downloads_removed == 0 {
+            crate::output::ok("downloads clean — nothing to sweep");
+        } else {
+            crate::output::ok(format!(
+                "swept {} download(s), {} bytes reclaimed",
+                report.downloads_removed, report.downloads_bytes_reclaimed
+            ));
+        }
     }
     print_report(&report);
     Ok(())
@@ -2642,9 +2662,9 @@ fn runtime_rollback(generation: Option<u64>, state_dir: Option<String>) -> miett
     Ok(())
 }
 
-fn runtime_gc(prune: bool, state_dir: Option<String>) -> miette::Result<()> {
+fn runtime_gc(opts: crate::runtime::GcOpts, state_dir: Option<String>) -> miette::Result<()> {
     let store = RuntimeStore::from_state_dir(state_dir.as_deref());
-    let report = store.gc(prune)?;
+    let report = store.gc(opts)?;
     if !report.generations_removed.is_empty() {
         crate::output::ok(format!(
             "pruned generation(s): {}",
@@ -2663,6 +2683,16 @@ fn runtime_gc(prune: bool, state_dir: Option<String>) -> miette::Result<()> {
             "swept {} blob(s), {} bytes reclaimed",
             report.blobs_removed, report.bytes_reclaimed
         ));
+    }
+    if opts.downloads {
+        if report.downloads_removed == 0 {
+            crate::output::ok("downloads clean — nothing to sweep");
+        } else {
+            crate::output::ok(format!(
+                "swept {} download(s), {} bytes reclaimed",
+                report.downloads_removed, report.downloads_bytes_reclaimed
+            ));
+        }
     }
     print_report(&report);
     Ok(())

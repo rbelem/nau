@@ -2051,6 +2051,12 @@ pub enum RuntimeCommand {
         #[arg(long)]
         prune: bool,
 
+        /// Also sweep the downloads staging directory (re-fetchable
+        /// .snap payload cache). Payloads written within the last hour
+        /// are kept — a concurrent install may still need them.
+        #[arg(long)]
+        downloads: bool,
+
         /// State root for generations + content store
         /// (default: /var/lib/nau)
         #[arg(long)]
@@ -2493,6 +2499,12 @@ pub enum PodCommand {
         /// before sweeping unreferenced blobs.
         #[arg(long)]
         prune: bool,
+
+        /// Also sweep the downloads staging directory (re-fetchable
+        /// .snap payload cache). Payloads written within the last hour
+        /// are kept — a concurrent install may still need them.
+        #[arg(long)]
+        downloads: bool,
 
         /// Pod state root (see `pod add --root`).
         #[arg(long)]
@@ -3286,12 +3298,30 @@ mod tests {
             }
             _ => panic!("expected Runtime Rollback default"),
         }
-        match Cli::try_parse_from(["nau", "runtime", "gc", "--prune"])
+        match Cli::try_parse_from(["nau", "runtime", "gc", "--prune", "--downloads"])
             .unwrap()
             .command
         {
-            Command::Runtime(RuntimeCommand::Gc { prune, .. }) => assert!(prune),
+            Command::Runtime(RuntimeCommand::Gc {
+                prune, downloads, ..
+            }) => {
+                assert!(prune);
+                assert!(downloads);
+            }
             _ => panic!("expected Runtime Gc"),
+        }
+        // Defaults: no prune, no downloads sweep.
+        match Cli::try_parse_from(["nau", "runtime", "gc"])
+            .unwrap()
+            .command
+        {
+            Command::Runtime(RuntimeCommand::Gc {
+                prune, downloads, ..
+            }) => {
+                assert!(!prune);
+                assert!(!downloads);
+            }
+            _ => panic!("expected Runtime Gc defaults"),
         }
     }
 

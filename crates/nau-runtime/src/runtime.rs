@@ -214,6 +214,22 @@ pub struct GcReport {
     pub bytes_reclaimed: u64,
     /// Generations dropped by --prune before the sweep.
     pub generations_removed: Vec<u64>,
+    /// Downloads staging payloads swept by --downloads.
+    pub downloads_removed: usize,
+    pub downloads_bytes_reclaimed: u64,
+}
+
+/// Knobs for [`RuntimeStore::gc`] — the pod GC's retention axes.
+/// Default: plain mark-sweep (keep every generation, sweep only
+/// unreferenced blobs).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GcOpts {
+    /// Drop every generation except active + previous before the
+    /// sweep (the `--prune` flag) so their exclusive blobs free.
+    pub prune: bool,
+    /// Also sweep the downloads staging directory (the `--downloads`
+    /// flag): fetched .snap payloads are a re-fetchable cache.
+    pub downloads: bool,
 }
 
 // ── Shell-out seam ──
@@ -878,13 +894,14 @@ impl RuntimeStore {
 
     /// Mark-sweep the content store. Mark = union of per-file hashes
     /// across ALL generation manifests; sweep = delete unreferenced
-    /// blobs. `prune` first drops every generation except active +
-    /// previous (manifests + trees) so their exclusive blobs free.
-    pub fn gc(&self, prune: bool) -> miette::Result<GcReport> {
+    /// blobs. `opts.prune` first drops every generation except active +
+    /// previous (manifests + trees) so their exclusive blobs free;
+    /// `opts.downloads` also sweeps the re-fetchable downloads cache.
+    pub fn gc(&self, opts: GcOpts) -> miette::Result<GcReport> {
         self.recover()?;
         let mut generations_removed = Vec::new();
 
-        if prune {
+        if opts.prune {
             let active = self.active_generation()?.ok_or_else(|| {
                 miette::miette!(
                     "no active generation — nothing anchors retention; \
@@ -924,6 +941,8 @@ impl RuntimeStore {
                 blobs_removed,
                 bytes_reclaimed,
                 generations_removed,
+                downloads_removed: 0,
+                downloads_bytes_reclaimed: 0,
             });
         };
         for shard in shards {
@@ -951,11 +970,61 @@ impl RuntimeStore {
             }
         }
 
+        let (downloads_removed, downloads_bytes_reclaimed) = if opts.downloads {
+            self.sweep_downloads(Self::DOWNLOADS_MIN_AGE)?
+        } else {
+            (0, 0)
+        };
+
         Ok(GcReport {
             blobs_removed,
             bytes_reclaimed,
             generations_removed,
+            downloads_removed,
+            downloads_bytes_reclaimed,
         })
+    }
+
+    /// Files in the downloads staging dir newer than this are presumed
+    /// in-flight — a concurrent install just staged them and is about
+    /// to ingest — not garbage.
+    const DOWNLOADS_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+    /// Sweep the downloads staging directory (top-level files only):
+    /// fetched .snap payloads are a re-fetchable cache, so dropping
+    /// them is always safe — re-download on miss. Entries whose mtime
+    /// is younger than `min_age` (or unreadable) are kept.
+    fn sweep_downloads(&self, min_age: std::time::Duration) -> miette::Result<(usize, u64)> {
+        let mut removed = 0usize;
+        let mut bytes = 0u64;
+        let dir = self.downloads_dir();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Ok((removed, bytes));
+        };
+        let now = std::time::SystemTime::now();
+        for entry in entries {
+            let entry = entry
+                .into_diagnostic()
+                .wrap_err_with(|| format!("reading {}", dir.display()))?;
+            if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                continue;
+            }
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|mtime| now.duration_since(mtime).unwrap_or_default() >= min_age)
+                .unwrap_or(false);
+            if !stale {
+                continue;
+            }
+            let path = entry.path();
+            bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            std::fs::remove_file(&path)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("sweeping {}", path.display()))?;
+            removed += 1;
+        }
+        Ok((removed, bytes))
     }
 
     // ── Pipeline internals ──
@@ -3504,7 +3573,7 @@ plugs:
             seed_blob(&f.store, h, 10);
         }
 
-        let report = f.store.gc(false).unwrap();
+        let report = f.store.gc(GcOpts::default()).unwrap();
         assert_eq!(report.blobs_removed, 1, "only the orphan swept");
         assert_eq!(report.bytes_reclaimed, 10);
         assert!(report.generations_removed.is_empty());
@@ -3532,7 +3601,13 @@ plugs:
             seed_blob(&f.store, h, 10);
         }
 
-        let report = f.store.gc(true).unwrap();
+        let report = f
+            .store
+            .gc(GcOpts {
+                prune: true,
+                ..Default::default()
+            })
+            .unwrap();
         // Keep = active (3) + previous (2); generation 1 dropped first so
         // its exclusive blob frees.
         assert_eq!(report.generations_removed, vec![1]);
@@ -3547,11 +3622,123 @@ plugs:
     #[test]
     fn gc_prune_without_active_generation_is_refused() {
         let f = fixture();
-        let err = f.store.gc(true).unwrap_err();
+        let err = f
+            .store
+            .gc(GcOpts {
+                prune: true,
+                ..Default::default()
+            })
+            .unwrap_err();
         assert!(
             format!("{err:#}").contains("no active generation"),
             "refusal must be named: {err:#}"
         );
+    }
+
+    #[test]
+    fn gc_downloads_sweeps_stale_keeps_fresh() {
+        let f = fixture();
+        let dir = f.store.downloads_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join("stale.snap");
+        let fresh = dir.join("fresh.snap");
+        std::fs::write(&stale, vec![0u8; 40]).unwrap();
+        std::fs::write(&fresh, vec![0u8; 7]).unwrap();
+        backdate(&stale, std::time::Duration::from_secs(2 * 60 * 60));
+
+        let (removed, bytes) = f
+            .store
+            .sweep_downloads(RuntimeStore::DOWNLOADS_MIN_AGE)
+            .unwrap();
+        assert_eq!(removed, 1, "only the stale payload swept");
+        assert_eq!(bytes, 40);
+        assert!(!stale.exists());
+        assert!(fresh.exists(), "fresh payload kept (in-flight guard)");
+
+        // Zero min-age treats everything as sweepable (test seam).
+        let (removed, bytes) = f.store.sweep_downloads(std::time::Duration::ZERO).unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(bytes, 7);
+        assert!(!fresh.exists());
+    }
+
+    #[test]
+    fn gc_downloads_keeps_fresh_payloads() {
+        let f = fixture();
+        let dir = f.store.downloads_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = dir.join("just-written.snap");
+        std::fs::write(&payload, vec![0u8; 12]).unwrap();
+
+        let report = f
+            .store
+            .gc(GcOpts {
+                downloads: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(report.downloads_removed, 0);
+        assert_eq!(report.downloads_bytes_reclaimed, 0);
+        assert!(payload.exists(), "just-written payload kept");
+    }
+
+    #[test]
+    fn gc_downloads_missing_dir_is_clean_noop() {
+        let f = fixture();
+        let report = f
+            .store
+            .gc(GcOpts {
+                downloads: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(report.downloads_removed, 0);
+        assert_eq!(report.downloads_bytes_reclaimed, 0);
+        assert_eq!(report.blobs_removed, 0);
+    }
+
+    #[test]
+    fn gc_downloads_combines_with_prune() {
+        let f = fixture();
+        let mut g1 = BTreeMap::new();
+        g1.insert("a".into(), pkg("a", &[], vec![H1.into()]));
+        let mut g2 = BTreeMap::new();
+        g2.insert("b".into(), pkg("b", &[], vec![H2.into()]));
+        let mut g3 = BTreeMap::new();
+        g3.insert("c".into(), pkg("c", &[], vec![H3.into()]));
+        seed_generation(&f.store, 1, g1);
+        seed_generation(&f.store, 2, g2);
+        seed_generation(&f.store, 3, g3);
+        f.store.flip_active(3).unwrap();
+        for h in [H1, H2, H3] {
+            seed_blob(&f.store, h, 10);
+        }
+        let dir = f.store.downloads_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = dir.join("stale.snap");
+        std::fs::write(&payload, vec![0u8; 25]).unwrap();
+        backdate(&payload, std::time::Duration::from_secs(2 * 60 * 60));
+
+        let report = f
+            .store
+            .gc(GcOpts {
+                prune: true,
+                downloads: true,
+            })
+            .unwrap();
+        assert_eq!(report.generations_removed, vec![1]);
+        assert_eq!(report.blobs_removed, 1);
+        assert_eq!(report.downloads_removed, 1);
+        assert_eq!(report.downloads_bytes_reclaimed, 25);
+        assert!(!payload.exists());
+    }
+
+    /// Age a file's mtime back by `age` (std's set_times, write-opened)
+    /// so download-sweep staleness is deterministic in tests.
+    fn backdate(path: &std::path::Path, age: std::time::Duration) {
+        let f = std::fs::File::options().append(true).open(path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now() - age))
+            .unwrap();
     }
 
     // ── Pure helpers ──
