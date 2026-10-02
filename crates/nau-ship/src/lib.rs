@@ -18,3 +18,4 @@
 pub mod oci;
 pub mod pull_peer;
 pub mod pull_ref;
+pub mod release;
