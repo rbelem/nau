@@ -7,7 +7,7 @@
 //! sign, `cmd_index` -> store resolution) stay root-side, where those
 //! domains live (ADR-0051 dependency direction).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use nau_core::snap_types::PackageInput;
@@ -685,6 +685,177 @@ pub fn cmd_search(query: &str, json: bool) {
             eprintln!("  {} package(s) found", scored.len());
         }
     }
+}
+
+// ── Versions command (ADR-0052 Decision 2) ──
+
+/// One JSON entry for `nau chart versions --json`:
+/// `{"resolved": "...", "versions": [...] | null}` — plus `"error"` when
+/// the listing itself failed (raise / wrong shape / cap breach).
+fn listing_to_json(l: &crate::isolate::VersionListing) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "resolved".into(),
+        serde_json::Value::String(l.resolved.clone()),
+    );
+    obj.insert(
+        "versions".into(),
+        match &l.versions {
+            Some(v) => serde_json::to_value(v).unwrap_or(serde_json::Value::Null),
+            None => serde_json::Value::Null,
+        },
+    );
+    if let Some(e) = &l.error {
+        obj.insert("error".into(), serde_json::Value::String(e.clone()));
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Aligned table for one output's listing: output / version / available
+/// columns; the recipe-resolved version carries the `latest` marker in
+/// the available column. An empty listing is a valid answer (ADR-0052)
+/// and renders as its own row.
+fn print_versions_table(key: &str, resolved: &str, versions: &[String]) {
+    let marked = |v: &str| {
+        if v == resolved {
+            format!("{v} (latest)")
+        } else {
+            v.to_string()
+        }
+    };
+    let name_w = key.len().max("output".len());
+    let ver_w = versions
+        .iter()
+        .map(|v| v.len())
+        .max()
+        .unwrap_or(0)
+        .max("version".len());
+    let avail_w = versions
+        .iter()
+        .map(|v| marked(v).len())
+        .max()
+        .unwrap_or(0)
+        .max("available".len())
+        .max("(empty listing)".len());
+    let header = format!(
+        "{:<name_w$}  {:<ver_w$}  {:<avail_w$}",
+        "output", "version", "available"
+    );
+    println!("{}", header.trim_end());
+    for (i, v) in versions.iter().enumerate() {
+        let name_cell = if i == 0 { key } else { "" };
+        let row = format!(
+            "{:<name_w$}  {:<ver_w$}  {:<avail_w$}",
+            name_cell,
+            v,
+            marked(v)
+        );
+        println!("{}", row.trim_end());
+    }
+    if versions.is_empty() {
+        let row = format!(
+            "{:<name_w$}  {:<ver_w$}  {:<avail_w$}",
+            key, "", "(empty listing)"
+        );
+        println!("{}", row.trim_end());
+    }
+}
+
+/// The clean error for `--output NAME` naming no declared output.
+fn unknown_output_err(
+    file: &str,
+    name: &str,
+    listings: &BTreeMap<String, crate::isolate::VersionListing>,
+) -> miette::Error {
+    let declared: Vec<&str> = listings.keys().map(String::as_str).collect();
+    let list = if declared.is_empty() {
+        "(none)".to_string()
+    } else {
+        declared.join(", ")
+    };
+    miette::miette!("no output '{name}' in {file} (declared: {list})")
+}
+
+/// `--json` report for the selected outputs.
+fn report_versions_json(
+    listings: &BTreeMap<String, crate::isolate::VersionListing>,
+    selected: &impl Fn(&str) -> bool,
+) {
+    let mut map = serde_json::Map::new();
+    for (key, listing) in listings {
+        if !selected(key) {
+            continue;
+        }
+        map.insert(key.clone(), listing_to_json(listing));
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::Value::Object(map))
+            .unwrap_or_else(|_| "{}".to_string())
+    );
+}
+
+/// Human report for the selected outputs: aligned tables per listed
+/// output, a named skip per output without a versions method, and a
+/// named error per failed listing. Returns whether any listing FAILED
+/// (the verb exits 1 in that case — a skip is not a failure).
+fn report_versions_human(
+    listings: &BTreeMap<String, crate::isolate::VersionListing>,
+    selected: &impl Fn(&str) -> bool,
+) -> bool {
+    let mut any_error = false;
+    for (key, listing) in listings {
+        if !selected(key) {
+            continue;
+        }
+        match (&listing.versions, &listing.error) {
+            (None, None) => nau_infra::output::warn(format!("{key}: no versions method")),
+            (None, Some(e)) => {
+                any_error = true;
+                nau_infra::output::err(format!("{key}: versions() failed: {e}"));
+            }
+            (Some(list), error) => {
+                if error.is_some() {
+                    any_error = true;
+                }
+                print_versions_table(key, &listing.resolved, list);
+            }
+        }
+    }
+    any_error
+}
+
+/// `nau chart versions`: list upstream versions for a definition's snap
+/// outputs (ADR-0052 Decision 2). ONE bounded eval in versions-mode;
+/// fetch is allowed as usual (the --offline env gate applies). A snap
+/// without a versions method is a named skip, not an error; a listing
+/// that fails to produce a valid answer is an error (exit 1). Unknown
+/// `--output` names are clean errors.
+pub fn cmd_versions(file: &str, output: Option<&str>, json: bool) -> miette::Result<()> {
+    nau_infra::output::set_mode(json);
+    let listings = crate::lua::versions_eval_file(file)?;
+
+    if let Some(name) = output {
+        if !listings.contains_key(name) {
+            return Err(unknown_output_err(file, name, &listings));
+        }
+    }
+    let selected = |key: &str| output.is_none_or(|n| n == key);
+
+    let any_error = listings
+        .iter()
+        .filter(|(key, _)| selected(key))
+        .any(|(_, l)| l.error.is_some());
+    if json {
+        report_versions_json(&listings, &selected);
+    } else {
+        report_versions_human(&listings, &selected);
+    }
+
+    if any_error {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 // ── Completion command ──

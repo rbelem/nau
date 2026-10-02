@@ -7,7 +7,7 @@ use clap::Parser;
 use nau::cli::{
     normalize_domain, AuditArgs, CheckArgs, Cli, Command, DepsCommand, EvalArgs, ExportArgs,
     ImageArgs, LintArgs, LockArgs, PeersArgs, PullArgs, PushArgs, RunArgs, SearchArgs, ServeArgs,
-    TestArgs, VerifyImageArgs,
+    TestArgs, VerifyImageArgs, VersionsArgs,
 };
 
 fn main() -> miette::Result<()> {
@@ -149,6 +149,10 @@ fn main() -> miette::Result<()> {
                 lockfile_path,
                 offline,
             )
+        }
+
+        Command::Versions(VersionsArgs { file, output, json }) => {
+            nau::commands::cmd_versions(&file, output.as_deref(), json)
         }
 
         Command::Completion { shell } => nau::commands::cmd_completion(shell),

@@ -141,6 +141,13 @@ pub enum Command {
     #[command(hide = true)]
     Eval(EvalArgs),
 
+    /// List upstream versions for a definition's snap outputs via the
+    /// eval worker's versions-mode (ADR-0052 Decisions 1-2). A snap
+    /// without a versions method is a named skip, not an error.
+    /// Legacy hidden alias of `chart versions` (ADR-0049).
+    #[command(hide = true)]
+    Versions(VersionsArgs),
+
     /// Generate shell completion scripts
     Completion {
         /// Shell to generate completions for (bash, zsh, fish, powershell, elvish)
@@ -587,6 +594,13 @@ pub enum ChartCommand {
     /// byte-identical JSON.
     Eval(EvalArgs),
 
+    /// List upstream versions for a definition's snap outputs (ADR-0052
+    /// Decisions 1-2): one bounded eval in versions-mode calls each snap
+    /// output's `versions()` in-process and prints output / version /
+    /// available with the recipe-resolved version marked `latest`. A snap
+    /// without a versions method is a named skip, not an error.
+    Versions(VersionsArgs),
+
     /// Advanced: invoked by nau itself. The bounded evaluation worker the
     /// parent re-executes via `current_exe()` to evaluate untrusted
     /// definitions (ADR-0010 Decisions 4+5) — the revealed form of the
@@ -631,6 +645,7 @@ impl From<ChartCommand> for Command {
         match sub {
             ChartCommand::Check(args) => Command::Check(args),
             ChartCommand::Eval(args) => Command::Eval(args),
+            ChartCommand::Versions(args) => Command::Versions(args),
             ChartCommand::EvalWorker => Command::EvalWorker,
             ChartCommand::CheckWorker => Command::CheckWorker,
             ChartCommand::Lock(args) => Command::Lock(args),
@@ -1096,6 +1111,23 @@ pub struct EvalArgs {
 
     /// Suppress human-readable status output (the manifest is JSON
     /// either way).
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The `nau chart versions` arguments (ADR-0052 Decision 2).
+#[derive(clap::Args)]
+pub struct VersionsArgs {
+    /// Path to the Lua definition file.
+    pub file: String,
+
+    /// Only list versions for this output. An unknown name is a clean
+    /// error naming what the definition does declare.
+    #[arg(long)]
+    pub output: Option<String>,
+
+    /// Emit `{"<output>": {"resolved": "...", "versions": [...] | null}}`
+    /// instead of the aligned table.
     #[arg(long)]
     pub json: bool,
 }

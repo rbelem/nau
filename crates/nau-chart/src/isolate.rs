@@ -60,6 +60,12 @@ const MAX_MODULE_NAME_LEN: usize = 4096;
 /// pipe would stall the child mid-record, which is exactly what piping
 /// stderr exists to prevent (see [`forward_worker_stderr`]).
 const MAX_FORWARDED_STDERR_BYTES: u64 = 1024 * 1024;
+/// Versions-mode cap (ADR-0052 Decision 1): a listing longer than this is
+/// an error, never a truncation — a silently-clipped listing is worse than
+/// a named refusal.
+const MAX_VERSIONS_ENTRIES: usize = 1000;
+/// Versions-mode cap on one version string, in bytes.
+const MAX_VERSIONS_LEN: usize = 128;
 
 // ── Protocol types (newline-delimited JSON on the child's stdio) ──
 
@@ -95,6 +101,14 @@ pub struct EvalRequest {
     /// read (`fetch()` at selection is banned by the ADR).
     #[serde(default)]
     pub constraint: Option<String>,
+    /// Versions-mode (ADR-0052 Decision 1): after the chunk evaluates,
+    /// each snap output's `versions()` function is called IN-PROCESS and
+    /// the listings come back alongside the resolved versions. Functions
+    /// cannot cross the worker's JSON output boundary — that is the whole
+    /// reason this mode exists. Normal eval leaves it false and never
+    /// calls the listing (listing-only: it never feeds build resolution).
+    #[serde(default)]
+    pub versions_mode: bool,
 }
 
 /// Child → parent: request for one require-able source.
@@ -151,6 +165,31 @@ pub struct WorkerOk {
     pub workers: Value,
     /// Warn-and-continue diagnostics (per-output extraction skips).
     pub diagnostics: Vec<String>,
+    /// Per-output upstream version listings (ADR-0052 Decision 1),
+    /// populated only in versions-mode. Skipped from serialization when
+    /// empty so a normal eval's outcome line stays byte-identical.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub versions: BTreeMap<String, VersionListing>,
+    /// Output keys whose snap table declared a `versions` function,
+    /// recorded in EVERY mode (the listing itself is versions-mode-only;
+    /// `nau lint`'s missing-versions check needs the declaration fact).
+    /// Skipped from serialization when empty for the same byte-identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub versions_declared: Vec<String>,
+}
+
+/// One output's upstream version listing (ADR-0052 Decision 1):
+/// `resolved` is the snap's own `version`, `versions` the listing its
+/// `versions()` returned — `None` when the output has no such method.
+/// A listing that failed to produce a valid answer (raise, wrong shape,
+/// cap breach) carries `error` and `versions: None`; extraction never
+/// aborts the eval for it.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VersionListing {
+    pub resolved: String,
+    pub versions: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Child → parent: failed eval with diagnostics.
@@ -1157,6 +1196,21 @@ fn run_worker(req: &EvalRequest) -> WorkerOutcome {
         )]);
     };
 
+    // Versions-mode (ADR-0052 Decision 1): call each snap output's
+    // versions() BEFORE output serialization — functions cannot cross the
+    // JSON boundary, which is exactly why this mode runs in the child.
+    let versions = if req.versions_mode {
+        extract_versions(table)
+    } else {
+        BTreeMap::new()
+    };
+    // Which outputs declare a versions function, in every mode: the
+    // listing is versions-mode-only (listing-only, ADR-0052 — a plain
+    // build must never call it), but the missing-versions lint needs the
+    // declaration fact. Empty for every existing recipe, so the normal
+    // mode's outcome line stays byte-identical.
+    let versions_declared = versions_declared_keys(table);
+
     // Warn-and-continue: a broken output becomes a diagnostic, remaining
     // outputs keep flowing (ADR-0010 Decision 3, silent-drop fix).
     let mut outputs = BTreeMap::new();
@@ -1169,6 +1223,22 @@ fn run_worker(req: &EvalRequest) -> WorkerOutcome {
                 break;
             }
         };
+        // A listing-only `versions` function cannot cross the JSON
+        // boundary (lua_to_json rejects functions); strip it before
+        // serialization. In versions-mode the listing was already
+        // extracted above; in normal mode it is none of the build's
+        // business. Today no shipped recipe declares the field, so this
+        // strip changes no existing bytes — it only keeps a recipe that
+        // ADDS the field from losing its whole output to a skip
+        // diagnostic.
+        if let mlua::Value::Table(t) = &value {
+            if matches!(
+                t.get::<mlua::Value>("versions"),
+                Ok(mlua::Value::Function(_))
+            ) {
+                let _ = t.set("versions", mlua::Value::Nil);
+            }
+        }
         match lua_to_json(&value) {
             Ok(json) => {
                 outputs.insert(key, json);
@@ -1187,7 +1257,142 @@ fn run_worker(req: &EvalRequest) -> WorkerOutcome {
         global_inputs: inputs,
         workers,
         diagnostics,
+        versions,
+        versions_declared,
     })
+}
+
+/// Versions-mode extraction (ADR-0052 Decision 1): walk the outputs
+/// table and, for each snap output (`name` + `version` string fields)
+/// carrying a `versions` function, call it error-bounded and enforce the
+/// listing shape. The listing runs with fetch allowed as usual — a
+/// listing may resolve its own upstream data. Failures (raise, wrong
+/// shape, cap breach) land in `VersionListing.error`; extraction never
+/// aborts the eval and never truncates a listing.
+fn extract_versions(table: &mlua::Table) -> BTreeMap<String, VersionListing> {
+    let mut out = BTreeMap::new();
+    for pair in table.pairs::<String, mlua::Value>() {
+        let (key, value) = match pair {
+            Ok(p) => p,
+            Err(_) => break, // same walk-abort as the serialization loop
+        };
+        let mlua::Value::Table(t) = &value else {
+            continue; // not snap-shaped; the serialization loop handles it
+        };
+        let (Ok(name), Ok(version)) = (t.get::<String>("name"), t.get::<String>("version")) else {
+            continue; // node/image/other outputs carry no snap identity
+        };
+        let _ = name; // the snap's own name; the map is keyed by output key
+        let vf: mlua::Value = t.get("versions").unwrap_or(mlua::Value::Nil);
+        let listing = match &vf {
+            mlua::Value::Function(f) => {
+                // pcall-equivalent: the Rust-side call captures the Lua
+                // error as a value, so a raising listing cannot kill the
+                // worker mid-record.
+                let versions = f
+                    .call::<mlua::Value>(())
+                    .map_err(|e| e.to_string())
+                    .and_then(|v| listing_from_value(&v));
+                match versions {
+                    Ok(list) => VersionListing {
+                        resolved: version,
+                        versions: Some(list),
+                        error: None,
+                    },
+                    Err(e) => VersionListing {
+                        resolved: version,
+                        versions: None,
+                        error: Some(e),
+                    },
+                }
+            }
+            _ => VersionListing {
+                resolved: version,
+                versions: None,
+                error: None,
+            },
+        };
+        out.insert(key, listing);
+    }
+    out
+}
+
+/// Output keys whose table declares `versions` as a function (ADR-0052).
+fn versions_declared_keys(table: &mlua::Table) -> Vec<String> {
+    let mut keys = Vec::new();
+    for pair in table.pairs::<String, mlua::Value>() {
+        let (key, value) = match pair {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+        if let mlua::Value::Table(t) = &value {
+            if matches!(
+                t.get::<mlua::Value>("versions"),
+                Ok(mlua::Value::Function(_))
+            ) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+/// Enforce the versions() answer shape: a dense 1..n Lua array of
+/// strings, at most [`MAX_VERSIONS_ENTRIES`] entries of at most
+/// [`MAX_VERSIONS_LEN`] bytes each — an over-cap listing errors, it is
+/// never truncated. An empty array is a valid answer (ADR-0052).
+fn listing_from_value(v: &mlua::Value) -> Result<Vec<String>, String> {
+    let mlua::Value::Table(t) = v else {
+        return Err(format!(
+            "versions() must return an array of version strings, got {}",
+            v.type_name()
+        ));
+    };
+    let mut entries: Vec<(i64, String)> = Vec::new();
+    for pair in t.pairs::<mlua::Value, mlua::Value>() {
+        let (k, val) = pair.map_err(|e| format!("versions() result: {e}"))?;
+        let idx = match k {
+            mlua::Value::Integer(i) => i,
+            mlua::Value::Number(n) if n.fract() == 0.0 => n as i64,
+            other => {
+                return Err(format!(
+                    "versions() must return an array (key type {} is not an integer index)",
+                    other.type_name()
+                ));
+            }
+        };
+        let s = match &val {
+            mlua::Value::String(s) => s.to_string_lossy(),
+            other => {
+                return Err(format!(
+                    "versions() entries must be strings, got {}",
+                    other.type_name()
+                ));
+            }
+        };
+        entries.push((idx, s));
+    }
+    entries.sort_by_key(|a| a.0);
+    for (pos, (idx, _)) in entries.iter().enumerate() {
+        if *idx != pos as i64 + 1 {
+            return Err("versions() must return a dense 1..n array of version strings".into());
+        }
+    }
+    if entries.len() > MAX_VERSIONS_ENTRIES {
+        return Err(format!(
+            "versions() returned {} entries — over the {MAX_VERSIONS_ENTRIES}-entry cap",
+            entries.len()
+        ));
+    }
+    for (idx, s) in &entries {
+        if s.len() > MAX_VERSIONS_LEN {
+            return Err(format!(
+                "versions()[{idx}] is {} chars — over the {MAX_VERSIONS_LEN}-char cap",
+                s.len()
+            ));
+        }
+    }
+    Ok(entries.into_iter().map(|(_, s)| s).collect())
 }
 
 /// Entry point for `nau chart eval-worker` (the hidden `__eval-worker`
@@ -1638,6 +1843,261 @@ mod tests {
             .eval()
             .unwrap();
         assert!(lua_to_json(&v).is_err());
+    }
+
+    // ── Versions-mode extraction (ADR-0052 Decision 1) ──
+
+    /// Build a versions-mode request evaluating `entry` through the full
+    /// in-process worker VM (prelude, narrowed stdlib, IPC require).
+    fn versions_worker(entry: &str) -> WorkerOk {
+        let req = EvalRequest {
+            prelude: crate::dsl::prelude(),
+            index_data: serde_json::json!({ "version": 1, "snaps": [] }),
+            arch: "amd64".into(),
+            sources: Default::default(),
+            entry: entry.to_string(),
+            entry_label: "versions-test".into(),
+            allow_fetch: false,
+            constraint: None,
+            versions_mode: true,
+        };
+        match run_worker(&req) {
+            WorkerOutcome::Ok(ok) => ok,
+            WorkerOutcome::Err(e) => panic!("worker failed: {}", e.diagnostics.join("; ")),
+        }
+    }
+
+    #[test]
+    fn versions_mode_extracts_listing_and_resolved() {
+        let ok = versions_worker(
+            r#"
+            return {
+                default = snap {
+                    name = "probe",
+                    version = "2.0.21",
+                    versions = function() return { "2.0.21", "2.0.20", "2.0.19" } end,
+                },
+            }
+            "#,
+        );
+        let l = ok.versions.get("default").expect("listing recorded");
+        assert_eq!(l.resolved, "2.0.21");
+        assert_eq!(
+            l.versions.as_deref().unwrap(),
+            [
+                "2.0.21".to_string(),
+                "2.0.20".to_string(),
+                "2.0.19".to_string()
+            ]
+        );
+        assert!(l.error.is_none());
+        assert_eq!(ok.versions_declared, vec!["default".to_string()]);
+    }
+
+    #[test]
+    fn versions_mode_reports_absent_method_as_null() {
+        let ok = versions_worker(
+            r#"
+            return { default = snap { name = "plain", version = "1.0" } }
+            "#,
+        );
+        let l = ok.versions.get("default").expect("entry recorded for skip");
+        assert_eq!(l.resolved, "1.0");
+        assert!(l.versions.is_none());
+        assert!(l.error.is_none());
+        assert!(ok.versions_declared.is_empty());
+    }
+
+    #[test]
+    fn versions_mode_names_non_snap_outputs_nowhere() {
+        // A raw (non-snap-shaped) output carries no name+version pair and
+        // must not appear in the listing map at all.
+        let ok = versions_worker(r#"return { cfg = { some = "data" } }"#);
+        assert!(ok.versions.is_empty());
+    }
+
+    #[test]
+    fn versions_mode_captures_a_raising_listing() {
+        let ok = versions_worker(
+            r#"
+            return {
+                default = snap {
+                    name = "boom",
+                    version = "1.0",
+                    versions = function() error("upstream gone") end,
+                },
+            }
+            "#,
+        );
+        let l = ok.versions.get("default").unwrap();
+        assert!(l.versions.is_none());
+        let err = l.error.as_deref().expect("the raise must be captured");
+        assert!(err.contains("upstream gone"), "got: {err}");
+    }
+
+    #[test]
+    fn versions_mode_rejects_wrong_shapes_by_name() {
+        // Non-table return.
+        let ok = versions_worker(
+            r#"
+            return { d = snap { name = "x", version = "1",
+                versions = function() return "2.0.0" end } }
+            "#,
+        );
+        let err = ok.versions["d"].error.as_deref().unwrap();
+        assert!(err.contains("must return an array"), "got: {err}");
+
+        // Non-string entries.
+        let ok = versions_worker(
+            r#"
+            return { d = snap { name = "x", version = "1",
+                versions = function() return { "1.0", 42 } end } }
+            "#,
+        );
+        let err = ok.versions["d"].error.as_deref().unwrap();
+        assert!(err.contains("entries must be strings"), "got: {err}");
+
+        // Non-array table (string keys).
+        let ok = versions_worker(
+            r#"
+            return { d = snap { name = "x", version = "1",
+                versions = function() return { latest = "1.0" } end } }
+            "#,
+        );
+        let err = ok.versions["d"].error.as_deref().unwrap();
+        assert!(err.contains("key type"), "got: {err}");
+
+        // Sparse array (a hole breaks the 1..n run).
+        let ok = versions_worker(
+            r#"
+            return { d = snap { name = "x", version = "1",
+                versions = function() local t = {} t[1] = "1.0" t[3] = "0.9" return t end } }
+            "#,
+        );
+        let err = ok.versions["d"].error.as_deref().unwrap();
+        assert!(err.contains("dense 1..n"), "got: {err}");
+    }
+
+    #[test]
+    fn versions_mode_caps_are_errors_not_truncations() {
+        // 1001 entries — one past the cap.
+        let ok = versions_worker(
+            r#"
+            local t = {}
+            for i = 1, 1001 do t[i] = "1.0." .. i end
+            return { d = snap { name = "x", version = "1", versions = function() return t end } }
+            "#,
+        );
+        let err = ok.versions["d"].error.as_deref().unwrap();
+        assert!(err.contains("1001") && err.contains("cap"), "got: {err}");
+
+        // A version string 129 bytes long.
+        let ok = versions_worker(
+            r#"
+            return { d = snap { name = "x", version = "1",
+                versions = function() return { string.rep("v", 129) } end } }
+            "#,
+        );
+        let err = ok.versions["d"].error.as_deref().unwrap();
+        assert!(err.contains("128-char cap"), "got: {err}");
+
+        // Exactly at both caps is still valid.
+        let ok = versions_worker(
+            r#"
+            local t = {}
+            for i = 1, 999 do t[i] = "1.0." .. i end
+            t[1000] = string.rep("v", 128)
+            return { d = snap { name = "x", version = "1", versions = function() return t end } }
+            "#,
+        );
+        let l = ok.versions["d"].clone();
+        assert!(
+            l.error.is_none(),
+            "at-cap listing must be valid: {:?}",
+            l.error
+        );
+        assert_eq!(l.versions.as_ref().map(Vec::len), Some(1000));
+    }
+
+    #[test]
+    fn versions_mode_empty_listing_is_a_valid_answer() {
+        let ok = versions_worker(
+            r#"
+            return { d = snap { name = "x", version = "1", versions = function() return {} end } }
+            "#,
+        );
+        let l = ok.versions["d"].clone();
+        assert_eq!(l.versions.as_deref(), Some(&[][..]));
+        assert!(l.error.is_none());
+    }
+
+    #[test]
+    fn normal_mode_still_ships_outputs_carrying_a_versions_fn() {
+        // Regression guard for the pre-serialization strip: today a
+        // function field makes lua_to_json skip the WHOLE output; the
+        // strip keeps the output flowing instead, with no listing call.
+        let req = EvalRequest {
+            prelude: crate::dsl::prelude(),
+            index_data: serde_json::json!({ "version": 1, "snaps": [] }),
+            arch: "amd64".into(),
+            sources: Default::default(),
+            entry: r#"
+                return {
+                    default = snap {
+                        name = "probe",
+                        version = "2.0.21",
+                        versions = function() error("must never be called") end,
+                    },
+                }
+            "#
+            .into(),
+            entry_label: "normal-mode-test".into(),
+            allow_fetch: false,
+            constraint: None,
+            versions_mode: false,
+        };
+        let ok = match run_worker(&req) {
+            WorkerOutcome::Ok(ok) => ok,
+            WorkerOutcome::Err(e) => panic!("worker failed: {}", e.diagnostics.join("; ")),
+        };
+        assert!(
+            ok.outputs.contains_key("default"),
+            "the output must not be skipped: {:?}",
+            ok.diagnostics
+        );
+        assert!(ok.diagnostics.is_empty(), "{:?}", ok.diagnostics);
+        // The listing was never called and never shipped — listing-only.
+        assert!(ok.versions.is_empty());
+        assert_eq!(ok.versions_declared, vec!["default".to_string()]);
+        // The stripped field must not reach the JSON.
+        assert!(ok.outputs["default"].get("versions").is_none());
+    }
+
+    #[test]
+    fn normal_mode_outcome_line_stays_byte_identical() {
+        // The additive fields must vanish from the serialization when
+        // empty — every recipe shipped today has no versions field, so
+        // the worker's outcome bytes cannot move.
+        let req = EvalRequest {
+            prelude: crate::dsl::INIT_LUA.to_string(),
+            index_data: serde_json::json!({ "version": 1, "snaps": [] }),
+            arch: "amd64".into(),
+            sources: Default::default(),
+            entry: r#"return { default = snap { name = "p", version = "1" } }"#.into(),
+            entry_label: "bytes-test".into(),
+            allow_fetch: false,
+            constraint: None,
+            versions_mode: false,
+        };
+        let ok = match run_worker(&req) {
+            WorkerOutcome::Ok(ok) => ok,
+            WorkerOutcome::Err(e) => panic!("worker failed: {}", e.diagnostics.join("; ")),
+        };
+        let line = serde_json::to_string(&ok).unwrap();
+        assert!(
+            !line.contains("\"versions\""),
+            "empty versions maps must not serialize: {line}"
+        );
     }
 
     // ── stderr forwarder: cap + deadline (issue #76) ──
