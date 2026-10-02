@@ -1744,6 +1744,7 @@ dependencies = [
  "nau-pod",
  "nau-runtime",
  "nau-ship",
+ "nau-trust",
  "pgp",
  "rand",
  "rsa",
@@ -1912,6 +1913,19 @@ dependencies = [
 name = "nau-ship"
 version = "0.1.0"
 dependencies = [
+ "miette",
+ "nau-core",
+ "nau-infra",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "nau-trust"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
  "miette",
  "nau-core",
  "nau-infra",

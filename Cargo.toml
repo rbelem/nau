@@ -19,6 +19,7 @@ members = [
     "crates/nau-peer",
     "crates/nau-pod",
     "crates/nau-runtime",
+    "crates/nau-trust",
 ]
 resolver = "2"
 
@@ -40,7 +41,9 @@ nau-chart = { path = "crates/nau-chart" }
 # composes every domain.
 nau-build = { path = "crates/nau-build" }
 # The image domain (issue #326 PR 3): the UC image build/verify pipeline,
-# the release media, the UC seed, the app-runtime unit emission.
+# the release media, the UC seed, the app-runtime unit emission. Keeps the
+# `pgp` dep for its sysupdate POLICY layer (nau-infra::pgp owns the moved
+# packet primitives).
 nau-image = { path = "crates/nau-image" }
 # The ship domain (issue #326 PR 4): the OCI registry client, the pull
 # reference grammar, the peer/static pull transport lane.
@@ -56,6 +59,11 @@ nau-pod = { path = "crates/nau-pod" }
 # content store's mutation machinery, install/remove/rollback/gc,
 # activation, and the slot-recovery assessment.
 nau-runtime = { path = "crates/nau-runtime" }
+# The trust domain (issue #326 PR 8): the update-manifest signing
+# ceremony policy, the on-device verify cluster, the SSH host-CA
+# ceremony. (The pgp PRIMITIVES live in nau-infra; the image-side
+# sysupdate policy keeps nau-image's own pgp dep.)
+nau-trust = { path = "crates/nau-trust" }
 clap = { version = "4", features = ["derive"] }
 mlua = { version = "0.12", features = ["luau"] }
 miette = { version = "7", features = ["fancy"] }
@@ -63,9 +71,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 base64 = "0.22"
-# Snap Store assertion verification (ADR-0011 step b): OpenPGP v4
-# RSA-SHA512 over assertion wire bytes (see src/assert.rs).
-pgp = "0.20"
 # snapd assertion SIGNING (#28/#32): snapd's assertion crypto implements
 # ONLY OpenPGP v4 RSA-SHA512 (asserts/crypto.go — no ed25519 anywhere), so
 # the UC seed's model/account/account-key assertions are signed with an
@@ -103,6 +108,10 @@ clap_complete = "4"
 strip = true
 
 [dev-dependencies]
+# The sysupdate/pgp unit tests that stayed root (issue #326 PR 8) use the
+# pgp crate directly; the production primitives live in nau-infra::pgp,
+# the policy layer in nau-image.
+pgp = "0.20"
 # The live-D-Bus gated secrets test (NAU_SECRETS_LIVE_DBUS=1) drives the
 # real Secret Service client; the provider itself lives in nau-pod.
 dbus-secret-service = { version = "4", features = ["crypto-rust", "vendored"] }

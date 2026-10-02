@@ -18,6 +18,7 @@ pub mod assert;
 pub mod command;
 pub mod output;
 pub mod pathsearch;
+pub mod pgp;
 pub mod store;
 pub mod tools;
 

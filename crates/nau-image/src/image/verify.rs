@@ -285,7 +285,7 @@ fn load_signed_manifest(path: &Path) -> miette::Result<ImageManifest> {
 
 /// Canonical signature input for the image manifest: serialized with the
 /// signatures map emptied — byte-stable, and a signature never covers
-/// itself. The exact scheme [`nau_core::sign::eval_manifest_canonical_bytes`]
+/// itself. The exact scheme [`nau_core::manifest_ir::eval_manifest_canonical_bytes`]
 /// applies to the eval manifest, applied to the image one. This — NOT the
 /// eval scheme — is what `nau image --release` signs (#266) and what
 /// this module verifies.

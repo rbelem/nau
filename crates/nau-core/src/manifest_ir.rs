@@ -474,3 +474,19 @@ impl ImageManifest {
         Ok(())
     }
 }
+
+/// Canonical signature input for the EVAL manifest
+/// ([`ImageManifest`]): serialized with `signatures` emptied (a
+/// signature never covers itself; the map is deterministic, so the
+/// bytes are byte-stable). Moved DOWN from the root sign module (issue
+/// #326 PR 8, the §3/§5 records-twin pattern — beside the schema it
+/// digests; `ImageManifest`/`ManifestInput`/`MANIFEST_VERSION` landed
+/// here in PR 3). Named `eval_manifest_…` deliberately (#266): the
+/// IMAGE manifest's canonical bytes are a separate scheme —
+/// `nau-image::verify`'s `image_manifest_canonical_bytes` — and the two
+/// must never be confused when signing/verifying.
+pub fn eval_manifest_canonical_bytes(manifest: &ImageManifest) -> miette::Result<Vec<u8>> {
+    let mut clean = manifest.clone();
+    clean.signatures.clear();
+    serde_json::to_vec(&clean).map_err(|e| miette::miette!("canonical serialization: {e}"))
+}

@@ -8,7 +8,6 @@ pub use nau_chart::{
 pub mod assert;
 pub mod build_orch;
 pub mod build_sched;
-pub mod ca;
 pub mod cli;
 pub mod commands;
 pub mod coordinator;
@@ -57,6 +56,11 @@ pub use nau_pod::{confine, desktop, farm, fonts};
 // a real shim FILE (the verify cluster + its cosign/attest suite —
 // the trust domain, later crate) re-exporting the moved names.
 pub use nau_runtime::slot_recovery;
+// The trust domain (issue #326 PR 8): the signing ceremony policy, the
+// device verify cluster, and the SSH host-CA ceremony. sign.rs and
+// runtime.rs stay real shim FILES (the eval-coupled test clusters live
+// there); ca is a pure re-export.
+pub use nau_trust::ca;
 pub mod oci;
 pub mod snap;
 pub mod ssh_exec;
