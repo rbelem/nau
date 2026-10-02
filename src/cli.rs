@@ -201,6 +201,17 @@ pub enum Command {
     #[command(hide = true)]
     Export(ExportArgs),
 
+    /// Ask a farm server to build a version, and drain the farm's
+    /// build-request queue (ADR-0052 Decisions 4+6): `submit` POSTs an
+    /// identity (never build text) to a token-gated server; `run` is
+    /// the farm-side loop that claims requests, re-evaluates the farm's
+    /// own recipes, builds via the worker pool, and releases to the
+    /// static tree.
+    BuildRequest {
+        #[command(subcommand)]
+        command: BuildRequestCommand,
+    },
+
     /// Manage the binary package cache — legacy hidden alias of
     /// `build cache` (ADR-0049).
     #[command(subcommand, hide = true)]
@@ -706,6 +717,111 @@ impl From<PeerCommand> for Command {
             PeerCommand::Export(args) => Command::Export(args),
         }
     }
+}
+
+/// Verbs for `nau build-request` (ADR-0052 Decision 4): the ask-a-farm
+/// surface — submit an identity to a token-gated server, and the
+/// farm-side drain loop.
+#[derive(clap::Subcommand)]
+pub enum BuildRequestCommand {
+    /// Ask a server to build `<package> <version>`: POST the identity
+    /// (never build text) to `<server>/build-requests`, bearer-token
+    /// gated, and print the server's request id. Without `--server`,
+    /// the `servers` list resolves pod-override-first, then the system
+    /// config's list, tried in order (ADR-0052 Decision 6).
+    Submit(BuildRequestSubmitArgs),
+
+    /// Run the farm-side drain: claim one queued request, resolve the
+    /// recipe under the recipes root, evaluate farm-side with the
+    /// requested version as the constraint, build via the worker pool,
+    /// release the built snap to the static tree, write the receipt
+    /// (manifest/blob urls, or the error), next. Failures are recorded
+    /// and the loop continues; `--once` exits after one request.
+    Run(BuildRequestRunArgs),
+}
+
+/// The `nau build-request submit` arguments (ADR-0052 Decision 4).
+#[derive(clap::Args)]
+pub struct BuildRequestSubmitArgs {
+    /// Server front to ask (the public tree base, e.g.
+    /// `https://download.example/nau`). Absent: the `servers` config
+    /// resolves (pod override → system list, in order).
+    #[arg(long, value_name = "BASE")]
+    pub server: Option<String>,
+
+    /// Package to build (`[a-z0-9-]`, the ADR-0032 charset).
+    #[arg(long)]
+    pub package: String,
+
+    /// Version to build (a plain numeric triple, X.Y.Z).
+    #[arg(long)]
+    pub version: String,
+
+    /// File carrying the bearer token (its first line, trimmed).
+    /// Absent: the token is read from stdin.
+    #[arg(long, value_name = "FILE")]
+    pub token_file: Option<String>,
+
+    /// Who is asking (an audit label the farm records with the
+    /// request; default: this host's kernel hostname).
+    #[arg(long, value_name = "SOURCE")]
+    pub request_by: Option<String>,
+
+    /// Project Lua declaring the system `servers` list (the resolution
+    /// fallback when --server is absent; default: nau.lua).
+    #[arg(long, value_name = "FILE")]
+    pub file: Option<String>,
+}
+
+/// The `nau build-request run` arguments (ADR-0052 Decision 4): the
+/// farm-side drain.
+#[derive(clap::Args)]
+pub struct BuildRequestRunArgs {
+    /// Queue directory override (default: the XDG data root's nau dir,
+    /// `$XDG_DATA_HOME/nau/build-requests` — the same root
+    /// `nau serve --token-file` fills unless overridden there).
+    #[arg(long, value_name = "DIR")]
+    pub queue_dir: Option<String>,
+
+    /// Recipes root to resolve requests against (default `pkgs/` —
+    /// `pkgs/<first-letter>/<name>.lua`, the collection layout).
+    #[arg(long, value_name = "ROOT", default_value = "pkgs")]
+    pub recipes_root: String,
+
+    /// Process one request (or exit immediately when the queue is
+    /// empty) instead of polling forever.
+    #[arg(long)]
+    pub once: bool,
+
+    /// Update-manifest signing key for the release step (the trust
+    /// root the puller verifies against).
+    #[arg(long, value_name = "FILE")]
+    pub signing_key: Option<String>,
+
+    /// Public static-tree base the release reports its URLs against
+    /// (what `nau pull` consumes).
+    #[arg(long, value_name = "BASE")]
+    pub tree_base: Option<String>,
+
+    /// rustfs (S3 API) endpoint the release uploads to.
+    #[arg(long, value_name = "URL")]
+    pub s3_endpoint: Option<String>,
+
+    /// Bucket backing the static tree.
+    #[arg(long, value_name = "BUCKET")]
+    pub s3_bucket: Option<String>,
+
+    /// SigV4 region string (rustfs accepts any consistent value).
+    #[arg(long, value_name = "REGION")]
+    pub s3_region: Option<String>,
+
+    /// rustfs access key.
+    #[arg(long, value_name = "KEY")]
+    pub s3_access_key: Option<String>,
+
+    /// rustfs secret key.
+    #[arg(long, value_name = "KEY")]
+    pub s3_secret_key: Option<String>,
 }
 
 /// Verbs for `nau trust` (ADR-0049): the key-ceremony surface
@@ -1282,6 +1398,20 @@ pub struct ServeArgs {
     /// `pull` and `export` (ADR-0033 Decision 5).
     #[arg(long, value_name = "POD")]
     pub pod: Option<String>,
+
+    /// Open `POST /build-requests` (ADR-0052 Decision 4): the file of
+    /// bearer tokens, one per line, operator-managed — a request
+    /// without a valid token is a 4xx and never reaches the queue, and
+    /// removing a line revokes it on the next request. Absent, the
+    /// write route is off (POST answers 404).
+    #[arg(long, value_name = "FILE")]
+    pub token_file: Option<String>,
+
+    /// Build-request queue directory override (ADR-0052 Decision 4;
+    /// default: the XDG data root's nau dir,
+    /// `$XDG_DATA_HOME/nau/build-requests`).
+    #[arg(long, value_name = "DIR")]
+    pub queue_dir: Option<String>,
 }
 
 /// The `nau peer browse` / legacy `nau peers` arguments (ADR-0049).

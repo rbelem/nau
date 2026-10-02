@@ -1927,11 +1927,15 @@ dependencies = [
 name = "nau-ship"
 version = "0.1.0"
 dependencies = [
+ "hmac",
  "miette",
  "nau-core",
  "nau-infra",
  "serde",
  "serde_json",
+ "serde_yaml",
+ "sha2",
+ "sha3",
  "tempfile",
 ]
 

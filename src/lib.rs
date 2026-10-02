@@ -7,6 +7,7 @@ pub use nau_chart::{
 
 pub mod assert;
 pub mod build_orch;
+pub mod build_request;
 pub mod cli;
 pub mod commands;
 pub mod coordinator;
@@ -43,7 +44,7 @@ pub use nau_ship::pull_ref;
 // whole (the serve/export signatures now take the resolved pod roots —
 // the env-reading `pod_root`/`pod_store` stay root); the plain
 // re-export keeps every `crate::<module>::` path resolving.
-pub use nau_peer::{discovery, export, serve};
+pub use nau_peer::{discovery, export, queue, serve};
 // The pod domain (issue #326 PR 6): confine/desktop/fonts/farm moved
 // whole (emitters take the core `StoreView` seam); `secrets` stays a
 // root shim FILE (it keeps the `pod secrets` verb layer + its suite —

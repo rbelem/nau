@@ -163,6 +163,11 @@ pub struct WorkerOk {
     /// one parser (the `inputs` precedent).
     #[serde(default = "serde_json::Value::default")]
     pub workers: Value,
+    /// The global `servers` table (ADR-0052 Decision 6), serialized to
+    /// JSON. Shape validation happens in the parent's re-extraction —
+    /// the `workers` precedent, byte-identical outcome line when absent.
+    #[serde(default = "serde_json::Value::default")]
+    pub servers: Value,
     /// Warn-and-continue diagnostics (per-output extraction skips).
     pub diagnostics: Vec<String>,
     /// Per-output upstream version listings (ADR-0052 Decision 1),
@@ -1090,6 +1095,22 @@ fn extract_workers_json(lua: &mlua::Lua) -> Result<Value, String> {
     }
 }
 
+/// Extract the global `servers` table (ADR-0052 Decision 6) to JSON —
+/// the `workers` twin: raw table rides through verbatim, shape
+/// validation happens in the parent's re-extraction, and absence is an
+/// empty array so a servers-less eval's outcome line stays unchanged.
+fn extract_servers_json(lua: &mlua::Lua) -> Result<Value, String> {
+    let value: mlua::Value = lua.globals().get("servers").unwrap_or(mlua::Value::Nil);
+    match value {
+        mlua::Value::Nil => Ok(serde_json::json!([])),
+        mlua::Value::Table(t) => lua_to_json(&mlua::Value::Table(t)),
+        other => Err(format!(
+            "'servers' must be a table, got {}",
+            other.type_name()
+        )),
+    }
+}
+
 /// Serialize an mlua value to JSON. Tables must be array-shaped (1..=n
 /// integer keys) or string-keyed maps; functions/userdata and cycles are
 /// errors (they become per-output "skipping" diagnostics).
@@ -1189,6 +1210,11 @@ fn run_worker(req: &EvalRequest) -> WorkerOutcome {
         Err(e) => return fatal(vec![e.to_string()]),
     };
 
+    let servers = match extract_servers_json(&lua) {
+        Ok(v) => v,
+        Err(e) => return fatal(vec![e.to_string()]),
+    };
+
     let mlua::Value::Table(table) = &result else {
         return fatal(vec![format!(
             "must return a table of outputs, got {}",
@@ -1256,6 +1282,7 @@ fn run_worker(req: &EvalRequest) -> WorkerOutcome {
         outputs,
         global_inputs: inputs,
         workers,
+        servers,
         diagnostics,
         versions,
         versions_declared,

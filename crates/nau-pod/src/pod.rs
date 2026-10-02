@@ -110,6 +110,13 @@ pub struct PodDeclaration {
     /// option overrides merged over each package-declared service's
     /// options (package defaults < loaded pods < this declaration).
     pub services: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
+    /// Server-front override (ADR-0052 Decision 6): this pod's ordered
+    /// `servers` list, replacing the system config's list wholesale when
+    /// non-empty (pod override → system list in order → named error).
+    /// URLs, validated at parse time against
+    /// `nau_core::servers::validate_server_url`; stored in declaration
+    /// order — the order IS the try order.
+    pub servers: Vec<String>,
 }
 
 // ── Rendering ──
@@ -132,6 +139,15 @@ pub fn render_pod_source(decl: &PodDeclaration) -> String {
         out.push_str(&format!(
             "    packages = {},\n",
             render_string_array(&decl.packages)
+        ));
+    }
+    if !decl.servers.is_empty() {
+        // ADR-0052 Decision 6: the pod-level servers override must
+        // round-trip through `nau pod add/remove`/`declare` re-renders
+        // like every other declared field.
+        out.push_str(&format!(
+            "    servers = {},\n",
+            render_string_array(&decl.servers)
         ));
     }
     if !decl.overlay.is_empty() {
@@ -847,6 +863,32 @@ mod tests {
         assert!(parse_pod_package("jq@").is_err());
         assert!(parse_pod_package("").is_err());
         assert!(parse_pod_package("two words").is_err());
+    }
+
+    #[test]
+    fn render_round_trips_the_servers_override() {
+        // ADR-0052 Decision 6: the pod-level servers override must
+        // survive `nau pod add/remove`/`declare` re-renders like every
+        // other declared field.
+        let decl = PodDeclaration {
+            packages: vec!["jq".into()],
+            servers: vec![
+                "https://primary.example/nau".into(),
+                "http://backup.example:7780".into(),
+            ],
+            ..Default::default()
+        };
+        let source = render_pod_source(&decl);
+        assert!(
+            source.contains(
+                "servers = { \"https://primary.example/nau\", \
+                             \"http://backup.example:7780\" }"
+            ),
+            "the override renders in declaration order: {source}"
+        );
+        // Absent servers render nothing (zero behavior change).
+        let bare = render_pod_source(&PodDeclaration::default());
+        assert!(!bare.contains("servers"), "{bare}");
     }
 
     #[test]

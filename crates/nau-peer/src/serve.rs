@@ -1,7 +1,9 @@
-//! `nau serve` — the peer lane's read-only serving surface
-//! (ADR-0033 Decisions 4+5): plain TCP with a minimal HTTP/1.1 subset
-//! over the pod store (`GET /info`, `GET /manifests/<pkg>`,
-//! `GET /blobs/<sha256>`), foreground until interrupted.
+//! `nau serve` — the peer lane's serving surface: the read-only pod
+//! store grammar (ADR-0033 Decisions 4+5: plain TCP with a minimal
+//! HTTP/1.1 subset over `GET /info`, `GET /manifests/<pkg>`,
+//! `GET /blobs/<sha256>`) plus ONE token-gated write route,
+//! `POST /build-requests` (ADR-0052 Decision 4), foreground until
+//! interrupted.
 //!
 //! The wire grammar is NORMATIVE (ADR-0033 Decision 4 — safety is
 //! conditional on it, not intrinsic to "read-only"): a blob segment is
@@ -14,6 +16,16 @@
 //! every socket gets a read/write timeout, and the server holds a hard
 //! connection-concurrency bound (the `oci.rs` bounded-timeout
 //! precedent) — a bare `TcpListener` has no slowloris defenses.
+//!
+//! `/build-requests` (ADR-0052 Decision 4) is bearer-token gated
+//! BEFORE anything else: the token lives in an operator-managed file
+//! (`--token-file`, revocable by removal — the file is re-read per
+//! request), the compare is exact, and every auth failure is a 4xx
+//! that never reaches the queue. A valid request carries `{package,
+//! version, requested_by}` (identity only — never build text), lands
+//! as ONE queue file (atomic temp+rename), and earns a minimal 2xx
+//! naming the request id. The GET surface and the trust chain are
+//! untouched by this route.
 //!
 //! `/manifests/<pkg>` and `/info` publish the UNION of the current
 //! generation's records (minted + signed on the fly — unsigned store
@@ -61,6 +73,11 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 /// 400 before it can pin a connection.
 const REQUEST_HEAD_LIMIT: usize = 8 * 1024;
 
+/// POST body cap (`/build-requests`). The request identity is three
+/// short strings; 64 KiB is orders of magnitude past any honest body
+/// and refuses the oversized before it can pin memory.
+const MAX_BODY_BYTES: usize = 64 * 1024;
+
 /// Per-socket read/write timeout (the `oci.rs` bounded-timeout
 /// precedent).
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -75,11 +92,15 @@ enum Route {
     Info,
     Manifest(String),
     Blob(String),
+    /// `POST /build-requests` (ADR-0052 Decision 4) — the ONE write
+    /// route, token-gated in its handler before anything else.
+    BuildRequests,
 }
 
-/// Parse the HTTP request line. `Ok(route)` for a valid GET;
-/// `Err(status)` for the refusal code (405 wrong method, 404 anything
-/// not matching the three route shapes exactly, 400 malformed line).
+/// Parse the HTTP request line. `Ok(route)` for a valid request;
+/// `Err(status)` for the refusal code (405 wrong method for the path,
+/// 404 anything not matching the route shapes exactly, 400 malformed
+/// line).
 fn parse_request(line: &str) -> Result<Route, u16> {
     let mut tokens = line.split_whitespace();
     let (Some(method), Some(path), Some(version)) = (tokens.next(), tokens.next(), tokens.next())
@@ -89,15 +110,24 @@ fn parse_request(line: &str) -> Result<Route, u16> {
     if tokens.next().is_some() {
         return Err(400);
     }
-    if method != "GET" {
-        return Err(405);
-    }
     if !version.starts_with("HTTP/") {
         return Err(400);
     }
+    // The write route first: it is POST-only, and everything else on
+    // its path is a 405 (the method names what would be allowed).
+    if path == "/build-requests" {
+        return if method == "POST" {
+            Ok(Route::BuildRequests)
+        } else {
+            Err(405)
+        };
+    }
+    if method != "GET" {
+        return Err(405);
+    }
     // Query strings and fragments are not part of any route shape —
     // strict segment grammar rejects them below (nothing outside the
-    // three exact forms parses).
+    // exact forms parses).
     if path == "/info" {
         return Ok(Route::Info);
     }
@@ -134,20 +164,45 @@ fn is_sha256(s: &str) -> bool {
 
 // ── Request head reading ──
 
+/// One parsed request head: the request line plus the header pairs in
+/// arrival order. The GET routes consume only the line (their responses
+/// are all `Connection: close`; nothing in the read-only subset needs
+/// headers); `/build-requests` reads `Authorization` and
+/// `Content-Length` off the pairs.
+#[derive(Debug)]
+struct RequestHead {
+    line: String,
+    headers: Vec<(String, String)>,
+}
+
+impl RequestHead {
+    /// Case-insensitive header lookup, first match wins.
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
 /// Outcome of reading one request head.
 #[derive(Debug)]
 enum Head {
-    /// The request line (everything before the first CRLF).
-    Line(String),
+    /// A complete head plus the bytes READ PAST its terminator — a
+    /// client may pipeline the body in the same TCP segment as the
+    /// head, and the chunked reads can absorb it. Discarding those
+    /// bytes would corrupt a POST body; they are handed to the body
+    /// reader. (The GET routes ignore them — no body, connection
+    /// closes after one response.)
+    Complete(RequestHead, Vec<u8>),
     /// Line + headers exceeded [`REQUEST_HEAD_LIMIT`] — refuse with 400.
     TooLarge,
     /// EOF or timeout before a complete head — close silently.
     Closed,
 }
 
-/// Read the request line + headers, capped. The headers themselves are
-/// discarded (the responses are all `Connection: close`; nothing in the
-/// minimal subset needs them) — only their SIZE is policed.
+/// Read the request line + headers, capped, parse the header pairs,
+/// and keep whatever arrived past the terminator.
 fn read_head<R: Read>(reader: &mut R) -> Head {
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 512];
@@ -165,13 +220,41 @@ fn read_head<R: Read>(reader: &mut R) -> Head {
         }
         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             let head = String::from_utf8_lossy(&buf[..pos]).into_owned();
-            let line = head.lines().next().unwrap_or_default().to_string();
-            return Head::Line(line);
+            return Head::Complete(parse_head(&head), buf[pos + 4..].to_vec());
         }
     }
 }
 
+/// Split one head's text into the request line and `name: value`
+/// pairs. Malformed header lines are kept verbatim — they can only
+/// fail a later `header()` lookup, never panic (the size cap already
+/// bounds them).
+fn parse_head(head: &str) -> RequestHead {
+    let mut lines = head.split("\r\n");
+    let line = lines.next().unwrap_or_default().to_string();
+    let headers = lines
+        .filter_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            Some((name.trim().to_string(), value.trim().to_string()))
+        })
+        .collect();
+    RequestHead { line, headers }
+}
+
 // ── Server ──
+
+/// The `/build-requests` gate (ADR-0052 Decision 4): the operator's
+/// token file plus the queue the route appends to. `None` (no
+/// `--token-file`) takes the route OFF the wire — POST answers 404
+/// like any unknown path.
+#[derive(Clone)]
+struct BuildRequestGate {
+    /// Operator-managed bearer tokens, one per line; revocation is
+    /// removing the line (the file is re-read per request, so removal
+    /// takes effect without a restart).
+    token_file: PathBuf,
+    queue: Arc<crate::queue::BuildQueue>,
+}
 
 /// Everything a connection handler needs. Shared across connection
 /// threads behind an [`Arc`].
@@ -191,6 +274,8 @@ struct ServerCtx {
     /// The configured `node.name` (ADR-0033 Decision 6) — the identity
     /// `/info` publishes; the kernel hostname is only the fallback.
     node_name: Option<String>,
+    /// The `/build-requests` gate; `None` = route off (404).
+    build_requests: Option<BuildRequestGate>,
 }
 
 /// A computed response: either an inline body or a file to stream
@@ -210,6 +295,15 @@ impl Handled {
     }
 }
 
+/// The `/build-requests` gate overrides (ADR-0052 Decision 4): the
+/// token file turns the route on; the queue dir defaults to the XDG
+/// data root. Both come from `--token-file`/`--queue-dir`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BuildRequestsOptions<'a> {
+    pub token_file: Option<&'a Path>,
+    pub queue_dir: Option<&'a Path>,
+}
+
 /// Run `nau serve` with the CLI's bind overrides. `address`/`port`
 /// are `None` when the operator gave no flag — the defaults come from
 /// `node {}` conventions ([`DEFAULT_SERVE_ADDRESS`], loopback).
@@ -219,7 +313,8 @@ impl Handled {
 /// store is the served surface (default `default`, matching the
 /// `--pod` flags on `pull` and `export`). `pod_root` is the pod state
 /// root the flag resolves under — resolved by the root glue (the
-/// env-reading `pod_root` stays root). Foreground until
+/// env-reading `pod_root` stays root). `build_requests` opens the
+/// token-gated POST route when its token file is set. Foreground until
 /// interrupted; no daemonization (ADR-0033 Decision 5).
 pub fn run(
     pod_root: &Path,
@@ -228,8 +323,15 @@ pub fn run(
     announce: bool,
     node_name: Option<&str>,
     pod: Option<&str>,
+    build_requests: BuildRequestsOptions<'_>,
 ) -> miette::Result<()> {
-    let (pod_name, ctx) = serve_ctx(pod_root, pod, node_name)?;
+    let (pod_name, ctx) = serve_ctx(
+        pod_root,
+        pod,
+        node_name,
+        build_requests.token_file,
+        build_requests.queue_dir,
+    )?;
     let (host, port) = resolve_bind(address, port)?;
     let listener = TcpListener::bind((host.as_str(), port))
         .into_diagnostic()
@@ -237,6 +339,9 @@ pub fn run(
     output::info(format!(
         "serving pod '{pod_name}' store on http://{host}:{port} — Ctrl-C to stop"
     ));
+    if ctx.build_requests.is_some() {
+        output::info("accepting build requests on POST /build-requests (bearer-token gated)");
+    }
     // The guard binds the registration to the serve loop's lifetime —
     // it is dropped only when the loop exits (i.e. never in practice:
     // Ctrl-C terminates the process, and the OS reaps the multicast
@@ -274,6 +379,10 @@ pub fn run(
 /// Resolve the pod to serve under an explicit pod root: the `--pod`
 /// name ([`nau_core::paths::resolve_pod_dir_under`]) plus the
 /// store-existence gate, and carry the node name through to `/info`.
+/// The `/build-requests` gate assembles here: a `--token-file` turns
+/// the route on (queue root: `--queue-dir`, else the XDG default); an
+/// unreadable token file refuses the STARTUP — a gate the operator
+/// asked for and nau cannot honor must not silently serve half-open.
 /// Split from [`run`] so tests can point the pod root at a tempdir and
 /// observe which store a pod flag selects. A missing store is a named
 /// error — the pod that was asked for and where it was looked for.
@@ -281,6 +390,8 @@ fn serve_ctx(
     pod_root: &Path,
     pod: Option<&str>,
     node_name: Option<&str>,
+    token_file: Option<&Path>,
+    queue_dir: Option<&Path>,
 ) -> miette::Result<(String, ServerCtx)> {
     let (pod_name, pod_dir) = nau_core::paths::resolve_pod_dir_under(pod_root, pod)?;
     if !pod_dir.is_dir() {
@@ -291,6 +402,28 @@ fn serve_ctx(
         );
     }
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    let build_requests = match token_file {
+        None => None,
+        Some(token_file) => {
+            if !token_file.is_file() {
+                miette::bail!(
+                    "build-requests token file {} does not exist — create it first \
+                     (one bearer token per line; remove a line to revoke)",
+                    token_file.display()
+                );
+            }
+            let queue = crate::queue::BuildQueue::new(
+                queue_dir
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(crate::queue::BuildQueue::default_dir),
+            );
+            queue.ensure_dirs()?;
+            Some(BuildRequestGate {
+                token_file: token_file.to_path_buf(),
+                queue: Arc::new(queue),
+            })
+        }
+    };
     let ctx = ServerCtx {
         // The store dir half of the runtime state layout
         // (`<state root>/store`, the same component
@@ -300,6 +433,7 @@ fn serve_ctx(
         blobs: Arc::new(BlobStore::new(pod_dir.join("store"))),
         home,
         node_name: node_name.map(str::to_string),
+        build_requests,
     };
     Ok((pod_name, ctx))
 }
@@ -384,6 +518,31 @@ fn drain_available(stream: &mut TcpStream) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
 }
 
+/// Close politely on a refused POST: consume what the client already
+/// sent (bounded by its declared length or the request caps — a client
+/// that declares megabytes gets the documented 503-path tradeoff: its
+/// refusal may ride an RST once it keeps dribbling past the bound) so
+/// the close is a FIN the client's status read survives. The window is
+/// 250ms per read: a loopback client's body is effectively always
+/// already buffered; a stalled one gets its refusal either way.
+fn drain_for_refuse(stream: &mut TcpStream, head: &RequestHead) {
+    let declared = head
+        .header("content-length")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let budget = declared.clamp(REQUEST_HEAD_LIMIT, MAX_BODY_BYTES + REQUEST_HEAD_LIMIT);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+    let mut buf = [0u8; 4096];
+    let mut total = 0usize;
+    while total < budget {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => total += n,
+        }
+    }
+    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+}
+
 /// Serve ONE connection: read the capped head, parse the wire grammar,
 /// dispatch, respond, close (`Connection: close` — one request per
 /// connection; the minimal subset needs no keep-alive).
@@ -391,15 +550,22 @@ fn serve_connection(mut stream: TcpStream, ctx: &ServerCtx) -> std::io::Result<(
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let _ = stream.set_nodelay(true);
-    let line = match read_head(&mut stream) {
-        Head::Line(line) => line,
+    let head = match read_head(&mut stream) {
+        Head::Complete(head, extra) => (head, extra),
         Head::TooLarge => {
             return write_json_error(&mut stream, 400, "request head exceeds 8 KiB");
         }
         Head::Closed => return Ok(()),
     };
+    let line = head.0.line.clone();
     let (method, path) = request_target(&line);
     match parse_request(&line) {
+        Ok(Route::BuildRequests) => {
+            // The write route reads its body itself (bounded by
+            // Content-Length + the body cap) — the gate checks the
+            // Authorization header before anything else touches it.
+            handle_build_requests_connection(&mut stream, ctx, &head.0, &head.1, method, path)
+        }
         Ok(route) => match dispatch(ctx, &route) {
             Ok(handled) => {
                 log_request(method, path, handled.status());
@@ -417,7 +583,7 @@ fn serve_connection(mut stream: TcpStream, ctx: &ServerCtx) -> std::io::Result<(
         },
         Err(405) => {
             log_request(method, path, 405);
-            write_json_error(&mut stream, 405, "GET only")
+            write_json_error(&mut stream, 405, "method not allowed")
         }
         Err(404) => {
             log_request(method, path, 404);
@@ -428,6 +594,173 @@ fn serve_connection(mut stream: TcpStream, ctx: &ServerCtx) -> std::io::Result<(
             write_json_error(&mut stream, 400, "malformed request")
         }
     }
+}
+
+/// The `/build-requests` connection path (ADR-0052 Decision 4): read
+/// the bounded body off the socket (a refusal still drains the declared
+/// bytes, so the client reliably receives its status), gate on the
+/// bearer token BEFORE anything else, validate the identity, write ONE
+/// queue file, answer with the request id. Auth failures are 4xx and
+/// NEVER a queue write.
+fn handle_build_requests_connection(
+    stream: &mut TcpStream,
+    ctx: &ServerCtx,
+    head: &RequestHead,
+    extra: &[u8],
+    method: &str,
+    path: &str,
+) -> std::io::Result<()> {
+    let gate = match &ctx.build_requests {
+        // Route off: 404 like any unknown path — a serve the operator
+        // started without --token-file has no write surface at all.
+        None => {
+            log_request(method, path, 404);
+            return write_json_error(stream, 404, "not found");
+        }
+        Some(gate) => gate,
+    };
+    let body = match read_body(stream, head, extra) {
+        Ok(body) => body,
+        Err(status) => {
+            log_request(method, path, status);
+            // Close politely: drain what the client already sent
+            // (bounded by the declared length or the request caps) so
+            // the close is a FIN, not an RST that eats the refusal.
+            drain_for_refuse(stream, head);
+            let message = match status {
+                413 => "request body exceeds 64 KiB",
+                _ => "malformed request body",
+            };
+            return write_json_error(stream, status, message);
+        }
+    };
+    // The gate: exact compare against every token line in the
+    // operator's file. First, before parsing the body, before the
+    // queue — an unauthenticated byte never becomes state.
+    match authorize(gate, head.header("authorization")) {
+        Ok(()) => {}
+        Err(status) => {
+            log_request(method, path, status);
+            return write_json_error(stream, status, "unauthorized");
+        }
+    }
+    let request: crate::queue::BuildRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            log_request(method, path, 400);
+            return write_json_error(
+                stream,
+                400,
+                &format!("body must be {{package, version, requested_by}} JSON: {e}"),
+            );
+        }
+    };
+    // enqueue validates the identity grammar itself (fail-closed for
+    // every writer); a refusal is a 400 naming the field.
+    match gate.queue.enqueue(&request) {
+        Ok(id) => {
+            log_request(method, path, 202);
+            write_response(
+                stream,
+                202,
+                "application/json",
+                serde_json::to_vec(&serde_json::json!({ "id": id }))
+                    .unwrap_or_else(|_| b"{}".to_vec())
+                    .as_slice(),
+            )
+        }
+        Err(e) => {
+            log_request(method, path, 400);
+            // The validation message names the offending field; it
+            // carries no server-side secrets.
+            write_json_error(stream, 400, &format!("{e:#}"))
+        }
+    }
+}
+
+/// Read the declared body: `Content-Length` required, capped at
+/// [`MAX_BODY_BYTES`], bounded by the socket timeout already set.
+/// `extra` is the head reader's over-read — pipelined body bytes that
+/// must count toward the body, never be lost. `Err(413)` oversize,
+/// `Err(400)` missing/invalid length or a short body (EOF/timeout
+/// before the declared bytes arrived).
+fn read_body(stream: &mut TcpStream, head: &RequestHead, extra: &[u8]) -> Result<Vec<u8>, u16> {
+    let Some(len_raw) = head.header("content-length") else {
+        return Err(400);
+    };
+    let Ok(len) = len_raw.trim().parse::<usize>() else {
+        return Err(400);
+    };
+    if len > MAX_BODY_BYTES {
+        return Err(413);
+    }
+    let mut buf: Vec<u8> = extra.iter().take(len).copied().collect();
+    if buf.len() > len {
+        return Err(400);
+    }
+    let mut chunk = [0u8; 512];
+    while buf.len() < len {
+        let want = (len - buf.len()).min(chunk.len());
+        match stream.read(&mut chunk[..want]) {
+            Ok(0) => return Err(400),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(ref e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Err(400)
+            }
+            Err(_) => return Err(400),
+        }
+    }
+    Ok(buf)
+}
+
+/// The bearer gate: `Authorization: Bearer <token>` compared EXACTLY
+/// against every non-empty line of the operator's token file (re-read
+/// per request — revocation is removing the line, no restart). Both
+/// the header shape and the lookup failure are 401; the compare walks
+/// all candidates in constant time relative to the input (no
+/// early-exit on the first matching byte).
+fn authorize(gate: &BuildRequestGate, authorization: Option<&str>) -> Result<(), u16> {
+    let Some(presented) = authorization.and_then(|a| a.strip_prefix("Bearer ")) else {
+        return Err(401);
+    };
+    let presented = presented.trim();
+    if presented.is_empty() {
+        return Err(401);
+    }
+    let Ok(file) = std::fs::read_to_string(&gate.token_file) else {
+        // An unreadable token file authenticates nobody.
+        return Err(401);
+    };
+    let mut matched = false;
+    for candidate in file.lines() {
+        let candidate = candidate.trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        if constant_time_eq(presented.as_bytes(), candidate.as_bytes()) {
+            matched = true;
+        }
+    }
+    if matched {
+        Ok(())
+    } else {
+        Err(401)
+    }
+}
+
+/// Byte-equal compare with no data-dependent early exit: the loop
+/// always walks the longer input, XOR-accumulating differences
+/// (length mismatch included in the accumulator). An exact match and
+/// nothing else returns true.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = (a.len() ^ b.len()) as u32;
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        let av = a.get(i).copied().unwrap_or(0);
+        let bv = b.get(i).copied().unwrap_or(0);
+        diff |= (av ^ bv) as u32;
+    }
+    diff == 0
 }
 
 /// The (method, path) pair of a request line, verbatim from the wire —
@@ -455,6 +788,10 @@ fn dispatch(ctx: &ServerCtx, route: &Route) -> miette::Result<Handled> {
         Route::Info => handle_info(ctx),
         Route::Manifest(pkg) => handle_manifest(ctx, pkg),
         Route::Blob(sha) => Ok(handle_blob(ctx, sha)),
+        // Unreachable by construction: serve_connection routes the
+        // write path through handle_build_requests_connection (it owns
+        // the socket for the bounded body read) before dispatch.
+        Route::BuildRequests => unreachable!("handled by handle_build_requests_connection"),
     }
 }
 
@@ -580,9 +917,12 @@ fn not_found() -> Handled {
 fn reason(code: u16) -> &'static str {
     match code {
         200 => "OK",
+        202 => "Accepted",
         400 => "Bad Request",
+        401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        413 => "Payload Too Large",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "Error",
@@ -747,6 +1087,24 @@ mod tests {
     }
 
     #[test]
+    fn the_build_requests_route_is_post_only() {
+        assert_eq!(
+            parse_request("POST /build-requests HTTP/1.1"),
+            Ok(Route::BuildRequests)
+        );
+        assert_eq!(parse_request("GET /build-requests HTTP/1.1"), Err(405));
+        assert_eq!(parse_request("DELETE /build-requests HTTP/1.1"), Err(405));
+        assert_eq!(parse_request("PUT /build-requests HTTP/1.1"), Err(405));
+        assert_eq!(parse_request("post /build-requests HTTP/1.1"), Err(405));
+        // The GET routes keep refusing POST (the write route did not
+        // loosen the read-only grammar), and the method check precedes
+        // the path grammar everywhere — the pre-existing wire posture.
+        assert_eq!(parse_request("POST /info HTTP/1.1"), Err(405));
+        assert_eq!(parse_request("POST /build-requests/ HTTP/1.1"), Err(405));
+        assert_eq!(parse_request("POST /build-requests?x=1 HTTP/1.1"), Err(405));
+    }
+
+    #[test]
     fn oversized_head_is_too_large() {
         // 9 KiB with no head terminator → the 8 KiB cap fires.
         let bloated = vec![b'a'; REQUEST_HEAD_LIMIT + 1024];
@@ -757,11 +1115,22 @@ mod tests {
     }
 
     #[test]
-    fn head_reader_extracts_the_request_line_and_drops_headers() {
+    fn head_reader_extracts_the_request_line_and_parses_headers() {
         let raw = b"GET /info HTTP/1.1\r\nHost: peer\r\nUser-Agent: curl/8\r\n\r\n";
         match read_head(&mut Cursor::new(&raw[..])) {
-            Head::Line(line) => assert_eq!(line, "GET /info HTTP/1.1"),
-            other => panic!("expected a request line, got {other:?}"),
+            Head::Complete(head, extra) => {
+                assert_eq!(head.line, "GET /info HTTP/1.1");
+                assert_eq!(head.header("host"), Some("peer"));
+                assert_eq!(
+                    head.header("HOST"),
+                    Some("peer"),
+                    "lookup is case-insensitive"
+                );
+                assert_eq!(head.header("user-agent"), Some("curl/8"));
+                assert_eq!(head.header("missing"), None);
+                assert!(extra.is_empty(), "a GET with no body over-reads nothing");
+            }
+            other => panic!("expected a request head, got {other:?}"),
         }
         // EOF with no terminator → closed, never a hang.
         assert!(matches!(
@@ -832,6 +1201,37 @@ mod tests {
     /// keyless — the /manifests mint then fails (the generic-500 case).
     fn start() -> ServeFixture {
         start_with_signing_key(true)
+    }
+
+    /// Start with a `/build-requests` gate: the token lives at
+    /// `<root>/tokens` (exactly `farm-token`), the queue at
+    /// `<root>/queue`. Both tempdirs stay in the fixture so the tree
+    /// outlives the loop.
+    fn start_with_gate() -> (ServeFixture, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        // The served pod only needs to exist for serve_ctx's store gate;
+        // the write-route tests never touch the read-only surface.
+        fs::create_dir_all(dir.path().join("default")).unwrap();
+        let token_file = dir.path().join("tokens");
+        std::fs::write(&token_file, "farm-token\n").unwrap();
+        let queue_dir = dir.path().join("queue");
+        let (pod_name, ctx) =
+            serve_ctx(dir.path(), None, None, Some(&token_file), Some(&queue_dir)).unwrap();
+        assert_eq!(pod_name, "default");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let server_active = Arc::clone(&active);
+        thread::spawn(move || accept_loop(listener, ctx, server_active));
+        let fx = ServeFixture {
+            addr,
+            active,
+            public_hex: String::new(),
+            blob_sha: String::new(),
+            blob_body: Vec::new(),
+            inbox_body: Vec::new(),
+        };
+        (fx, dir)
     }
 
     fn start_with_signing_key(with_key: bool) -> ServeFixture {
@@ -917,6 +1317,7 @@ mod tests {
             blobs: Arc::new(blobs),
             home,
             node_name: None,
+            build_requests: None,
         };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1143,10 +1544,10 @@ mod tests {
         fabricate_pod(root.path(), "lab", "lab-pod-pkg");
 
         // No flag: the default pod, as before.
-        let (name, _) = serve_ctx(root.path(), None, None).unwrap();
+        let (name, _) = serve_ctx(root.path(), None, None, None, None).unwrap();
         assert_eq!(name, "default");
 
-        let (name, ctx) = serve_ctx(root.path(), Some("lab"), None).unwrap();
+        let (name, ctx) = serve_ctx(root.path(), Some("lab"), None, None, None).unwrap();
         assert_eq!(name, "lab");
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1160,7 +1561,7 @@ mod tests {
         assert_eq!(pkgs[0]["name"], "lab-pod-pkg");
 
         // A missing store is a named refusal.
-        let err = serve_ctx(root.path(), Some("ghost"), None)
+        let err = serve_ctx(root.path(), Some("ghost"), None, None, None)
             .err()
             .expect("no such pod");
         assert!(err.to_string().contains("ghost"), "{err}");
@@ -1172,7 +1573,7 @@ mod tests {
     fn info_publishes_the_node_name_over_the_hostname_fallback() {
         let root = tempfile::tempdir().unwrap();
         fabricate_pod(root.path(), "default", "pkg");
-        let (pod_name, ctx) = serve_ctx(root.path(), None, Some("devbox")).unwrap();
+        let (pod_name, ctx) = serve_ctx(root.path(), None, Some("devbox"), None, None).unwrap();
         assert_eq!(pod_name, "default");
         let info = handle_info(&ctx).expect("info builds");
         let Handled::Body(200, _, body) = info else {
@@ -1182,7 +1583,7 @@ mod tests {
         assert_eq!(parsed["name"], "devbox");
 
         // No node name → kernel hostname fallback (never empty).
-        let (_, ctx) = serve_ctx(root.path(), None, None).unwrap();
+        let (_, ctx) = serve_ctx(root.path(), None, None, None, None).unwrap();
         let info = handle_info(&ctx).expect("info builds");
         let Handled::Body(_, _, body) = info else {
             panic!("expected a body response");
@@ -1232,5 +1633,210 @@ mod tests {
             !text.contains("secret-key"),
             "no key paths on the wire: {text}"
         );
+    }
+
+    // ── POST /build-requests (ADR-0052 Decision 4) ──
+
+    /// A raw POST with Authorization + JSON body; returns
+    /// (status, lowercased head, body).
+    fn post(
+        addr: SocketAddr,
+        token: Option<&str>,
+        body: &str,
+        extra: &[(&str, &str)],
+    ) -> (u16, String, Vec<u8>) {
+        let mut req = String::from("POST /build-requests HTTP/1.1\r\nHost: test\r\n");
+        if let Some(token) = token {
+            req.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        }
+        for (name, value) in extra {
+            req.push_str(&format!("{name}: {value}\r\n"));
+        }
+        // A caller-supplied content-length header overrides the default
+        // (the missing-length test passes none by blanking it here).
+        if !extra
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case("content-length"))
+        {
+            req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        }
+        req.push_str("\r\n");
+        req.push_str(body);
+        http_exchange(addr, req.as_bytes())
+    }
+
+    fn request_body(pkg: &str, version: &str, by: &str) -> String {
+        serde_json::json!({ "package": pkg, "version": version, "requested_by": by }).to_string()
+    }
+
+    /// The gate is BEFORE everything: no token, a wrong token, and a
+    /// revoked token all answer 401 — and the queue directory never
+    /// gains a file.
+    #[test]
+    fn post_is_bearer_gated_before_any_queue_write() {
+        let (fx, dir) = start_with_gate();
+        let queue_root = dir.path().join("queue");
+        let queue = crate::queue::BuildQueue::new(&queue_root);
+        let body = request_body("hello-world", "1.2.3", "device-7");
+
+        // No Authorization header at all.
+        let (status, ..) = post(fx.addr, None, &body, &[]);
+        assert_eq!(status, 401);
+        // Malformed scheme.
+        let raw = format!(
+            "POST /build-requests HTTP/1.1\r\nHost: t\r\nAuthorization: Basic zzz\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert_eq!(http_exchange(fx.addr, raw.as_bytes()).0, 401);
+        // Wrong token.
+        let (status, _, resp) = post(fx.addr, Some("not-the-token"), &body, &[]);
+        assert_eq!(status, 401);
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.contains("unauthorized"), "{text}");
+
+        // Revocation: removing the line from the token file takes
+        // effect on the NEXT request (per-request re-read).
+        std::fs::write(dir.path().join("tokens"), "another-token\n").unwrap();
+        assert_eq!(post(fx.addr, Some("farm-token"), &body, &[]).0, 401);
+
+        // The refused requests never touched the queue.
+        assert_eq!(queue.pending_count().unwrap(), 0);
+        assert!(queue.claim().unwrap().is_none());
+    }
+
+    #[test]
+    fn post_happy_path_writes_one_queue_file_and_answers_the_id() {
+        let (fx, dir) = start_with_gate();
+        let queue = crate::queue::BuildQueue::new(dir.path().join("queue"));
+
+        let (status, head, resp) = post(
+            fx.addr,
+            Some("farm-token"),
+            &request_body("hello-world", "1.2.3", "device-7"),
+            &[],
+        );
+        assert_eq!(status, 202);
+        assert!(head.contains("content-type: application/json"));
+        let parsed: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        let id = parsed["id"].as_str().expect("202 names the request id");
+
+        // The queue holds exactly the request that was POSTed.
+        assert_eq!(queue.pending_count().unwrap(), 1);
+        let claimed = queue.claim().unwrap().expect("the request is claimable");
+        assert_eq!(claimed.id, id);
+        assert_eq!(claimed.request.package, "hello-world");
+        assert_eq!(claimed.request.version, "1.2.3");
+        assert_eq!(claimed.request.requested_by, "device-7");
+    }
+
+    #[test]
+    fn post_malformed_identities_are_400_after_auth() {
+        let (fx, dir) = start_with_gate();
+        let queue = crate::queue::BuildQueue::new(dir.path().join("queue"));
+
+        // Not JSON.
+        let (status, _, _) = post(fx.addr, Some("farm-token"), "not json", &[]);
+        assert_eq!(status, 400);
+        // Package outside the collision-classifier charset.
+        assert_eq!(
+            post(
+                fx.addr,
+                Some("farm-token"),
+                &request_body("Hello_World", "1.2.3", "d"),
+                &[]
+            )
+            .0,
+            400
+        );
+        // Version that is not a plain triple.
+        assert_eq!(
+            post(
+                fx.addr,
+                Some("farm-token"),
+                &request_body("hello", "v1.2.3", "d"),
+                &[]
+            )
+            .0,
+            400
+        );
+        assert_eq!(
+            post(
+                fx.addr,
+                Some("farm-token"),
+                &request_body("hello", "1.2", "d"),
+                &[]
+            )
+            .0,
+            400
+        );
+        // Empty requested_by.
+        assert_eq!(
+            post(
+                fx.addr,
+                Some("farm-token"),
+                &request_body("hello", "1.2.3", ""),
+                &[]
+            )
+            .0,
+            400
+        );
+
+        // Every refusal stayed a refusal: nothing entered the queue.
+        assert_eq!(queue.pending_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn post_enforces_the_body_framing_rules() {
+        let (fx, _) = start_with_gate();
+        let body = request_body("hello-world", "1.2.3", "device-7");
+
+        // No Content-Length: refused before the body matters.
+        let raw = format!(
+            "POST /build-requests HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer farm-token\r\n\r\n{body}"
+        );
+        assert_eq!(http_exchange(fx.addr, raw.as_bytes()).0, 400);
+        // Non-integer Content-Length.
+        let (status, _, _) = post(
+            fx.addr,
+            Some("farm-token"),
+            &body,
+            &[("Content-Length", "abc")],
+        );
+        assert_eq!(status, 400);
+        // Oversize: over the 64 KiB cap is 413 (the head still parses —
+        // the body is never read).
+        let blob = "x".repeat(MAX_BODY_BYTES + 1);
+        let raw = format!(
+            "POST /build-requests HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer farm-token\r\nContent-Length: {}\r\n\r\n{blob}",
+            blob.len()
+        );
+        assert_eq!(http_exchange(fx.addr, raw.as_bytes()).0, 413);
+    }
+
+    #[test]
+    fn the_route_is_off_without_a_token_file() {
+        // The plain fixture configures no gate: POST answers 404 like
+        // any unknown path, whatever the credentials say.
+        let fx = start();
+        let (status, _, _) = post(
+            fx.addr,
+            Some("anything"),
+            &request_body("hello", "1.2.3", "d"),
+            &[],
+        );
+        assert_eq!(status, 404);
+        assert_eq!(post(fx.addr, None, "{}", &[]).0, 404);
+    }
+
+    #[test]
+    fn constant_time_eq_is_exact_equality() {
+        assert!(constant_time_eq(b"token", b"token"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"token", b"tokeN"));
+        assert!(!constant_time_eq(b"token", b"toke"));
+        assert!(!constant_time_eq(b"toke", b"token"));
+        assert!(!constant_time_eq(b"", b"\0\0\0\0\0"));
+        assert!(!constant_time_eq(b"\0\0\0\0\0", b""));
+        assert!(!constant_time_eq(b"a", b"b"));
     }
 }
