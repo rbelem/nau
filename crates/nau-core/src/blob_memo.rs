@@ -101,8 +101,14 @@ pub fn clear_for_tests() {
 mod tests {
     use super::*;
 
+    /// The memo is a process-global; cargo runs this module's tests on
+    /// parallel threads, and a concurrent `clear_for_tests()` wipes any
+    /// in-flight assertion's records. Serialize the tests over the map.
+    static MEMO_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn memoized_sha256_hashes_once_then_serves_the_record() {
+        let _guard = MEMO_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("blob");
@@ -121,6 +127,7 @@ mod tests {
 
     #[test]
     fn invalidate_forces_a_fresh_hash_of_the_new_bytes() {
+        let _guard = MEMO_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("blob");
@@ -144,6 +151,7 @@ mod tests {
 
     #[test]
     fn missing_file_is_an_error_and_records_nothing() {
+        let _guard = MEMO_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("absent");
