@@ -4083,6 +4083,7 @@ fn reconcile_pod_scoped(
         &build.repins,
         &build.deps_pins,
         &build.source_repins,
+        &build.source_validations,
         &state.lock_path,
     )?;
     trace("apply_pin_updates", t);
@@ -4436,12 +4437,21 @@ struct ReconcileBuild {
     /// rebuilt from their recipes even though the active generation
     /// carries content for them.
     recipe_drift_members: std::collections::BTreeSet<String>,
-    /// Floating-source re-resolves (issue #175): `(url, sha256)` pairs
-    /// to restamp into the lockfile's `sources` map — collected only
+    /// Floating-source re-resolves (issue #175): `(url, sha256, etag)`
+    /// triples to restamp into the lockfile's `sources` map — collected only
     /// from floating own packages' builds, applied only after the
     /// installs succeeded, so the TOFU record follows the float without
-    /// ever pinning a rebuild that did not land.
-    source_repins: Vec<(String, String)>,
+    /// ever pinning a rebuild that did not land. The same write sets the
+    /// etag (the probe's when it observed these exact bytes, else `None`)
+    /// and the validation stamp — never the etag alone.
+    source_repins: Vec<(String, String, Option<String>)>,
+    /// Validator re-anchors (float-304 plan): `(url, observed sha, etag)`
+    /// triples from a FULL-200 drift observation that reproduced the
+    /// recorded pin — applied only after the installs succeeded. The
+    /// write re-certifies the recorded sha (a mismatch leaves the entry
+    /// untouched), sets the etag, and stamps `validated_at`; a 304 never
+    /// reaches this bucket (nothing is written from a 304).
+    source_validations: Vec<(String, String, Option<String>)>,
 }
 
 /// Fold the `loads` graph one level deep (issue #8): each loaded pod
@@ -4854,8 +4864,8 @@ fn build_own_package(
             miette::miette!("cannot fetch dependency closure for '{}': {e}", spec.name)
         })?;
     if hold_possible {
-        let observed_source = match observed_from_deps {
-            Some(sha) => Some(sha),
+        let observed_source = match observed_from_deps.as_ref() {
+            Some(obs) => Some(obs.sha256.clone()),
             None => crate::snap::observe_source(meta)?,
         };
         if held_float_at_observed_inputs(
@@ -4878,6 +4888,21 @@ fn build_own_package(
             // reproduced the pin left its fetched_at untouched — the
             // ensure_pod_deps reproduced-pin arm).
             queue_held_deps_verify(ctx, &meta.name, build);
+            // A FULL-200 observation that reproduced the recorded pin
+            // re-anchors the source's validator (etag + validated_at —
+            // the same co-write rule the restamp obeys, minus the sha:
+            // re-certified equal) so the next sync's conditional probe
+            // stays inside the TTL. A 304 writes nothing (nothing was
+            // learned; the 304 never touches the stamp).
+            if let Some(obs) = observed_from_deps.as_ref().filter(|o| !o.unchanged) {
+                if let Some(url) = meta.source.as_ref().map(|s| s.url()) {
+                    build.source_validations.push((
+                        url.to_string(),
+                        obs.sha256.clone(),
+                        obs.etag.clone(),
+                    ));
+                }
+            }
             hold_plain_sync(ctx, meta, build);
             return Ok(());
         }
@@ -4920,11 +4945,25 @@ fn build_own_package(
     // Floating sources (issue #175): the build re-resolved the pin, so
     // the observed hashes restamp the lockfile's `sources` record once
     // the reconcile lands. Loaded packages don't restamp here — their
-    // pod owns the pins.
+    // pod owns the pins. The drift probe's etag rides the restamp only
+    // when both observations agree on the bytes (sha equality proves
+    // the etag describes exactly the built content); a disagreement
+    // (upstream moved mid-sync) records no etag, and a 304 for the
+    // probed url writes NOTHING — the record is already correct and its
+    // recorded etag + stamp stand.
     if meta.floating {
-        build
-            .source_repins
-            .extend(source_infos.into_iter().map(|info| (info.url, info.sha256)));
+        let probe = observed_from_deps.as_ref();
+        let probe_url = meta.source.as_ref().map(|s| s.url());
+        for info in source_infos {
+            let is_probed = probe_url == Some(info.url.as_str());
+            if is_probed && probe.is_some_and(|o| o.unchanged) {
+                continue;
+            }
+            let etag = probe
+                .filter(|o| !o.unchanged && is_probed && o.sha256 == info.sha256)
+                .and_then(|o| o.etag.clone());
+            build.source_repins.push((info.url, info.sha256, etag));
+        }
     }
     build.pending.push(pending);
     Ok(())
@@ -5492,8 +5531,9 @@ fn ensure_refresh_targets_are_members(
 }
 
 /// Apply overlay-driven repins (issue #6), moved dependency-closure
-/// pins (ADR-0017), and floating-source re-resolve restamps (issue
-/// #175) to the lockfile — called only after the installs succeeded, so
+/// pins (ADR-0017), floating-source re-resolve restamps (issue
+/// #175), and validator re-anchors (float-304 plan) to the lockfile —
+/// called only after the installs succeeded, so
 /// a failed reconcile leaves the pins untouched. Recipe-closure stamps
 /// (issue #142) are NOT batched here: they commit incrementally, per
 /// package, as each package's contribution succeeds
@@ -5505,12 +5545,31 @@ fn apply_pin_updates(
     lock: &mut LockFile,
     repins: &[(String, PodPackageLockEntry)],
     deps_pins: &[(String, crate::lock::PackageDepsLock)],
-    source_repins: &[(String, String)],
+    source_repins: &[(String, String, Option<String>)],
+    source_validations: &[(String, String, Option<String>)],
     lock_path: &Path,
 ) -> miette::Result<()> {
-    if repins.is_empty() && deps_pins.is_empty() && source_repins.is_empty() {
+    if repins.is_empty()
+        && deps_pins.is_empty()
+        && source_repins.is_empty()
+        && source_validations.is_empty()
+    {
         return Ok(());
     }
+    stamp_pin_updates(lock, repins, deps_pins, source_repins, source_validations);
+    lock.save(lock_path)
+}
+
+/// The in-memory stamping half of [`apply_pin_updates`] (kept separate
+/// so the save-once contract above stays obvious and the function stays
+/// under the complexity guard).
+fn stamp_pin_updates(
+    lock: &mut LockFile,
+    repins: &[(String, PodPackageLockEntry)],
+    deps_pins: &[(String, crate::lock::PackageDepsLock)],
+    source_repins: &[(String, String, Option<String>)],
+    source_validations: &[(String, String, Option<String>)],
+) {
     for (name, entry) in repins {
         lock.packages.insert(name.clone(), entry.clone());
     }
@@ -5530,15 +5589,30 @@ fn apply_pin_updates(
             );
         }
     }
-    for (url, sha256) in source_repins {
+    for (url, sha256, etag) in source_repins {
         lock.sources.insert(
             url.clone(),
             crate::lock::SourceLockEntry {
                 sha256: sha256.clone(),
+                // Co-write invariant: the same write sets the etag (the
+                // probe's when it observed these exact bytes) and the
+                // validation stamp — never the etag alone.
+                etag: etag.clone(),
+                validated_at: Some(crate::lock::now_unix()),
             },
         );
     }
-    lock.save(lock_path)
+    for (url, observed_sha, etag) in source_validations {
+        // Validation refresh: re-certify the recorded sha (a mismatch
+        // leaves the entry untouched — never mask a moved pin) and
+        // re-anchor its validator inside the TTL.
+        if let Some(entry) = lock.sources.get_mut(url) {
+            if entry.sha256 == *observed_sha {
+                entry.etag = etag.clone();
+                entry.validated_at = Some(crate::lock::now_unix());
+            }
+        }
+    }
 }
 
 /// Remove store packages the declaration dropped. Removal never
@@ -6673,33 +6747,122 @@ fn record_dep_payload_digest(payload: &Path, sha3_384: &str) -> miette::Result<(
 /// auto-fetch). `force_float` floats the closure regardless of the
 /// meta's own float mode — the `pod rebuild --latest` seam (issue #15,
 /// ADR-0017 Decision 5). Returns the pin to merge into the lockfile plus
-/// the OBSERVED sha256 of the source tarball when the closure
-/// re-resolve downloaded one (the float hold's drift observation,
-/// ADR-0017 Decision 4a — reused so the sync never downloads the source
-/// twice); `None` when the package declares no deps or nothing was
-/// fetched.
+/// the OBSERVED source (`sha256` + etag; `unchanged` marks a 304
+/// short-circuit) when the closure re-resolve downloaded or 304-
+/// certified one (the float hold's drift observation, ADR-0017 Decision
+/// 4a — reused so the sync never downloads the source twice); `None`
+/// when the package declares no deps or nothing was fetched.
 fn ensure_own_deps(
     store: &crate::runtime::RuntimeStore,
     lock: &LockFile,
     meta: &crate::snap::SnapMeta,
     pkg_name: &str,
     force_float: bool,
-) -> miette::Result<(Option<crate::lock::PackageDepsLock>, Option<String>)> {
+) -> miette::Result<(
+    Option<crate::lock::PackageDepsLock>,
+    Option<crate::dep_fetch::SourceObserved>,
+)> {
     if meta.deps.is_none() {
         return Ok((None, None));
     }
     let prev = lock.packages.get(pkg_name).and_then(|e| e.deps.clone());
     let floating = force_float || meta.floating;
     let recipe_dir = crate::deps::recipe_dir(pkg_name);
+    let validators = float_source_validators(lock, meta);
     crate::dep_fetch::ensure_pod_deps(
         &store.blob_store(),
         meta,
         prev.as_ref(),
         floating,
         recipe_dir.as_deref(),
+        validators,
     )
-    .map(|(pin, observed_source)| (Some(pin), observed_source))
+    .map(|(pin, observed)| (Some(pin), observed))
     .map_err(|e| miette::miette!("package '{pkg_name}': {e}"))
+}
+
+/// The kill switch for the conditional drift probe (float-304 plan):
+/// `NAU_DISABLE_CONDITIONAL_PROBE` set in the environment forces every
+/// float's source observation through a plain full GET (validators are
+/// never constructed).
+fn conditional_probe_disabled() -> bool {
+    std::env::var_os("NAU_DISABLE_CONDITIONAL_PROBE").is_some()
+}
+
+/// Why a floating source cannot ride a conditional 304 probe this sync
+/// and falls back to a plain full GET — the `drift probe` telemetry's
+/// reason vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeSkip {
+    NoEtag,
+    WeakEtag,
+    TtlExpired,
+    UrlMoved,
+    Disabled,
+}
+
+impl ProbeSkip {
+    fn as_str(self) -> &'static str {
+        match self {
+            ProbeSkip::NoEtag => "no-etag",
+            ProbeSkip::WeakEtag => "weak-etag",
+            ProbeSkip::TtlExpired => "ttl-expired",
+            ProbeSkip::UrlMoved => "url-moved",
+            ProbeSkip::Disabled => "disabled",
+        }
+    }
+}
+
+/// Validators for the conditional drift probe of a FLOATING package's
+/// single http(s) source (float-304 plan): the lock's `sources` record
+/// under the CURRENT url — a map hit proves the url unmoved — carrying a
+/// strong etag whose validation stamp sits inside the 7-day TTL. Any
+/// other case (`None` here) probes with a plain full GET, and one
+/// `drift probe` telemetry line names the reason: fixed pins never probe
+/// at all (no line, no behavior change), while a probed float with no
+/// usable validator logs `full fetch (<reason>)`.
+fn float_source_validators(
+    lock: &LockFile,
+    meta: &crate::snap::SnapMeta,
+) -> Option<nau_core::lock::SourceValidators> {
+    if !meta.floating {
+        // Fixed pin: no drift probe, no telemetry, no behavior change.
+        return None;
+    }
+    if conditional_probe_disabled() {
+        probe_full_fetch_line(meta, ProbeSkip::Disabled);
+        return None;
+    }
+    let url = meta.source.as_ref().map(|s| s.url().to_string())?;
+    let Some(entry) = lock.sources.get(&url) else {
+        probe_full_fetch_line(meta, ProbeSkip::UrlMoved);
+        return None;
+    };
+    if entry.etag.is_none() {
+        probe_full_fetch_line(meta, ProbeSkip::NoEtag);
+        return None;
+    }
+    if entry.etag.as_deref().is_some_and(|e| e.starts_with("W/")) {
+        probe_full_fetch_line(meta, ProbeSkip::WeakEtag);
+        return None;
+    }
+    if entry.validated_at.is_none_or(|at| {
+        nau_core::lock::now_unix().saturating_sub(at) > nau_core::lock::VALIDATOR_TTL_SECS
+    }) {
+        probe_full_fetch_line(meta, ProbeSkip::TtlExpired);
+        return None;
+    }
+    entry.validators(nau_core::lock::now_unix())
+}
+
+/// The `drift probe` telemetry line for a probed float that falls back
+/// to a plain full GET (nau_infra::output; suppressed in JSON mode).
+fn probe_full_fetch_line(meta: &crate::snap::SnapMeta, reason: ProbeSkip) {
+    nau_infra::output::info(format!(
+        "drift probe '{}': full fetch ({})",
+        meta.name,
+        reason.as_str()
+    ));
 }
 
 /// Shape a built, content-hashed payload as a [`PendingSnap`] at the
@@ -6870,12 +7033,14 @@ pub fn fetch_pod_deps(
         }
         let old_hash = prev.as_ref().map(|p| p.deps_hash.clone());
         let recipe_dir = crate::deps::recipe_dir(&spec.name);
-        let (pin, _observed_source) = crate::dep_fetch::ensure_pod_deps(
+        let validators = float_source_validators(&lock, &meta);
+        let (pin, _observed) = crate::dep_fetch::ensure_pod_deps(
             &store.blob_store(),
             &meta,
             prev.as_ref(),
             floating,
             recipe_dir.as_deref(),
+            validators,
         )
         .map_err(|e| miette::miette!("package '{}': {e}", spec.name))?;
         let changed = old_hash.as_deref() != Some(pin.deps_hash.as_str());
@@ -8294,6 +8459,8 @@ pod {
             url.to_string(),
             crate::lock::SourceLockEntry {
                 sha256: "observed-sha".to_string(),
+                etag: None,
+                validated_at: None,
             },
         );
         let build = ReconcileBuild::default();
@@ -8323,6 +8490,8 @@ pod {
             url.to_string(),
             crate::lock::SourceLockEntry {
                 sha256: "recorded-sha".to_string(),
+                etag: None,
+                validated_at: None,
             },
         );
         let build = ReconcileBuild::default();
@@ -10167,5 +10336,136 @@ pod {
         .unwrap();
         let body = std::fs::read_to_string(&path).unwrap();
         assert_eq!(body, "{}");
+    }
+
+    // ── Conditional drift probe (float-304 plan) ──
+
+    /// The validator-extraction gate, end to end in one test (the env
+    /// kill switch is process-global, so every case shares one thread):
+    /// a floating meta with a strong fresh validator passes; the kill
+    /// switch, a moved url, a missing/weak etag, an expired stamp, and a
+    /// fixed (non-floating) pin all fall back to a plain full GET.
+    #[test]
+    fn float_source_validators_gate() {
+        let url = "https://example.invalid/tool.tar.gz";
+        let mut meta = floating_meta("1.0");
+        meta.source = Some(crate::snap::SourceSpec::Pinned {
+            url: url.to_string(),
+            sha256: "seed".to_string(),
+        });
+        let mut lock = LockFile::empty();
+        lock.sources.insert(
+            url.to_string(),
+            crate::lock::SourceLockEntry {
+                sha256: "observed-sha".to_string(),
+                etag: Some("\"v1\"".to_string()),
+                validated_at: Some(crate::lock::now_unix()),
+            },
+        );
+
+        // Fresh + strong: validators ride the probe.
+        let v = float_source_validators(&lock, &meta).unwrap();
+        assert_eq!(v.etag, "\"v1\"");
+        assert_eq!(v.recorded_sha256, "observed-sha");
+
+        // Kill switch set: validators are never constructed.
+        std::env::set_var("NAU_DISABLE_CONDITIONAL_PROBE", "1");
+        assert!(float_source_validators(&lock, &meta).is_none());
+        std::env::remove_var("NAU_DISABLE_CONDITIONAL_PROBE");
+
+        // URL moved: no `sources` entry under the current url.
+        assert!(float_source_validators(&LockFile::empty(), &meta).is_none());
+
+        // No etag recorded yet.
+        let mut bare = lock.clone();
+        bare.sources.get_mut(url).unwrap().etag = None;
+        assert!(float_source_validators(&bare, &meta).is_none());
+
+        // Weak etag: rejected → treated as absent.
+        let mut weak = lock.clone();
+        weak.sources.get_mut(url).unwrap().etag = Some("W/\"weak\"".to_string());
+        assert!(float_source_validators(&weak, &meta).is_none());
+
+        // Stamp older than the TTL: expired.
+        let mut stale = lock.clone();
+        stale.sources.get_mut(url).unwrap().validated_at =
+            Some(crate::lock::now_unix() - crate::lock::VALIDATOR_TTL_SECS - 1);
+        assert!(float_source_validators(&stale, &meta).is_none());
+
+        // Fixed pin: never probed at all (no behavior change).
+        let mut fixed = meta.clone();
+        fixed.floating = false;
+        assert!(float_source_validators(&lock, &fixed).is_none());
+    }
+
+    /// The co-write helper's contract at the apply site: a validation
+    /// refresh re-certifies the recorded sha (equal → etag + stamp move;
+    /// different → the entry is untouched) and a restamp sets sha, etag,
+    /// and validated_at in ONE write.
+    #[test]
+    fn apply_pin_updates_cowrites_sha_etag_and_stamp() {
+        let mut lock = LockFile::empty();
+        lock.sources.insert(
+            "https://example.invalid/a.tar.gz".to_string(),
+            crate::lock::SourceLockEntry {
+                sha256: "old-sha".to_string(),
+                etag: Some("\"old\"".to_string()),
+                validated_at: Some(1),
+            },
+        );
+
+        // Restamp: the same write sets sha + etag + validated_at.
+        stamp_pin_updates(
+            &mut lock,
+            &[],
+            &[],
+            &[(
+                "https://example.invalid/a.tar.gz".to_string(),
+                "new-sha".to_string(),
+                Some("\"new\"".to_string()),
+            )],
+            &[],
+        );
+        let entry = &lock.sources["https://example.invalid/a.tar.gz"];
+        assert_eq!(entry.sha256, "new-sha");
+        assert_eq!(entry.etag.as_deref(), Some("\"new\""));
+        assert!(
+            entry.validated_at.is_some_and(|at| at > 1),
+            "the restamp re-anchors the stamp"
+        );
+
+        // Validation refresh, matching sha: etag + stamp move, sha
+        // untouched.
+        stamp_pin_updates(
+            &mut lock,
+            &[],
+            &[],
+            &[],
+            &[(
+                "https://example.invalid/a.tar.gz".to_string(),
+                "new-sha".to_string(),
+                Some("\"newer\"".to_string()),
+            )],
+        );
+        let entry = &lock.sources["https://example.invalid/a.tar.gz"];
+        assert_eq!(entry.sha256, "new-sha", "a refresh never moves the pin");
+        assert_eq!(entry.etag.as_deref(), Some("\"newer\""));
+
+        // Validation refresh, MISMATCHED sha: the entry is untouched —
+        // never mask a moved pin.
+        stamp_pin_updates(
+            &mut lock,
+            &[],
+            &[],
+            &[],
+            &[(
+                "https://example.invalid/a.tar.gz".to_string(),
+                "moved-sha".to_string(),
+                Some("\"sneaky\"".to_string()),
+            )],
+        );
+        let entry = &lock.sources["https://example.invalid/a.tar.gz"];
+        assert_eq!(entry.sha256, "new-sha");
+        assert_eq!(entry.etag.as_deref(), Some("\"newer\""));
     }
 }

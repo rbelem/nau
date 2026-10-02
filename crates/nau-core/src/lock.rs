@@ -51,6 +51,71 @@ pub struct LockFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceLockEntry {
     pub sha256: String,
+
+    /// The HTTP validator (ETag) the server returned for the response the
+    /// `sha256` was observed in, verbatim as received (quoted form
+    /// included, never normalized). Present only when a fetch captured it;
+    /// drives the conditional drift probe of floating sources (the 304
+    /// plan): a 304 under this etag certifies `sha256` unchanged. Co-write
+    /// invariant: patched only by the same write that (re)sets `sha256` —
+    /// never independently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+
+    /// Unix epoch seconds of the last FULL (status 200) fetch of the
+    /// source — the freshness anchor of the conditional probe's TTL. A
+    /// 304 never touches it. Co-write invariant: patched only by the same
+    /// write that (re)sets `sha256`, or by a validation refresh that
+    /// re-certifies the recorded `sha256` unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validated_at: Option<u64>,
+}
+
+/// How long a recorded source validator ([`SourceLockEntry::etag`] plus
+/// [`SourceLockEntry::validated_at`]) may drive conditional 304 probes
+/// before a full GET must re-anchor it. Bounds etag rot (a CDN whose etag
+/// outlives its content) and, with it, how long a 304 short-circuit can
+/// stand in for a real re-resolve.
+pub const VALIDATOR_TTL_SECS: u64 = 7 * 24 * 3600;
+
+/// The conditional-GET validator pair a previous full fetch recorded for
+/// a source: the etag verbatim, paired with the sha256 observed in the
+/// SAME response — so a 304 under this etag certifies `recorded_sha256`
+/// unchanged without downloading a byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceValidators {
+    pub etag: String,
+    pub recorded_sha256: String,
+}
+
+impl SourceLockEntry {
+    /// The probe validators this entry can offer at `now`, or `None` when
+    /// the entry carries no etag, only a weak one (`W/` prefix — never
+    /// probed against), or its validation stamp is older than
+    /// [`VALIDATOR_TTL_SECS`] (a full GET must re-anchor it).
+    pub fn validators(&self, now: u64) -> Option<SourceValidators> {
+        let etag = self.etag.as_deref()?;
+        if etag.starts_with("W/") {
+            return None;
+        }
+        let validated_at = self.validated_at?;
+        if now.saturating_sub(validated_at) > VALIDATOR_TTL_SECS {
+            return None;
+        }
+        Some(SourceValidators {
+            etag: etag.to_string(),
+            recorded_sha256: self.sha256.clone(),
+        })
+    }
+}
+
+/// Unix epoch seconds for the current instant (no chrono dependency —
+/// the same source [`crate::lock`]'s `validated_at` stamps use).
+pub fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// A single package-input entry in the lockfile.
@@ -348,6 +413,8 @@ mod tests {
             SourceLockEntry {
                 sha256: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
                     .to_string(),
+                etag: None,
+                validated_at: None,
             },
         );
 
@@ -398,6 +465,8 @@ mod tests {
             "https://example.com/pkg.tar.gz".to_string(),
             SourceLockEntry {
                 sha256: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into(),
+                etag: None,
+                validated_at: None,
             },
         );
 
@@ -768,5 +837,100 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(entries.len(), 2, "only lockfile + blocker, no temp residue");
+    }
+
+    #[test]
+    fn test_source_entry_without_validator_fields_backcompat() {
+        // Pre-304-plan source entries carry no etag/validated_at — they
+        // must still load, reading as "no probe validator" (full GET).
+        let json = r#"{
+            "version": 1,
+            "sources": {
+                "https://example.com/src.tar.gz": {
+                    "sha256": "abc123"
+                }
+            }
+        }"#;
+        let lock: LockFile = serde_json::from_str(json).unwrap();
+        let entry = &lock.sources["https://example.com/src.tar.gz"];
+        assert_eq!(entry.sha256, "abc123");
+        assert!(entry.etag.is_none(), "absent etag loads as None");
+        assert!(entry.validated_at.is_none(), "absent stamp loads as None");
+        assert!(
+            entry.validators(now_unix()).is_none(),
+            "no validator fields → no probe validators"
+        );
+    }
+
+    #[test]
+    fn test_source_entry_validator_fields_roundtrip_verbatim() {
+        // The etag is stored verbatim (quoted form included, never
+        // normalized) beside its validation stamp, and survives a
+        // serialize → parse round-trip unchanged.
+        let mut sources = HashMap::new();
+        sources.insert(
+            "https://example.com/src.tar.gz".to_string(),
+            SourceLockEntry {
+                sha256: "abc123".to_string(),
+                etag: Some("\"33a64df551425fcc\"".to_string()),
+                validated_at: Some(1_800_000_000),
+            },
+        );
+        let lock = LockFile {
+            version: 1,
+            sources,
+            snaps: HashMap::new(),
+            inputs: HashMap::new(),
+            packages: HashMap::new(),
+            build_deps: HashMap::new(),
+        };
+        let json = serde_json::to_string_pretty(&lock).unwrap();
+        assert!(json.contains("\"etag\""), "etag serializes");
+        assert!(json.contains("\"validated_at\""), "stamp serializes");
+        assert!(
+            json.contains("\\\"33a64df551425fcc\\\""),
+            "the quoted etag form must survive verbatim: {json}"
+        );
+        let back: LockFile = serde_json::from_str(&json).unwrap();
+        let entry = &back.sources["https://example.com/src.tar.gz"];
+        assert_eq!(entry.etag.as_deref(), Some("\"33a64df551425fcc\""));
+        assert_eq!(entry.validated_at, Some(1_800_000_000));
+
+        // A fresh entry's validators carry the etag + the recorded sha.
+        let validators = entry.validators(1_800_000_100).unwrap();
+        assert_eq!(validators.etag, "\"33a64df551425fcc\"");
+        assert_eq!(validators.recorded_sha256, "abc123");
+    }
+
+    #[test]
+    fn test_source_validators_reject_weak_etag_and_expired_stamp() {
+        let entry = |etag: Option<&str>, validated_at: Option<u64>| SourceLockEntry {
+            sha256: "abc123".to_string(),
+            etag: etag.map(str::to_string),
+            validated_at,
+        };
+        let now = 1_800_000_000;
+        // A weak etag (`W/` prefix) is rejected → treated as absent, so a
+        // conditional probe never sends it.
+        assert!(entry(Some("W/\"weak-1\""), Some(now))
+            .validators(now)
+            .is_none());
+        // No etag, no stamp: nothing to probe with.
+        assert!(entry(None, Some(now)).validators(now).is_none());
+        assert!(entry(Some("\"strong\""), None).validators(now).is_none());
+        // Exactly at the TTL boundary it is still valid; one second past
+        // it has expired (a full GET must re-anchor).
+        assert!(entry(Some("\"strong\""), Some(now - VALIDATOR_TTL_SECS))
+            .validators(now)
+            .is_some());
+        assert!(
+            entry(Some("\"strong\""), Some(now - VALIDATOR_TTL_SECS - 1))
+                .validators(now)
+                .is_none()
+        );
+        // A stamp from the future does not panic (saturating compare).
+        assert!(entry(Some("\"strong\""), Some(now + 60))
+            .validators(now)
+            .is_some());
     }
 }

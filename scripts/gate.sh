@@ -67,6 +67,17 @@ echo "gate: CXX=$CXX"
 # get somewhat slower and target/ stays small.
 export CARGO_INCREMENTAL=0
 
+# The workspace links TWO copies of the same luau736 C++ objects —
+# mlua's luau0-src and nau-chart's vendored analyzer build — and the
+# gcc14 wrapper's binutils 2.46 ld rejects their duplicate strong
+# symbols (`Luau::Config::… multiple definition`) where the build Host's
+# other toolchains merged them (nixpkgs#gcc15 links the same tree green;
+# proven on the pristine tree, 2026-10-02). The two copies are compiled
+# from identical sources, so first-definition-wins is byte-equivalent:
+# relax duplicate-symbol resolution for GATE links only. Normal builds
+# keep strict linking.
+export RUSTFLAGS="${RUSTFLAGS:-} -Clink-arg=-Wl,--allow-multiple-definition"
+
 # ── Gated-suite tool preflight (#291): a tool absent in the gate is a
 # FAIL, not a silent skip. The gated tests check NAU_GATE=1 too, so
 # a run that enters here without the outer provisioning still cannot

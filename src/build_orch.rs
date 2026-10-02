@@ -1370,6 +1370,11 @@ fn persist_new_sources(
                 info.url.clone(),
                 SourceLockEntry {
                     sha256: info.sha256.clone(),
+                    // TOFU record from this build's full download: the
+                    // build path captures no etag, so the entry probes
+                    // with a full GET until a fetch records one.
+                    etag: None,
+                    validated_at: Some(crate::lock::now_unix()),
                 },
             );
             changed = true;

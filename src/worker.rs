@@ -740,6 +740,10 @@ fn materialize_root(manifest: &JobManifest) -> miette::Result<tempfile::TempDir>
             pin.url.clone(),
             crate::lock::SourceLockEntry {
                 sha256: pin.sha256.clone(),
+                // A pin copy, not a fetch: the worker reproduces the
+                // dispatcher's recorded pin and learns no validator.
+                etag: None,
+                validated_at: None,
             },
         );
     }
