@@ -1244,17 +1244,57 @@ fn loaded_contribution(root: &Path, pod_name: &str) -> miette::Result<LoadedCont
                     )
                 })
                 .collect();
-            for (name, declared) in declared_contribution(root, pod_name, &decl)? {
-                match packages.entry(name) {
-                    std::collections::btree_map::Entry::Vacant(e) => {
-                        e.insert(declared);
-                    }
+            // Unchanged-generation fold (issue #331, secondary): a name
+            // the generation carries needs only its declared CONSTRAINT
+            // — the line the re-resolution must select (ADR-0047) — and
+            // that parses from the spec string. The live recipe eval
+            // (collection read + overlay apply) runs only for a
+            // declared name the generation does NOT carry. Output is
+            // identical to folding the declaration live — the
+            // generation's version wins every clash (issue #103) and an
+            // overlay never alters the constraint — but an unchanged
+            // loaded generation no longer re-evaluates its whole
+            // declaration (collection evals included) on every sync,
+            // and a generation-carried name whose collection entry
+            // since vanished (or stopped resolving) no longer fails the
+            // LOADING pod's sync.
+            for spec_str in &decl.packages {
+                let spec = parse_pod_package(spec_str)?;
+                match packages.entry(spec.name.clone()) {
                     std::collections::btree_map::Entry::Occupied(mut e) => {
-                        // The generation's version wins (issue #103);
-                        // the constraint still follows the declaration
-                        // so the re-resolution selects the same line.
-                        e.get_mut().constraint = declared.constraint;
+                        e.get_mut().constraint = spec.constraint;
                     }
+                    std::collections::btree_map::Entry::Vacant(e) => {
+                        let mut meta = load_spec_meta(&spec).map_err(|err| {
+                            miette::miette!(
+                                "cannot resolve loaded pod '{}' package '{}': {err}",
+                                pod_name,
+                                spec.name
+                            )
+                        })?;
+                        if let Some(patch) = decl.overlay.get(&spec.name) {
+                            apply_overlay(&mut meta, patch).map_err(|err| {
+                                miette::miette!(
+                                    "pod '{pod_name}' overlay of '{}' is invalid: {err}",
+                                    spec.name
+                                )
+                            })?;
+                        }
+                        e.insert(ContributedPkg {
+                            version: Some(meta.version),
+                            constraint: spec.constraint,
+                            source_pod: None,
+                        });
+                    }
+                }
+            }
+            // Sub-loads fold in beneath with `or_insert` — only names
+            // still missing can land, so the recursion keeps the same
+            // precedence it always had (ADR-0048).
+            for loaded in &decl.loads {
+                let sub = loaded_contribution(root, loaded)?;
+                for (name, pkg) in sub.packages {
+                    packages.entry(name).or_insert(pkg);
                 }
             }
             // Generation-only names: the lockfile pin's constraint is
@@ -3125,6 +3165,30 @@ fn held_at_content(
         .is_some_and(|d| d == digest)
 }
 
+/// True when a plain sync should hold a package at its pin even though
+/// the installed record predates build-input digest stamping (issue
+/// #113 `None`, the bridge arm of the #331 elimination): the pin exists
+/// and equals both the collection candidate and the installed version —
+/// pin, candidate, and generation all agree, so the pin IS the
+/// resolution and no local state is ambiguous. The strict digest
+/// contract stays intact for every record that HAS a digest: a recorded
+/// mismatch never takes this bridge.
+fn held_at_undigested_pin(
+    lock: &LockFile,
+    name: &str,
+    meta_version: &str,
+    active: Option<&crate::runtime::Generation>,
+) -> bool {
+    lock.packages.get(name).is_some_and(|pin| {
+        pin.version == meta_version
+            && active.is_some_and(|g| {
+                g.packages
+                    .get(name)
+                    .is_some_and(|p| p.version == pin.version && p.meta_digest.is_none())
+            })
+    })
+}
+
 /// The plain-sync hold body: record the hold (issue #5, issue #113) and
 /// contribute the installed record's claims so the generation still
 /// presents the package's desktop IDs and binaries.
@@ -3514,6 +3578,26 @@ fn scope_own_package(
         // The hold never reads the deps blob, so re-verify the recorded
         // closure pin first (issue #125): corrupted or missing store
         // content fails the sync loud instead of riding along.
+        verify_held_deps_blob(ctx, &meta.name)?;
+        return Ok(hold_plain_sync(ctx, meta, build));
+    }
+    // Pin-bridge hold (issue #331, plain sync only): the pin and the
+    // generation AGREE — pin == candidate == installed version — but the
+    // installed record predates build-input digest stamping (issue #113
+    // `None`), so the content hold above can never fire and the package
+    // would rebuild (source download included) on EVERY sync. The pin is
+    // the resolution: the collection candidate already matches it and
+    // the generation carries it, so the hold keeps the store content
+    // exactly like the version-move pin hold. A recorded digest that
+    // mismatches still rebuilds (the strict #113 check), and `pod
+    // refresh` / `pod rebuild` remain the deliberate moves; the deps
+    // blob re-verifies fail-closed like every hold (issue #125).
+    if !drifted
+        && !scoped
+        && !overlay
+        && build.refresh_members.is_empty()
+        && held_at_undigested_pin(ctx.lock, &meta.name, &meta.version, ctx.active)
+    {
         verify_held_deps_blob(ctx, &meta.name)?;
         return Ok(hold_plain_sync(ctx, meta, build));
     }
@@ -4462,7 +4546,13 @@ fn collect_loaded_packages(
         // requires members in THIS pod's store too — held members
         // included, so their libraries stay carried.
         build.requires_seeds.extend(meta.requires.iter().cloned());
-        if let Some(installed) = loaded_hold_record(ctx, &meta, build) {
+        if let Some(installed) = loaded_hold_record(
+            ctx,
+            contributed.source_pod.as_deref(),
+            decl.overlay.contains_key(&meta.name),
+            &meta,
+            build,
+        )? {
             hold_loaded_member(
                 ctx,
                 contributed.source_pod.as_deref(),
@@ -4494,21 +4584,79 @@ fn pin_loaded_version(meta: &mut crate::snap::SnapMeta, contributed: &Contribute
 /// layer down — `None` digests never match), the member is not a
 /// `pod refresh` target and not a recipe-drift rebuild, and it is not
 /// floating. Returns the installed record to materialize claims from.
+///
+/// Content-identity hold (issue #331): a drifted re-resolution alone
+/// must not rebuild a member whose content the DECLARING pod's active
+/// generation still executes byte-identically. When the declaring pod's
+/// manifest records the member at the same version, the same payload
+/// hash, and the same build-input digest the installed record carries,
+/// the member's content has not moved — the rebuild would reproduce
+/// identical bytes (deterministic builds), so the hold keeps the store
+/// content and skips the source download. Any declaring-pod move (its
+/// own sync re-stamps the manifest), a digest-None installed record, or
+/// this pod's own overlay on the member falls back to the strict
+/// re-resolution check: fail-closed, never guessed.
 fn loaded_hold_record<'a>(
     ctx: &ReconcileCtx<'a>,
+    source_pod: Option<&str>,
+    own_overlay: bool,
     meta: &crate::snap::SnapMeta,
     build: &ReconcileBuild,
-) -> Option<&'a crate::runtime::InstalledPackage> {
+) -> miette::Result<Option<&'a crate::runtime::InstalledPackage>> {
     if meta.floating
         || build.refresh_members.contains(&meta.name)
         || build.recipe_drift_members.contains(&meta.name)
     {
-        return None;
+        return Ok(None);
     }
-    let installed = ctx.active?.packages.get(&meta.name)?;
+    let installed = match ctx.active.and_then(|g| g.packages.get(&meta.name)) {
+        Some(installed) => installed,
+        None => return Ok(None),
+    };
+    if installed.version != meta.version {
+        return Ok(None);
+    }
     let digest = meta.build_input_digest();
-    (installed.version == meta.version && installed.meta_digest.as_deref() == Some(digest.as_str()))
-        .then_some(installed)
+    if installed.meta_digest.as_deref() == Some(digest.as_str()) {
+        return Ok(Some(installed));
+    }
+    // The re-resolved inputs drifted from the installed record. Hold
+    // anyway only when the content is provably the declaring pod's
+    // executing content (see the doc above); otherwise rebuild.
+    if own_overlay || installed.meta_digest.is_none() {
+        return Ok(None);
+    }
+    let Some(recorded) = declaring_pod_member_record(ctx, source_pod, &meta.name)? else {
+        return Ok(None);
+    };
+    if recorded.version == installed.version
+        && recorded.sha3_384 == installed.sha3_384
+        && recorded.meta_digest == installed.meta_digest
+    {
+        Ok(Some(installed))
+    } else {
+        Ok(None)
+    }
+}
+
+/// The declaring pod's active-generation record for one contributed
+/// member (issue #331): the content identity the member must still
+/// match for the loaded hold to skip its rebuild. `None` when there is
+/// no declaring pod or its active generation does not carry the member;
+/// an unreadable declaring store is an ERROR — we cannot know whether
+/// the content moved, so the hold must not fire.
+fn declaring_pod_member_record(
+    ctx: &ReconcileCtx<'_>,
+    source_pod: Option<&str>,
+    name: &str,
+) -> miette::Result<Option<crate::runtime::InstalledPackage>> {
+    let Some(pod) = source_pod else {
+        return Ok(None);
+    };
+    let store = pod_store(&pod_dir(ctx.root, pod));
+    Ok(store
+        .active_generation()?
+        .and_then(|g| g.packages.get(name).cloned()))
 }
 
 /// The loaded-member hold body (ADR-0048): re-verify the recorded deps
@@ -6704,20 +6852,30 @@ pod {
         assert!(matches!(scope, OwnScope::Build));
     }
 
-    /// A pre-#113 manifest carries no digest: it never holds — the
-    /// first sync rebuilds once and records the digest, and the NEXT
-    /// plain sync holds on the identical recipe.
+    /// A pre-#113 manifest carries no digest. The pin-bridge hold (issue
+    /// #331): when the lockfile pin, the collection candidate, and the
+    /// installed version all AGREE, the pin IS the resolution — the
+    /// plain sync holds without the rebuild the missing digest used to
+    /// force on EVERY sync (source download included). A recorded
+    /// digest that mismatches still rebuilds (the strict #113 check),
+    /// and a digested identical record holds through the content hold.
     #[test]
-    fn test_manifest_without_a_digest_rebuilds_once_then_holds() {
+    fn test_manifest_without_a_digest_holds_when_the_pin_agrees() {
         let mut meta = bare_meta("tool", "1.0");
+        // Undigested installed record + agreeing pin → the bridge holds.
         let mut fixture = hold_fixture(installed_tool(None));
         let mut build = ReconcileBuild::default();
         let scope =
             scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build).unwrap();
-        assert!(matches!(scope, OwnScope::Build));
+        assert!(matches!(scope, OwnScope::Held));
+        assert_eq!(build.held, vec!["tool".to_string()]);
+        assert!(
+            build.pending.is_empty(),
+            "the bridge hold must not queue a build: {:?}",
+            build.pending
+        );
 
-        // The rebuild records its digest on the installed record —
-        // simulated here by reinstalling the fixture with the digest.
+        // The digested record holds through the content hold (unchanged).
         let mut fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
         let mut build = ReconcileBuild::default();
         let scope =
@@ -6983,7 +7141,8 @@ pod {
         let mut fixture = hold_fixture(installed_loaded_tool(Some(meta.build_input_digest())));
         let ctx = fixture.ctx();
         let mut build = ReconcileBuild::default();
-        let installed = loaded_hold_record(&ctx, &meta, &build)
+        let installed = loaded_hold_record(&ctx, None, false, &meta, &build)
+            .expect("the hold decision must not error")
             .expect("a digest-matching loaded member must hold");
         hold_loaded_member(&ctx, None, installed, &meta, &mut build).unwrap();
         assert_eq!(build.held, vec!["tool".to_string()]);
@@ -7018,7 +7177,9 @@ pod {
         let mut fixture = hold_fixture(installed_loaded_tool(Some(meta.build_input_digest())));
         let build = ReconcileBuild::default();
         assert!(
-            loaded_hold_record(&fixture.ctx(), &meta, &build).is_none(),
+            loaded_hold_record(&fixture.ctx(), None, false, &meta, &build)
+                .unwrap()
+                .is_none(),
             "a floating loaded member must rebuild"
         );
     }
@@ -7035,7 +7196,9 @@ pod {
             ..Default::default()
         };
         assert!(
-            loaded_hold_record(&fixture.ctx(), &meta, &build).is_none(),
+            loaded_hold_record(&fixture.ctx(), None, false, &meta, &build)
+                .unwrap()
+                .is_none(),
             "a refresh-named loaded member must rebuild"
         );
 
@@ -7044,7 +7207,9 @@ pod {
             ..Default::default()
         };
         assert!(
-            loaded_hold_record(&fixture.ctx(), &meta, &build).is_none(),
+            loaded_hold_record(&fixture.ctx(), None, false, &meta, &build)
+                .unwrap()
+                .is_none(),
             "a recipe-drifted loaded member must rebuild"
         );
     }
@@ -7062,7 +7227,9 @@ pod {
         let mut fixture = hold_fixture(moved);
         let build = ReconcileBuild::default();
         assert!(
-            loaded_hold_record(&fixture.ctx(), &meta, &build).is_none(),
+            loaded_hold_record(&fixture.ctx(), None, false, &meta, &build)
+                .unwrap()
+                .is_none(),
             "a version mismatch must rebuild"
         );
 
@@ -7071,9 +7238,217 @@ pod {
         let mut fixture = hold_fixture(installed_loaded_tool(None));
         let build = ReconcileBuild::default();
         assert!(
-            loaded_hold_record(&fixture.ctx(), &meta, &build).is_none(),
+            loaded_hold_record(&fixture.ctx(), None, false, &meta, &build)
+                .unwrap()
+                .is_none(),
             "a digest-less manifest must rebuild once"
         );
+    }
+
+    // ── Content-identity loaded hold (issue #331) ──
+
+    /// Materialize a declaring pod's state root under the fixture dir:
+    /// its active generation carries exactly `record` — the content the
+    /// loaded pod EXECUTES, which [`loaded_hold_record`] cross-checks.
+    fn pin_declaring_pod_generation(
+        fixture: &HoldFixture,
+        pod: &str,
+        record: &crate::runtime::InstalledPackage,
+    ) {
+        let state = fixture._dir.path().join(pod);
+        let gen_dir = state.join("generations").join("1");
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        let gen = gen_with_record(record.clone());
+        std::fs::write(
+            gen_dir.join("manifest.json"),
+            serde_json::to_string(&gen).unwrap(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("generations/1", state.join("active")).unwrap();
+    }
+
+    /// A drifted re-resolution alone must not rebuild a loaded member
+    /// whose content the DECLARING pod's active generation still
+    /// executes byte-identically (issue #331): same version, same
+    /// payload hash, same recorded build-input digest on both sides —
+    /// the rebuild would reproduce identical bytes, so the hold keeps
+    /// the store content and skips the source download.
+    #[test]
+    fn test_loaded_member_holds_when_the_declaring_pods_content_is_unchanged() {
+        let meta = bare_meta("tool", "1.0");
+        // The installed record carries the digest the member was built
+        // from; the FRESH re-resolution moved (collection recipe drift).
+        let recorded = "recorded-build-inputs".to_string();
+        assert_ne!(recorded, meta.build_input_digest(), "test wants drift");
+        let installed = installed_loaded_tool(Some(recorded));
+        let mut fixture = hold_fixture(installed.clone());
+        pin_declaring_pod_generation(&fixture, "upstream", &installed);
+        let build = ReconcileBuild::default();
+        let held =
+            loaded_hold_record(&fixture.ctx(), Some("upstream"), false, &meta, &build).unwrap();
+        assert!(
+            held.is_some(),
+            "unchanged declaring content must hold despite the drifted re-resolution"
+        );
+    }
+
+    /// The declaring pod MOVED (its manifest now records different
+    /// build inputs — a constraint/version/overlay move landed by its
+    /// own sync) → the member rebuilds: the loading pod must follow the
+    /// line the declaring pod now executes.
+    #[test]
+    fn test_loaded_member_rebuilds_when_the_declaring_pods_content_moved() {
+        let meta = bare_meta("tool", "1.0");
+        let installed = installed_loaded_tool(Some("recorded-build-inputs".into()));
+        let mut moved = installed.clone();
+        moved.meta_digest = Some("moved-build-inputs".into());
+        let mut fixture = hold_fixture(installed);
+        pin_declaring_pod_generation(&fixture, "upstream", &moved);
+        let build = ReconcileBuild::default();
+        assert!(
+            loaded_hold_record(&fixture.ctx(), Some("upstream"), false, &meta, &build)
+                .unwrap()
+                .is_none(),
+            "a moved declaring pod must rebuild the member"
+        );
+    }
+
+    /// No declaring-pod record to cross-check (no `loads` source pod, or
+    /// its generation dropped the member) → the strict rebuild path.
+    /// The same refusal fires when the loading pod's own record has no
+    /// digest, even when the declaring side matches — fail-closed over a
+    /// pre-#113 manifest.
+    #[test]
+    fn test_loaded_member_rebuilds_without_a_cross_checkable_declaring_record() {
+        let meta = bare_meta("tool", "1.0");
+
+        // Declared directly (no source pod): nothing to cross-check.
+        let installed = installed_loaded_tool(Some("recorded-build-inputs".into()));
+        let mut fixture = hold_fixture(installed.clone());
+        pin_declaring_pod_generation(&fixture, "upstream", &installed);
+        let build = ReconcileBuild::default();
+        assert!(
+            loaded_hold_record(&fixture.ctx(), None, false, &meta, &build)
+                .unwrap()
+                .is_none(),
+            "no declaring pod must keep the strict path"
+        );
+
+        // Declaring generation dropped the member.
+        let mut fixture = hold_fixture(installed.clone());
+        pin_declaring_pod_generation(&fixture, "upstream", &installed);
+        let state = fixture
+            ._dir
+            .path()
+            .join("upstream/generations/1/manifest.json");
+        let mut gen: crate::runtime::Generation =
+            serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+        gen.packages.clear();
+        std::fs::write(&state, serde_json::to_string(&gen).unwrap()).unwrap();
+        assert!(
+            loaded_hold_record(&fixture.ctx(), Some("upstream"), false, &meta, &build)
+                .unwrap()
+                .is_none(),
+            "a member the declaring generation dropped must rebuild"
+        );
+
+        // Digest-None installed record: never hold, even with matching
+        // declaring content.
+        let undigested = installed_loaded_tool(None);
+        let mut fixture = hold_fixture(undigested.clone());
+        pin_declaring_pod_generation(&fixture, "upstream", &undigested);
+        assert!(
+            loaded_hold_record(&fixture.ctx(), Some("upstream"), false, &meta, &build)
+                .unwrap()
+                .is_none(),
+            "a pre-#113 record must rebuild once even with matching declaring content"
+        );
+    }
+
+    /// This pod's own overlay on the member keeps the strict
+    /// re-resolution check: the overlay is THIS pod's authoring, and its
+    /// change must rebuild even when the declaring pod's content is
+    /// unchanged.
+    #[test]
+    fn test_own_overlaid_loaded_member_keeps_the_strict_digest_check() {
+        let meta = bare_meta("tool", "1.0");
+        let installed = installed_loaded_tool(Some("recorded-build-inputs".into()));
+        let mut fixture = hold_fixture(installed.clone());
+        pin_declaring_pod_generation(&fixture, "upstream", &installed);
+        let build = ReconcileBuild::default();
+        assert!(
+            loaded_hold_record(&fixture.ctx(), Some("upstream"), true, &meta, &build)
+                .unwrap()
+                .is_none(),
+            "an own-overlaid member must take the strict digest path"
+        );
+    }
+
+    // ── Pin-bridge hold (issue #331, own packages) ──
+
+    /// Pin == candidate == installed version with a pre-#113 record
+    /// (digest `None`) → the plain sync HOLDS at the pin: the pin is
+    /// the resolution, no rebuild, no source download.
+    #[test]
+    fn test_undigested_pin_holds_at_the_pin() {
+        let mut meta = bare_meta("tool", "1.0");
+        let mut fixture = hold_fixture(installed_tool(None));
+        let mut build = ReconcileBuild::default();
+        let scope =
+            scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build).unwrap();
+        assert!(matches!(scope, OwnScope::Held));
+        assert_eq!(build.held, vec!["tool".to_string()]);
+        assert!(
+            build.pending.is_empty(),
+            "a bridge-held package must not queue a build: {:?}",
+            build.pending
+        );
+    }
+
+    /// A RECORDED digest that mismatches the fresh recipe never takes
+    /// the bridge: the strict issue #113 check owns recorded state.
+    #[test]
+    fn test_recorded_digest_mismatch_never_takes_the_bridge() {
+        let mut meta = bare_meta("tool", "1.0");
+        let mut installed = installed_tool(None);
+        installed.meta_digest = Some("recorded-elsewhere".into());
+        let mut fixture = hold_fixture(installed);
+        let mut build = ReconcileBuild::default();
+        let scope =
+            scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build).unwrap();
+        assert!(matches!(scope, OwnScope::Build), "must rebuild");
+        assert!(build.held.is_empty());
+    }
+
+    /// Missing local artifact (the generation does not carry the
+    /// package) → the sync verifies by rebuilding even at an agreeable
+    /// pin: the post-state must contain everything declared.
+    #[test]
+    fn test_missing_local_artifact_rebuilds_even_at_an_undigested_pin() {
+        let mut meta = bare_meta("tool", "1.0");
+        let mut fixture = hold_fixture(installed_tool(None));
+        let mut build = ReconcileBuild::default();
+        let mut ctx = fixture.ctx();
+        ctx.active = None;
+        let scope = scope_own_package(&ctx, true, false, false, &mut meta, &mut build).unwrap();
+        assert!(matches!(scope, OwnScope::Build), "must rebuild");
+        assert!(build.held.is_empty());
+    }
+
+    /// Explicit refresh (the member is NAMED) verifies by rebuilding:
+    /// the bridge hold is plain-sync only.
+    #[test]
+    fn test_refresh_named_member_bypasses_the_undigested_pin_bridge() {
+        let mut meta = bare_meta("tool", "1.0");
+        let mut fixture = hold_fixture(installed_tool(None));
+        let mut build = ReconcileBuild {
+            refresh_members: std::collections::BTreeSet::from(["tool".to_string()]),
+            ..Default::default()
+        };
+        let scope =
+            scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build).unwrap();
+        assert!(matches!(scope, OwnScope::Build), "refresh must rebuild");
+        assert!(build.held.is_empty());
     }
 
     /// The declared_names trap (ADR-0048): the hold flow records the
@@ -7088,7 +7463,11 @@ pod {
 
         // The member holds (the store content that must survive).
         let build = ReconcileBuild::default();
-        assert!(loaded_hold_record(&fixture.ctx(), &meta, &build).is_some());
+        assert!(
+            loaded_hold_record(&fixture.ctx(), None, false, &meta, &build)
+                .unwrap()
+                .is_some()
+        );
 
         // A real store whose active generation carries the record, the
         // way the previous sync's install left it.
@@ -7124,6 +7503,55 @@ pod {
         );
     }
 
+    /// The unchanged-generation fold (issue #331, secondary): a loaded
+    /// pod with an active generation contributes its EXECUTING versions
+    /// without live collection evals — a generation-carried name whose
+    /// collection entry is gone (or never resolves) must not fail the
+    /// LOADING pod's fold. Under the old always-re-resolve fold this
+    /// errored on the missing collection entry; now the generation's
+    /// version IS the contribution.
+    #[test]
+    fn test_unchanged_generation_folds_without_collection_evals() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pod = root.join("sub");
+        std::fs::create_dir_all(&pod).unwrap();
+        std::fs::write(
+            pod.join("pod.lua"),
+            "pod {\n    packages = { \"ghost\" },\n}\n",
+        )
+        .unwrap();
+
+        // The loaded pod's active generation carries 'ghost' — content
+        // the collection no longer names.
+        let store = pod_store(&pod);
+        let mut record = installed_loaded_tool(None);
+        record.name = "ghost".into();
+        record.version = "9.9".into();
+        let gen_dir = store.generation_dir(1);
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        std::fs::write(
+            gen_dir.join("manifest.json"),
+            serde_json::to_string(&crate::runtime::Generation {
+                n: 1,
+                base_version: "24.04".into(),
+                packages: BTreeMap::from([("ghost".to_string(), record)]),
+                created_epoch: 0,
+                boot_entry: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("generations/1", store.root().join("active")).unwrap();
+
+        let contribution = loaded_contribution(root, "sub").unwrap();
+        let ghost = contribution
+            .packages
+            .get("ghost")
+            .expect("the generation-carried name must fold in");
+        assert_eq!(ghost.version.as_deref(), Some("9.9"));
+    }
+
     /// A held LOADED member with a pin resolvable from the DECLARING
     /// pod's lockfile re-verifies the blob: tampered content fails the
     /// hold loud, never riding along (the #125 shape, one layer down).
@@ -7145,7 +7573,9 @@ pod {
         pin_declaring_pod_deps(&fixture, "upstream", &hash);
         let ctx = fixture.ctx();
         let mut build = ReconcileBuild::default();
-        let installed = loaded_hold_record(&ctx, &meta, &build).unwrap();
+        let installed = loaded_hold_record(&ctx, None, false, &meta, &build)
+            .unwrap()
+            .expect("an intact declaring-pod blob must hold");
         hold_loaded_member(&ctx, Some("upstream"), installed, &meta, &mut build).unwrap();
         assert_eq!(build.held, vec!["tool".to_string()]);
 
@@ -7157,7 +7587,9 @@ pod {
         pin_declaring_pod_deps(&fixture, "upstream", &hash);
         let ctx = fixture.ctx();
         let mut build = ReconcileBuild::default();
-        let installed = loaded_hold_record(&ctx, &meta, &build).unwrap();
+        let installed = loaded_hold_record(&ctx, None, false, &meta, &build)
+            .unwrap()
+            .expect("the tampered blob fails in the hold body, not the decision");
         let err =
             hold_loaded_member(&ctx, Some("upstream"), installed, &meta, &mut build).unwrap_err();
         assert!(
