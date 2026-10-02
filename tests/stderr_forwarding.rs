@@ -24,6 +24,7 @@ fn request(label: &str, source: &str) -> EvalRequest {
         entry_label: label.to_string(),
         allow_fetch: false,
         constraint: None,
+        versions_mode: false,
     }
 }
 

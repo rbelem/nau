@@ -1034,6 +1034,29 @@ return {
         );
     }
 
+    #[test]
+    fn typed_prelude_accepts_the_versions_field() {
+        // ADR-0052: a recipe declaring the listing-only versions() field
+        // must type-check cleanly through the deliberately-loose snap
+        // binding (schema strictness stays at the eval boundary).
+        let def = r#"
+return {
+    default = snap {
+        name = "opencode-bin",
+        version = "2.0.21",
+        versions = function()
+            return { "2.0.21", "2.0.20" }
+        end,
+    },
+}
+"#;
+        let diags = check_definition("typed-prelude-versions", def);
+        assert!(
+            diags.is_empty(),
+            "versions field must type-check: {diags:?}"
+        );
+    }
+
     // ── `name = 42`-style type error → spanned diagnostic ──
 
     #[test]

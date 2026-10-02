@@ -14,6 +14,9 @@
 -- A strict SnapMeta table type here would make the analyzer stage reject
 -- `snap { name = 42 }` with a Luau message before the eval stage reports its
 -- named schema error, reordering (and duplicating) the diagnostic stream.
+-- The listing-only `versions` field (ADR-0052: a zero-arg function returning
+-- `{string}`, newest first) type-checks through the same loose binding; a
+-- dedicated table type would belong to that same future tightening.
 -- What the strict-mode gate still catches on definitions: syntax errors,
 -- misspelled globals, unknown locals, annotated type errors, and type errors
 -- that flow across require() module boundaries.

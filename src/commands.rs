@@ -281,8 +281,8 @@ pub fn cmd_deps_fetch(pod: Option<&str>, root: Option<&str>, latest: bool) -> mi
 // unchanged. The lint reporter helpers are pub there because this
 // module's `cmd_lint` (root-side: its pod branch) calls them.
 pub use nau_chart::commands::{
-    check_ok_message, cmd_audit, cmd_check, cmd_deps, cmd_lock, cmd_search, lint_index,
-    lint_stage_dir, report_lint_human, report_lint_json,
+    check_ok_message, cmd_audit, cmd_check, cmd_deps, cmd_lock, cmd_search, cmd_versions,
+    lint_index, lint_stage_dir, report_lint_human, report_lint_json,
 };
 fn pin_epoch(source_date_epoch: Option<&str>) {
     if let Some(epoch) = source_date_epoch {
@@ -722,6 +722,7 @@ pub fn cmd_lint(
         index: &index,
         pod: pod_data.as_ref(),
         stage_dir: stage_dir.as_deref(),
+        versions_declared: eval.as_ref().map_or(&[], |e| &e.versions_declared),
     };
 
     let findings = crate::checks::run_battery(&input);

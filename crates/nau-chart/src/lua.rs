@@ -929,6 +929,9 @@ pub struct LintEval {
     pub images: HashMap<String, ImageDeclaration>,
     pub unparsed: Vec<String>,
     pub diagnostics: Vec<String>,
+    /// Output keys whose snap table declared a `versions` function
+    /// (ADR-0052) — the missing-versions lint's exemption list.
+    pub versions_declared: Vec<String>,
 }
 
 /// Evaluate a definition file for the linter: one bounded worker run, then
@@ -949,6 +952,7 @@ pub fn lint_eval_file(path: &str) -> miette::Result<LintEval> {
         images: HashMap::new(),
         unparsed: Vec::new(),
         diagnostics: ok.diagnostics,
+        versions_declared: ok.versions_declared,
     };
     for (key, json) in ok.outputs {
         out.raw.insert(key.clone(), json.clone());
@@ -969,6 +973,28 @@ pub fn lint_eval_file(path: &str) -> miette::Result<LintEval> {
         }
     }
     Ok(out)
+}
+
+/// Evaluate a definition file in versions-mode (ADR-0052 Decision 1):
+/// ONE bounded worker run, fetch allowed as usual (the `NAU_OFFLINE`
+/// gate applies); each snap output's `versions()` is called in the
+/// worker before output serialization and the listing comes back
+/// alongside the snap's own resolved `version`. Outputs without a
+/// versions method report `versions: null` — the CLI renders those as
+/// named skips.
+pub fn versions_eval_file(
+    path: &str,
+) -> miette::Result<BTreeMap<String, crate::isolate::VersionListing>> {
+    let source = std::fs::read_to_string(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("could not read {}", path))?;
+    let mut req = eval_request(path, &source, None)?;
+    req.versions_mode = true;
+    let ok = crate::isolate::run_eval(&req)?;
+    for diag in &ok.diagnostics {
+        nau_infra::output::warn(diag);
+    }
+    Ok(ok.versions)
 }
 
 /// Evaluate a Lua file and extract image declarations.
@@ -1037,6 +1063,10 @@ fn eval_request(
         // eval worker then refuses fetch() with a named error.
         allow_fetch: std::env::var("NAU_OFFLINE").is_err(),
         constraint: constraint.map(str::to_string),
+        // Listing-only: the versions walk runs only in the explicit
+        // versions-mode request (`versions_eval_file`), never on a
+        // build/check/eval path.
+        versions_mode: false,
     })
 }
 

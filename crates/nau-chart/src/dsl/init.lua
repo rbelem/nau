@@ -590,6 +590,17 @@ function snap(opts)
         error("snap(): 'floating' must be a boolean, got " .. type(opts.floating), 2)
     end
 
+    -- versions (ADR-0052 Decision 1): listing-only upstream version
+    -- listing — a zero-arg function returning a Lua array of version
+    -- strings, newest first (an empty array is a valid answer). snap()
+    -- never calls it: `nau chart versions` runs the eval worker's
+    -- versions-mode, which calls it in-process, pre-JSON.
+    if opts.versions ~= nil and type(opts.versions) ~= "function" then
+        error(string.format(
+            "snap(): field 'versions' must be a function, got %s", type(opts.versions)
+        ), 2)
+    end
+
     -- apps: table mapping string -> app definition
     check_table(opts.apps, "snap", "apps")
     if opts.apps ~= nil then

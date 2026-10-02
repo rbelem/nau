@@ -168,6 +168,7 @@ fn production_request(prelude: &str, index_data: Value, label: &str, source: &st
         entry_label: label.to_string(),
         allow_fetch: false,
         constraint: None,
+        versions_mode: false,
     }
 }
 

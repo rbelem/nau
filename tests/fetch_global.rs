@@ -82,6 +82,7 @@ fn fetch_is_refused_by_name_when_disallowed() {
         entry_label: "fetch-offline".into(),
         allow_fetch: false,
         constraint: None,
+        versions_mode: false,
     };
     let err = match nau::isolate::run_eval(&req) {
         Err(e) => format!("{e:#}"),

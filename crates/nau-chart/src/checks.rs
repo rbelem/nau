@@ -137,6 +137,10 @@ pub struct LintInput<'a> {
     /// The declared stage directory to scan for shebang wrappers, when it
     /// exists. Absent → the shebang check has nothing to scan.
     pub stage_dir: Option<&'a Path>,
+    /// Output keys whose snap table declared a `versions` function
+    /// (ADR-0052) — the missing-versions check's exemption list. Empty
+    /// in pod mode (pods declare specs, not snaps).
+    pub versions_declared: &'a [String],
 }
 
 // ── Registry ──
@@ -187,6 +191,11 @@ pub fn registry() -> &'static [Check] {
             name: "unparsed-declaration",
             summary: "outputs validating as neither package nor image (ADR-0010)",
             run: check_unparsed_declarations,
+        },
+        Check {
+            name: "missing-versions",
+            summary: "fetch() recipes whose snap outputs lack the versions() listing (ADR-0052)",
+            run: check_missing_versions,
         },
     ]
 }
@@ -982,6 +991,48 @@ fn check_unparsed_declarations(input: &LintInput) -> Vec<Finding> {
         .collect()
 }
 
+// ── Check 8: missing-versions (ADR-0052) ──
+
+/// Whether the definition's raw source calls `fetch(` — the always-latest
+/// shape whose upstream listing `nau chart versions` surfaces. A literal
+/// substring probe: a `fetch(` inside a comment or string false-positives
+/// into a warning, never an error (the check is warn-only by contract).
+fn source_calls_fetch(input: &LintInput) -> bool {
+    std::fs::read_to_string(input.file)
+        .map(|src| src.contains("fetch("))
+        .unwrap_or(false)
+}
+
+/// Snap outputs of fetch recipes missing the versions() listing
+/// (ADR-0052 Decision 2). A **warning**, never an error: the field is
+/// optional and ~100 existing fetch recipes must keep building clean —
+/// the finding just names what `nau chart versions` cannot list yet.
+fn check_missing_versions(input: &LintInput) -> Vec<Finding> {
+    const CHECK: &str = "missing-versions";
+    if !source_calls_fetch(input) {
+        return Vec::new();
+    }
+    input
+        .outputs
+        .iter()
+        .filter(|(key, _)| !input.versions_declared.iter().any(|k| k == *key))
+        .map(|(key, meta)| {
+            Finding::new(
+                CHECK,
+                key.clone(),
+                Severity::Warn,
+                format!(
+                    "{} resolves upstream via fetch() but declares no versions() — \
+                     `nau chart versions` cannot list what exists upstream",
+                    meta.name
+                ),
+                "add versions = function() return { \"...\" } end — the upstream \
+                 version strings, newest first",
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1096,6 +1147,8 @@ mod tests {
         images: HashMap<String, nau_core::manifest_ir::ImageDeclaration>,
         unparsed: Vec<String>,
         index: PackageIndex,
+        file: std::path::PathBuf,
+        versions_declared: Vec<String>,
     }
 
     impl Builder {
@@ -1106,6 +1159,8 @@ mod tests {
                 images: HashMap::new(),
                 unparsed: Vec::new(),
                 index: index(Vec::new()),
+                file: std::path::PathBuf::from("nau.lua"),
+                versions_declared: Vec::new(),
             }
         }
         fn image(mut self, key: &str, v: serde_json::Value) -> Self {
@@ -1120,9 +1175,17 @@ mod tests {
             self.index = index;
             self
         }
+        fn file(mut self, path: std::path::PathBuf) -> Self {
+            self.file = path;
+            self
+        }
+        fn declared(mut self, keys: &[&str]) -> Self {
+            self.versions_declared = keys.iter().map(|s| s.to_string()).collect();
+            self
+        }
         fn build(&self) -> LintInput<'_> {
             LintInput {
-                file: Path::new("nau.lua"),
+                file: &self.file,
                 arch: "amd64",
                 channel: "latest/stable",
                 outputs: &self.outputs,
@@ -1132,6 +1195,7 @@ mod tests {
                 index: &self.index,
                 pod: None,
                 stage_dir: None,
+                versions_declared: &self.versions_declared,
             }
         }
     }
@@ -1690,6 +1754,78 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Warn);
         assert_eq!(findings[0].package, "broken");
+    }
+
+    // ── missing-versions (ADR-0052) ──
+
+    /// Write a definition source to a tempdir so the check can read the
+    /// raw text it probes for `fetch(`.
+    fn def_file(dir: &Path, source: &str) -> std::path::PathBuf {
+        let path = dir.join("nau.lua");
+        std::fs::write(&path, source).unwrap();
+        path
+    }
+
+    #[test]
+    fn fetch_recipe_without_versions_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = def_file(
+            dir.path(),
+            "local v = fetch('https://example.test/latest')\nreturn {}",
+        );
+        let b = Builder::new().output(bare_meta("opencode-bin")).file(file);
+        let input = b.build();
+        let findings = for_check(&input, "missing-versions");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].severity, Severity::Warn);
+        assert_eq!(findings[0].package, "opencode-bin");
+        assert!(
+            findings[0].message.contains("opencode-bin")
+                && findings[0].message.contains("no versions()"),
+            "{}",
+            findings[0].message
+        );
+        assert!(
+            findings[0].hint.contains("versions = function()"),
+            "{}",
+            findings[0].hint
+        );
+    }
+
+    #[test]
+    fn fetch_recipe_with_declared_versions_is_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = def_file(
+            dir.path(),
+            "local v = fetch('https://example.test/latest')\nreturn {}",
+        );
+        let b = Builder::new()
+            .output(bare_meta("opencode-bin"))
+            .file(file)
+            .declared(&["opencode-bin"]);
+        let input = b.build();
+        assert!(for_check(&input, "missing-versions").is_empty());
+    }
+
+    #[test]
+    fn recipe_without_fetch_is_never_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = def_file(
+            dir.path(),
+            "return { default = snap { name = 'x', version = '1' } }",
+        );
+        let b = Builder::new().output(bare_meta("static")).file(file);
+        let input = b.build();
+        assert!(for_check(&input, "missing-versions").is_empty());
+    }
+
+    #[test]
+    fn missing_file_source_is_silent_not_a_crash() {
+        // An unreadable definition source must not panic the battery:
+        // no source, no fetch evidence, no findings.
+        let b = Builder::new().output(bare_meta("x"));
+        let input = b.build();
+        assert!(for_check(&input, "missing-versions").is_empty());
     }
 
     // ── Registry & battery ──
