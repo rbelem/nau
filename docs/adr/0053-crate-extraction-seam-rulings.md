@@ -148,6 +148,40 @@ Amended 2026-10-01 (council, 4 seats; same day, before PR 2):
    nau-trust; the two eval-coupled fixture clusters (runtime's
    divergent-materials test, sign's build_manifest flow) stay root;
    no dev-edges in either PR.
+11. **Amended 2026-10-02 (PR 9, operator-granted #326 run):** nau-pool
+   takes the farm TRANSPORT+MACHINES plane: `ssh_exec` and
+   `build_sched` whole, the `worker` wire half (`JobManifest`/
+   `CapabilityDoc`/`JobResult`/`ClosureObject`/`SourcePin`/`Artifact`,
+   `WORKER_PROTOCOL_VERSION`, `canonical_manifest_bytes`, the `jm1:`
+   identity + purpose grammar), and `provision` (verb bodies with
+   scalar args + `publish` + the five providers) — dep row
+   `nau-pool {nau-core nau-infra}`. (a) `coordinator.rs`, the
+   `worker.rs` execution half, and `farm_dispatch.rs` STAY ROOT: the
+   coordinator's vocabulary is build-planning (`SnapMeta`,
+   `PackageCache`, closure assembly, `deps::*`), the verbs run real
+   builds (nau-build + root-only `listings_for_build`), and
+   farm_dispatch wraps root `cli`/`build_orch` — the trust
+   eval-coupled stay-root precedent, one door. (b) CA material
+   primitives move to `nau_infra::ssh_ca` (`CaInfo`, the three path
+   fns, `inspect`, `key_fingerprint`/`parse_fingerprint_line`,
+   `validate_public_key_line` + `HOST_KEY_TYPES`/`is_base64_char`) —
+   extending amendment 10's primitives-to-infra pattern; trust
+   re-exports them (issuance policy stays `nau-trust::ca`), pool
+   consumes infra. (c) `host_arch`/`triplet_arch` move to
+   `nau_core::snap_types` beside `resolve_archs`; `WorkersConfig`/
+   `WorkerConfig` move to `nau_core::worker_types` (chart keeps the
+   `FromLua` extraction; `from_lua_value` became a chart-local free
+   fn — orphan rule). (d) Provision verb dispatch follows the
+   nau-chart commands precedent: the clap match stays root,
+   `workers_main`'s signature is unchanged, bodies move with scalar
+   args; burst sizing splits (`resolve_burst_count` stays root beside
+   `farm_dispatch`; `burst_auto_count`/`refuse_burst_above_max` move
+   to pool). (e) The root provision shim re-exports via an explicit
+   glob (`pub use nau_pool::provision::*`) — bounded: Rust
+   explicit-defeats-glob, two-glob conflicts error loudly. (f) Zero
+   integration-test churn; every wire surface (protocol const, digest
+   input, serde attrs, remote verbs, managed-block literals) moved
+   byte-identically behind re-exports.
 
 ## Context
 
