@@ -5,10 +5,10 @@
 //! analyzer-spike/REPORT.md). Source lists come from the tarball's own
 //! Sources.cmake (the build system Luau itself uses), so nothing is
 //! hand-maintained per library:
-//!   Luau.Analysis (77 .cpp) -> needs Ast (8) and Config (3) publicly,
+//!   Luau.Analysis (77 .cpp) -> needs Ast and Config publicly, plus
 //!   Compiler + VM privately (TypeFunction.cpp uses BytecodeBuilder +
 //!   compileOrThrow + lua_* symbols).
-//! Total: 80 C++ translation units + 1 shim TU. (EqSat was folded away
+//! Total: 77 C++ translation units + 1 shim TU. (EqSat was folded away
 //! upstream between 0.663 and 0.736; Analysis no longer needs it.)
 //!
 //! The vendored tarball (`vendor/luau-0.736.tar.gz`) must stay in lockstep
@@ -20,23 +20,28 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 const LUAU_TAG: &str = "0.736";
-// Luau.Analysis needs Config compiled, plus Ast, Compiler and VM headers
-// (TypeFunction.cpp uses BytecodeBuilder + compileOrThrow + lua_* symbols).
-// The Ast, Compiler and VM OBJECTS are deliberately not compiled here: the
-// `mlua` runtime dependency already links the identical luau0-src
-// 0.21.0+luau736 Ast+VM+Compiler (same sources, same LUAI_MAXCSTACK /
-// LUA_VECTOR_SIZE defines), and compiling any of them again duplicates
-// every symbol at link time (issue #230-land: the duplicate Parser.o
-// between libnau and libmlua_sys made 12 test targets fail to link
-// once a full rebuild reordered object pull). The analyzer's undefined
-// refs resolve against mlua's luauast/luau libs at final link, exactly as
-// the VM ones always have.
+// Only Analysis is compiled here. Everything else the analyzer needs is
+// resolved at final link against the mlua runtime dependency's luau0-src
+// 0.21.0+luau736 objects (same sources, same LUAI_MAXCSTACK /
+// LUA_VECTOR_SIZE defines): Ast + Config publicly (Analysis's public
+// headers expose their types), Compiler + VM + Bytecode privately
+// (TypeFunction.cpp uses BytecodeBuilder + compileOrThrow + lua_*
+// symbols). Compiling any of them again duplicates every symbol at link
+// time: issue #230-land (the duplicate Parser.o between libnau and
+// libmlua_sys made 12 test targets fail to link once a full rebuild
+// reordered object pull) and the 2026-10-02 binutils-2.46 gate failure
+// (the duplicate Config.o — `Luau::Config::… multiple definition` — same
+// disease, fixed by resolving Config against luau0-src's luauconfig lib
+// exactly like Ast/VM). The analyzer's undefined refs resolve against
+// mlua's luauast/luauconfig/luau libs at final link, exactly as the VM
+// ones always have.
 //
 // The vendored tarball version MUST match mlua-sys's luau0-src pin
-// (0.21.0+luau736 as of the mlua 0.12 bump): the analyzer's Ast/VM refs
-// resolve against luau0-src's objects at final link, so any drift between
-// the two trees is a link error (or worse, an ABI mismatch).
-const LIBS: &[&str] = &["Config", "Analysis"];
+// (0.21.0+luau736 as of the mlua 0.12 bump): the analyzer's
+// Ast/Config/VM refs resolve against luau0-src's objects at final link,
+// so any drift between the two trees is a link error (or worse, an ABI
+// mismatch).
+const LIBS: &[&str] = &["Analysis"];
 // Only these tree prefixes are unpacked from the tarball (skip CLI/tests/bench).
 // Bytecode is headers-only here: BytecodeBuilder.h moved under Bytecode/include
 // in 0.736 and Analysis includes it, but the Bytecode objects themselves stay
