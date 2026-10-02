@@ -118,6 +118,36 @@ Amended 2026-10-01 (council, 4 seats; same day, before PR 2):
    nau-pod (dbus as root dev-dep for the live-D-Bus gated test).
    Known pre-existing flake candidate (not this diff): doctor's bwrap
    probe can hit an ETXTBSY spawn race under parallel load.
+10. **Amended 2026-10-01 (PRs 7-8, operator-granted #326 run):**
+   (a) `RuntimeStore` moves INTO nau-runtime as the domain type — its
+   impl is the mutation machinery, and the adapter's consumer set was
+   empty post-PR-6; layout truth stays `nau-core` (every read path
+   delegates to `StoreView`/BlobStore), root keeps the
+   `pod_store`/`resolve_pod_store` glue ctors, and `RuntimeTools`
+   moves with it (amendment 9a stands: services stays root and
+   consumes it through the root re-export). (b) The ADR-0011
+   eval-manifest gate inside `install_batch` is injected as
+   `VerifySignatures<'_> = &dyn Fn(&[u8], &BTreeMap<String, Value>) ->
+   Result<Option<String>>` (the 9c precedent) — the verify cluster
+   stayed root through PR 7 and moved to `nau_trust::verify` in PR 8
+   with the root re-export keeping every call site byte-identical.
+   (c) PR 7 pre-moves: `DesktopSource`/`parse_source` +
+   the launcher sibling trio → `nau_core::{pkg_manifest, snap_types}`;
+   `SignatureEnvelope` → `nau_core::sign`; the device GUID trio →
+   `nau_core::channels`; `SYSUPDATE_DIR` → `nau_core::paths`.
+   (d) PR 8: `eval_manifest_canonical_bytes` → `nau_core::manifest_ir`
+   (the ImageDeclaration twin — trust consumes only the eval OUTPUT
+   schema, never eval machinery, so no injection was needed); the
+   OpenPGP primitives (`import_pubring_pgp` + packet machinery) move
+   to `nau_infra::pgp` — CORRECTING amendment 7's "release-flow-only"
+   premise, which broke when #290 gave the rotation ceremony its
+   fragment half; the policy/assembly fns stay in
+   `nau-image::sysupdate` re-exporting the primitives ("pgp never
+   enters the spine" unchanged — nau-infra is not the spine); `ca.rs`
+   (the SSH host-CA ceremony) and the ledger-policy cluster land in
+   nau-trust; the two eval-coupled fixture clusters (runtime's
+   divergent-materials test, sign's build_manifest flow) stay root;
+   no dev-edges in either PR.
 
 ## Context
 
