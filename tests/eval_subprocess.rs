@@ -550,12 +550,15 @@ fn real_node_recipe_selects_the_22_line_under_the_constraint() {
         }
         other => panic!("expected pinned 22-line source, got {other:?}"),
     }
-    // The build carries the real-copy fix verbatim (rm precedes cp -L).
+    // The build carries the bootstrap fix verbatim (rm precedes the
+    // bootstraps): the staged entries require npm's own entry files in
+    // place, so the #9 wrapper's tree exec keeps npm's require anchor.
     let build = meta.build.as_deref().expect("node build declared");
     assert!(
         build.contains("rm $STAGE/usr/bin/npm $STAGE/usr/bin/npx")
-            && build.contains("cp -L bin/npm bin/npx $STAGE/usr/bin/"),
-        "the stashed real-copy fix must be in the build: {build}"
+            && build.contains("require('../lib/node_modules/npm/bin/npm-cli.js')")
+            && build.contains("require('../lib/node_modules/npm/bin/npx-cli.js')"),
+        "the stashed bootstrap fix must be in the build: {build}"
     );
     // The apps bind unsuffixed to the pod's selected line.
     assert_eq!(meta.apps["npm"].interpreter.as_deref(), Some("node"));

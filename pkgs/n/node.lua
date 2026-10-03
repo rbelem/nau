@@ -70,14 +70,22 @@ return {
         -- lib/node_modules (corepack is no longer shipped on the
         -- current line); the interpreter-wrapper pass rewrites command
         -- files in place FOLLOWING symlinks, so an app declared on the
-        -- link would clobber npm-cli.js — replace them with real
-        -- copies first. rm precedes cp: cp follows an existing dest
-        -- link and would write through it.
+        -- link would clobber npm-cli.js — the staged entries are real
+        -- files instead. A COPY of npm-cli.js does not work either: it
+        -- requires `../lib/cli.js` anchored at its own location, which
+        -- only resolves inside lib/node_modules/npm — a copy stranded
+        -- in bin/ dies with MODULE_NOT_FOUND at runtime. The staged
+        -- entries are therefore two-line BOOTSTRAPS that require the
+        -- entry files in place; the #9 wrapper execs the bootstrap from
+        -- the generation tree, every require resolves inside npm's own
+        -- staged tree, and the bare `node` on PATH is the same line
+        -- (ADR-0047 Decision 2).
         build = table.concat({
             "mkdir -p $STAGE/usr",
             "cp -r bin lib include share $STAGE/usr/",
             "rm $STAGE/usr/bin/npm $STAGE/usr/bin/npx",
-            "cp -L bin/npm bin/npx $STAGE/usr/bin/",
+            "printf '%s\\n' '#!/usr/bin/env node' \"require('../lib/node_modules/npm/bin/npm-cli.js')\" > $STAGE/usr/bin/npm",
+            "printf '%s\\n' '#!/usr/bin/env node' \"require('../lib/node_modules/npm/bin/npx-cli.js')\" > $STAGE/usr/bin/npx",
         }, " && "),
 
         type = "source",
@@ -86,7 +94,7 @@ return {
         apps = {
             -- `node` is the ELF runtime (the #12 portability step
             -- repoints its interpreter/RUNPATH at build time). npm and
-            -- npx are the cli scripts (now real files, see build):
+            -- npx are the staged bootstrap entries (see build):
             -- declared with `interpreter = "node"` so the #9 pass
             -- preserves each at a `.real` sibling and wraps it with an
             -- exec of the bare interpreter name — resolved from PATH at
