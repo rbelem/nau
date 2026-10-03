@@ -418,6 +418,50 @@ mod tests {
         assert_eq!(again.already_present.len(), 1);
     }
 
+    /// The manifest's `executable: true` survives staging (live
+    /// 2026-10-02: the codecanary farm entry died with EACCES — the
+    /// store write defaulted to 0644). The already-present arm runs the
+    /// same mark, so a blob staged by an older build self-heals on the
+    /// next pull.
+    #[test]
+    fn staged_blobs_carry_the_manifest_executable_bit() {
+        let kp = test_kp(1);
+        let fx = Fixture::with_trust(&kp);
+        let pkg = signed_manifest(&kp);
+        let fetch = FakeFetch::peer(&manifest_source(&pkg), &[(&blob_sha(), blob_bytes())]);
+
+        pull_into_store(
+            &fx.blobs(),
+            fx.installed("hello"),
+            &peer_ref(),
+            &fx.anchor,
+            &fx.keys,
+            false,
+            &fetch,
+        )
+        .expect("a signed, fresh manifest stages");
+        let blob = fx.store.blob_path(&blob_sha());
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&blob).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "executable manifest entry: {mode:o}");
+
+        // Self-heal: a 0644 blob left by an older build is re-marked on
+        // the next pull (dedup re-verifies, then re-marks).
+        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o644)).unwrap();
+        pull_into_store(
+            &fx.blobs(),
+            fx.installed("hello"),
+            &peer_ref(),
+            &fx.anchor,
+            &fx.keys,
+            false,
+            &fetch,
+        )
+        .expect("re-pull re-marks");
+        let healed = std::fs::metadata(&blob).unwrap().permissions().mode();
+        assert_eq!(healed & 0o111, 0o111, "self-healed: {healed:o}");
+    }
+
     /// The staging inbox is single-file-per-package
     /// ([`crate::pkg_manifest::manifest_path`]): staging revision N
     /// OVERWRITES the same package's older entry — that overwrite IS

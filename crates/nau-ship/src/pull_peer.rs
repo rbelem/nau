@@ -381,36 +381,81 @@ fn stage_blobs<F: Fetch>(
     for file in files {
         let dest = store.blob_path(&file.sha256);
         if dest.exists() {
-            let actual = sha256_file(&dest)?;
-            if actual != file.sha256 {
-                miette::bail!(
-                    "existing store blob {} is corrupt: expected sha256 {}, found {}",
-                    dest.display(),
-                    file.sha256,
-                    actual
-                );
-            }
+            verify_existing_blob(&dest, &file.sha256)?;
+            mark_executable(&dest, file.executable)?;
             already.push(file.clone());
             continue;
         }
-        let url = blob_url(source, pkg, &file.sha256)?;
-        let body = fetch
-            .get(&url)
-            .wrap_err_with(|| format!("fetching blob for '{}' from {url}", file.path))?;
-        let actual = sha256_hex(&body);
-        if actual != file.sha256 {
-            miette::bail!(
-                "blob sha256 mismatch for '{}': expected {}, received {} — refusing \
-                 (fetched from {url})",
-                file.path,
-                file.sha256,
-                actual
-            );
-        }
-        write_atomic(&dest, &body)?;
+        fetch_and_stage_blob(store, source, pkg, file, fetch)?;
         fetched.push(file.clone());
     }
     Ok((fetched, already))
+}
+
+/// The already-present arm: re-hash the store blob against the
+/// manifest's pin (corruption here is a named hard error — ADR-0012
+/// fail-closed).
+fn verify_existing_blob(dest: &Path, expected: &str) -> miette::Result<()> {
+    let actual = sha256_file(dest)?;
+    if actual != expected {
+        miette::bail!(
+            "existing store blob {} is corrupt: expected sha256 {}, found {}",
+            dest.display(),
+            expected,
+            actual
+        );
+    }
+    Ok(())
+}
+
+/// The missing arm: fetch, hash-check against the manifest pin, write
+/// atomically.
+fn fetch_and_stage_blob<F: Fetch>(
+    store: &BlobStore,
+    source: &PullRef,
+    pkg: &str,
+    file: &ManifestFile,
+    fetch: &F,
+) -> miette::Result<()> {
+    let dest = store.blob_path(&file.sha256);
+    let url = blob_url(source, pkg, &file.sha256)?;
+    let body = fetch
+        .get(&url)
+        .wrap_err_with(|| format!("fetching blob for '{}' from {url}", file.path))?;
+    let actual = sha256_hex(&body);
+    if actual != file.sha256 {
+        miette::bail!(
+            "blob sha256 mismatch for '{}': expected {}, received {} — refusing \
+             (fetched from {url})",
+            file.path,
+            file.sha256,
+            actual
+        );
+    }
+    write_atomic(&dest, &body)?;
+    mark_executable(&dest, file.executable)
+}
+
+/// The manifest's executable bit must survive staging: the bin farm
+/// links a wrapper-managed command straight at its store blob, so a
+/// non-executable blob is a farm entry that dies with EACCES at
+/// invocation (live 2026-10-02, codecanary via the static lane). The
+/// already-present arm runs the same mark, so blobs staged by an
+/// older build self-heal on the next pull.
+fn mark_executable(dest: &Path, executable: bool) -> miette::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if executable { 0o755 } else { 0o644 };
+        std::fs::set_permissions(dest, std::fs::Permissions::from_mode(mode))
+            .into_diagnostic()
+            .wrap_err_with(|| format!("setting the mode of {}", dest.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dest, executable);
+    }
+    Ok(())
 }
 
 // ── Report (shape mirrors the OCI pull report) ──
