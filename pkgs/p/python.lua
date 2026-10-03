@@ -44,7 +44,7 @@ return {
             -- follow them and truncate the interpreter — the cc trap),
             -- then stage real files: a shim plus a hardlink.
             "rm -f $STAGE/usr/bin/python3 $STAGE/usr/bin/python",
-            "printf '#!/bin/sh\\nexec /usr/bin/python3.14 \"$@\"\\n' > $STAGE/usr/bin/python3",
+            "printf '#!/bin/sh\\nd=$(dirname \"$(readlink -f \"$0\")\")\\nexec \"$d/python3.14\" \"$@\"\\n' > $STAGE/usr/bin/python3",
             "chmod +x $STAGE/usr/bin/python3",
             "ln $STAGE/usr/bin/python3 $STAGE/usr/bin/python",
         }, " && "),
