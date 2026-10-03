@@ -265,6 +265,24 @@ impl SourceResolver {
         };
         if let Some(parent) = std::path::Path::new(entry_label).parent() {
             push_root(parent.to_path_buf());
+            // The entry's enclosing `pkgs` tree: charts require shared
+            // modules from the tree root (`lib/cli`, `lib/daemon` —
+            // ADR-0032). The CWD-derived root below misses every caller
+            // whose cwd is not the recipes root (the farm drain's cwd is
+            // the farm dir, not the repo), so anchor the tree on the
+            // entry itself. Containment unchanged: the surface is still
+            // this entry's own project tree, never an ambient dir.
+            let mut dir: &std::path::Path = parent;
+            loop {
+                if dir.file_name().map(|n| n == "pkgs").unwrap_or(false) {
+                    push_root(dir.to_path_buf());
+                    break;
+                }
+                match dir.parent() {
+                    Some(d) if d != dir => dir = d,
+                    _ => break,
+                }
+            }
         }
         if let Ok(cwd) = std::env::current_dir() {
             push_root(cwd.join("pkgs"));
@@ -2128,6 +2146,25 @@ mod tests {
     }
 
     // ── stderr forwarder: cap + deadline (issue #76) ──
+
+    #[test]
+    fn for_build_allowlists_the_entrys_pkgs_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry = dir.path().join("pkgs/v/valkey/init.lua");
+        std::fs::create_dir_all(entry.parent().unwrap()).expect("mkdirs");
+        std::fs::write(&entry, "return {}").expect("write");
+        let r = SourceResolver::for_build(entry.to_str().unwrap());
+        let pkgs = dir.path().join("pkgs").canonicalize().expect("canon");
+        assert!(
+            r.roots.contains(&pkgs),
+            "roots must contain the entry's own pkgs tree, got {:?}",
+            r.roots
+        );
+        // Containment: a sibling tree the entry does not belong to stays out.
+        let other = dir.path().join("other-tree/pkgs");
+        std::fs::create_dir_all(&other).expect("mkdirs");
+        assert!(!r.roots.contains(&other.canonicalize().unwrap()));
+    }
 
     #[test]
     fn forward_capped_below_cap_forwards_everything() {
