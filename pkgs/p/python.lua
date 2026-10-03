@@ -37,6 +37,13 @@ return {
         build = table.concat({
             "mkdir -p $STAGE/usr",
             "cp -r bin lib include share $STAGE/usr/",
+            -- The tarball's bin/python{,3} are symlinks to python3.14;
+            -- the payload walk records regular files only (#335), so the
+            -- apps claims on usr/bin/python3 can never pass against a
+            -- link. Stage real shims — the cc-precedent (gcc.lua).
+            "printf '#!/bin/sh\\nexec /usr/bin/python3.14 \"$@\"\\n' > $STAGE/usr/bin/python3",
+            "chmod +x $STAGE/usr/bin/python3",
+            "cp $STAGE/usr/bin/python3 $STAGE/usr/bin/python",
         }, " && "),
 
         type = "source",
