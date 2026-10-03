@@ -21,6 +21,13 @@ return {
         architectures = { "amd64", "arm64", "armhf" },
         type = "source",
         requires = { "linux-headers" },
+        -- The build tools the sandbox stages for configure/make (the
+        -- build/link split, ADR-0018): glibc's configure demands bison
+        -- and awk unconditionally (config.status runs awk even with
+        -- pre-generated parsers in the tarball). Live 2026-10-03: a
+        -- build-deps-less glibc died at "./config.status: awk: command
+        -- not found" on the farm and in every fresh pod sandbox.
+        build_deps = { "gcc", "make", "bison", "gawk" },
         source = {
             url = "https://ftp.gnu.org/gnu/glibc/glibc-2.43.tar.xz",
         },
