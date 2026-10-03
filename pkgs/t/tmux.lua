@@ -17,7 +17,7 @@
 return {
     default = snap {
         name = "tmux",
-        version = "3.7",
+        version = "3.7.0",
         summary = "Terminal multiplexer",
         description = [[
             tmux is a terminal multiplexer. It lets you switch easily

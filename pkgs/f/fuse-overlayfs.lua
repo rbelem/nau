@@ -22,7 +22,7 @@
 return {
     default = snap {
         name = "fuse-overlayfs",
-        version = "1.18",
+        version = "1.18.0",
         summary = "FUSE overlay filesystem for rootless containers",
         description = [[
             fuse-overlayfs provides an overlay filesystem in userspace

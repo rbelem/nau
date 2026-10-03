@@ -4,7 +4,7 @@
 return {
     default = snap {
         name = "autoconf",
-        version = "2.72",
+        version = "2.72.0",
         summary = "GNU tool for generating configure scripts",
         description = [[Autoconf 2.72 generates shell scripts that can automatically configure source
 code packages. These scripts adapt packages to many kinds of UNIX-like

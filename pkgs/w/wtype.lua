@@ -21,7 +21,7 @@
 return {
     default = snap {
         name = "wtype",
-        version = "0.4",
+        version = "0.4.0",
         summary = "Wayland virtual keyboard typing tool",
         description = [[
             wtype types text on Wayland compositors by creating a

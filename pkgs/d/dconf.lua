@@ -66,7 +66,7 @@ return {
 
         type = "source",
         requires = { "glibc", "glib" },
-        build_deps = { "dbus", "meson", "ninja", "pkg-config", "gcc"},
+        build_deps = { "dbus", "meson", "ninja", "pkg-config", "gcc", "glib"},
 
         apps = {
             -- The CLI reads/writes the user's dconf database (the

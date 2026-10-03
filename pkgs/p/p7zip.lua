@@ -10,7 +10,7 @@
 return {
     default = snap {
         name = "p7zip",
-        version = "26.03",
+        version = "26.03.0",
         summary = "7-Zip file archiver for Linux (7zz)",
         description = [[
             7-Zip is a file archiver with a high compression ratio,
