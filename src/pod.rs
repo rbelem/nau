@@ -3359,6 +3359,7 @@ fn queue_held_deps_verify(ctx: &ReconcileCtx<'_>, name: &str, build: &mut Reconc
         name: name.to_string(),
         blob,
         expected_hash: hash,
+        fallback: None,
     });
 }
 
@@ -3379,10 +3380,15 @@ fn queue_held_loaded_deps_verify(
         return Ok(());
     };
     let blob = ctx.store.blob_path(&hash);
+    let fallback = source_pod.map(|pod| FallbackBlob {
+        pod: pod.to_string(),
+        blob: crate::runtime::RuntimeStore::new(ctx.root.join(pod)).blob_path(&hash),
+    });
     build.held_blob_verifies.push(HeldBlobVerify {
         name: name.to_string(),
         blob,
         expected_hash: hash,
+        fallback,
     });
     Ok(())
 }
@@ -3407,14 +3413,26 @@ fn declaring_pod_deps_pin(
 
 /// One queued held-blob verification (issue #125 + ADR-0048, parallel
 /// pass per sync-speed plan item 4): the package whose hold recorded
-/// the pin, the blob path, and the expected sha256. Triples queue in
-/// lockfile iteration order; the pass reports the FIRST failure in that
-/// order.
+/// the pin, the blob path, the expected sha256, and — for LOADED
+/// members (issue #334) — the declaring pod's store, where the closure
+/// canonically lives. Triples queue in lockfile iteration order; the
+/// pass reports the FIRST failure in that order.
 #[derive(Debug)]
 struct HeldBlobVerify {
     name: String,
     blob: PathBuf,
     expected_hash: String,
+    fallback: Option<FallbackBlob>,
+}
+
+/// The declaring pod's copy of a loaded member's closure (issue #334):
+/// the loading pod's local copy is incidental — `pod gc` may sweep it —
+/// while the pin belongs to the pod whose lock records it. The verify
+/// consults this store when the local blob is absent.
+#[derive(Debug)]
+struct FallbackBlob {
+    pod: String,
+    blob: PathBuf,
 }
 
 /// The parallel held-blob verify (sync-speed plan item 4): hash every
@@ -3444,7 +3462,12 @@ fn verify_held_blobs(build: &ReconcileBuild) -> miette::Result<()> {
                     break;
                 }
                 let triple = &triples[i];
-                if let Err(e) = check_held_blob(&triple.name, &triple.blob, &triple.expected_hash) {
+                if let Err(e) = check_held_blob(
+                    &triple.name,
+                    &triple.blob,
+                    &triple.expected_hash,
+                    triple.fallback.as_ref(),
+                ) {
                     failures
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
@@ -3472,8 +3495,36 @@ fn verify_held_blobs(build: &ReconcileBuild) -> miette::Result<()> {
 /// the same closure) costs no second read. This is ALSO the worker body
 /// of [`verify_held_blobs`] — the error messages here are the sync's
 /// held-verify contract, verbatim.
-fn check_held_blob(name: &str, blob: &Path, hash: &str) -> miette::Result<()> {
+///
+/// Loaded members (issue #334): a pin from the declaring pod's lock
+/// resolves against the DECLARING pod's store when the local copy is
+/// absent — the closure canonically lives there, and the local copy is
+/// gc-sweepable. A LOCAL tampered blob still refuses (fail-closed); a
+/// blob missing from BOTH stores names the declaring pod and the one
+/// repair that actually works (`deps fetch --name <declaring pod>` —
+/// the old message's bare `nau deps fetch` cannot fix this case).
+fn check_held_blob(
+    name: &str,
+    blob: &Path,
+    hash: &str,
+    fallback: Option<&FallbackBlob>,
+) -> miette::Result<()> {
     if !blob.exists() {
+        if let Some(fb) = fallback {
+            if fb.blob.exists()
+                && nau_core::blob_memo::memoized_sha256_file(&fb.blob).is_ok_and(|h| h == hash)
+            {
+                return Ok(());
+            }
+            miette::bail!(
+                "held loaded package '{name}' (declared by pod '{}'): dependency closure \
+                 {hash:.12}… is missing from this pod's store and from the declaring pod's \
+                 store — run `nau deps fetch --name {}` to restore the declaring pod's copy \
+                 (this sync verifies that store when the local copy is absent)",
+                fb.pod,
+                fb.pod
+            );
+        }
         miette::bail!(
             "held package '{name}': dependency closure {hash:.12}… is missing from the pod \
              store — the held sync refuses to proceed; run `nau deps fetch` to fetch it"
@@ -8963,6 +9014,105 @@ pod {
         assert!(
             format!("{err}").contains("hash mismatch"),
             "the verify pass must refuse loud on a tampered closure: {err}"
+        );
+    }
+
+    /// A held LOADED member whose blob is absent from THIS pod's store
+    /// but intact in the DECLARING pod's store (issue #334): the pin
+    /// HOLDS — the closure canonically lives in the declaring pod's
+    /// store, and the loading pod's copy is gc-sweepable. The old
+    /// behavior refused (missing from the pod store) with a repair
+    /// message that could not fix the case.
+    #[test]
+    fn test_held_loaded_member_holds_on_the_declaring_pods_store_copy() {
+        use sha2::{Digest, Sha256};
+        let meta = bare_meta("tool", "1.0");
+        let content = b"closure bytes";
+        let hash: String = Sha256::digest(content)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+
+        // The loading pod's store carries NOTHING; the declaring pod's
+        // store carries the intact blob.
+        let mut fixture = hold_fixture(installed_loaded_tool(Some(meta.build_input_digest())));
+        let declaring_store =
+            crate::runtime::RuntimeStore::new(fixture._dir.path().join("upstream"));
+        let blob = declaring_store.blob_path(&hash);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, content).unwrap();
+        pin_declaring_pod_deps(&fixture, "upstream", &hash);
+        let ctx = fixture.ctx();
+        let mut build = ReconcileBuild::default();
+        let installed = loaded_hold_record(&ctx, None, false, &meta, &build)
+            .unwrap()
+            .expect("the hold decision carries; the blob check defers to the pass");
+        hold_loaded_member(&ctx, Some("upstream"), installed, &meta, &mut build).unwrap();
+        assert_eq!(build.held, vec!["tool".to_string()]);
+        verify_held_blobs(&build).unwrap();
+    }
+
+    /// Missing from BOTH stores: the refusal names the declaring pod
+    /// and the one repair that works (`deps fetch --name <pod>`), never
+    /// the bare `nau deps fetch` that cannot fix a loaded pin (the
+    /// issue #334 complaint).
+    #[test]
+    fn test_held_loaded_member_missing_everywhere_names_the_declaring_pod_repair() {
+        let meta = bare_meta("tool", "1.0");
+        let hash = "b2".repeat(32);
+        let mut fixture = hold_fixture(installed_loaded_tool(Some(meta.build_input_digest())));
+        pin_declaring_pod_deps(&fixture, "upstream", &hash);
+        let ctx = fixture.ctx();
+        let mut build = ReconcileBuild::default();
+        let installed = loaded_hold_record(&ctx, None, false, &meta, &build)
+            .unwrap()
+            .expect("the hold decision carries; the blob check defers to the pass");
+        hold_loaded_member(&ctx, Some("upstream"), installed, &meta, &mut build).unwrap();
+        let err = verify_held_blobs(&build).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("declared by pod 'upstream'"), "{msg}");
+        assert!(
+            msg.contains("nau deps fetch --name upstream"),
+            "must name the workable repair: {msg}"
+        );
+        assert!(
+            !msg.contains("run `nau deps fetch` to fetch"),
+            "must not send the operator down the unworkable repair: {msg}"
+        );
+    }
+
+    /// A tampered LOCAL copy still refuses even when the declaring
+    /// pod's store is intact: the fallback is for ABSENCE only — local
+    /// corruption is a real signal and stays fail-closed (issue #125).
+    #[test]
+    fn test_held_loaded_member_local_tamper_still_refuses_despite_a_good_fallback() {
+        use sha2::{Digest, Sha256};
+        let meta = bare_meta("tool", "1.0");
+        let content = b"closure bytes";
+        let hash: String = Sha256::digest(content)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let mut fixture = hold_fixture(installed_loaded_tool(Some(meta.build_input_digest())));
+        let local = fixture.store.blob_path(&hash);
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(&local, b"tampered").unwrap();
+        let declaring_store =
+            crate::runtime::RuntimeStore::new(fixture._dir.path().join("upstream"));
+        let blob = declaring_store.blob_path(&hash);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, content).unwrap();
+        pin_declaring_pod_deps(&fixture, "upstream", &hash);
+        let ctx = fixture.ctx();
+        let mut build = ReconcileBuild::default();
+        let installed = loaded_hold_record(&ctx, None, false, &meta, &build)
+            .unwrap()
+            .expect("the hold decision carries; the blob check defers to the pass");
+        hold_loaded_member(&ctx, Some("upstream"), installed, &meta, &mut build).unwrap();
+        let err = verify_held_blobs(&build).unwrap_err();
+        assert!(
+            format!("{err}").contains("hash mismatch"),
+            "local tamper must stay loud: {err}"
         );
     }
 
