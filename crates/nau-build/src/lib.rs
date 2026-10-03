@@ -20,6 +20,9 @@ pub mod cache;
 pub mod leak_scan;
 pub mod snap;
 pub mod source_cache;
+pub mod source_fetch;
+
+pub use source_fetch::SourceFetcher;
 
 #[cfg(test)]
 pub(crate) mod test_env;

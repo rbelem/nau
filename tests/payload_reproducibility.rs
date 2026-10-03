@@ -11,10 +11,11 @@
 //! phase upstream of packing (run_build environment paths, patchelf/
 //! wrapper writes, closure mounts) — reproducing it needs a real
 //! package build with network sources, tracked as the follow-up unit.
-//! The float hold sidesteps the whole question today (holds ride input
-//! identity); these gates keep the pack layer honest for the day the
-//! output-compare paths (refresh churn guard, rollback trust,
-//! ADR-0033/ADR-0043) come back.
+//! The follow-up unit has landed (c55bcef fixed the serialization
+//! order; payload_reproducibility_build.rs pins the full pipeline), so
+//! the output-compare paths (refresh churn guard, rollback trust,
+//! ADR-0033/ADR-0043) are load-bearing again; these gates keep the
+//! pack layer honest under that trust.
 
 use std::path::Path;
 use std::process::Command;
@@ -121,6 +122,7 @@ fn build_once(fresh_mtimes: bool) -> String {
         None,
         None,
         false,
+        None,
     )
     .unwrap();
     let payload = out.path().join(&result.snap_filename);
@@ -218,6 +220,7 @@ fn same_tree_different_creation_order_packs_identically() {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         let payload = out.path().join(&result.snap_filename);
@@ -269,6 +272,7 @@ fn same_large_tree_twice_packs_identically() {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         digests.push(sha3_384_hex(&out.path().join(&result.snap_filename)));

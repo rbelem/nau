@@ -6406,15 +6406,19 @@ fn resolve_service_overrides_against_meta(
 /// output-compare paths treat reproducibility as an ASSUMPTION: the
 /// install_batch no-op skip and the churn guard compare payload sha3-
 /// 384s, which is only sound if two builds of an identical tree produce
-/// identical bytes. Measured 2026-10-02: reproducibility is UNRELIABLE
-/// today — hermes-agent v2026.8.31 (a stable tag, unchanged upstream)
-/// produced payload digests 9caea2… → 92b0ac… → 9caea2… across three
-/// consecutive syncs. Idempotency therefore rests on INPUT-identity
-/// holds, not output compares: the #113/#331 recipe-digest holds and the
-/// ADR-0017 Decision 4a float hold (observed input tuple) keep content
-/// installed without trusting a digest flip. A gate test ("same tree
-/// twice ⇒ identical sha3") must restore and pin output reproducibility
-/// before any output-compare path is treated as load-bearing again.
+/// identical bytes. Measured 2026-10-02 as UNRELIABLE (hermes-agent
+/// payload digests 9caea2… ↔ 92b0ac… across consecutive syncs) — the
+/// cause was root-caused and fixed (c55bcef: SnapMeta.apps HashMap
+/// order randomized meta/snap.yaml), and reproducibility is now
+/// gate-pinned at both layers: packing by tests/payload_reproducibility.rs
+/// (four same-tree-twice arms against the real mksquashfs), the full
+/// build_snap pipeline — run_build, ELF repair, launcher wrappers — by
+/// tests/payload_reproducibility_build.rs. The output compares are
+/// load-bearing again. The input-identity holds — the #113/#331
+/// recipe-digest stamps and the ADR-0017 Decision 4a float hold — stay
+/// by design: they are the cheaper zero-build path (idempotency is
+/// decided before any build is paid), not a workaround for
+/// instability.
 const POD_BUILD_EPOCH: &str = "946684800";
 
 /// Stamp the pod build epoch unless the user chose one. Called by every
@@ -6495,6 +6499,7 @@ fn build_pending_snap(
         build_prefix.as_ref().map(|p| p.path()),
         scan_listings.as_ref(),
         bypass_source_cache,
+        Some(&crate::build_orch::SeamSourceFetcher),
     )?;
     let payload = downloads.join(&result.snap_filename);
     // The build just (re)wrote these bytes: any memo entry for the path
@@ -6668,6 +6673,7 @@ fn ensure_pod_dep_payload(
         scan_listings.as_ref(),
         // A dependency payload fetch is not a drift-observation point.
         false,
+        Some(&crate::build_orch::SeamSourceFetcher),
     )?;
     building.pop();
     let fresh = downloads.join(&result.snap_filename);

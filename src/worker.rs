@@ -397,6 +397,7 @@ fn finish_job(
         Some(&scan_listings),
         // Not a drift-observation point.
         false,
+        Some(&crate::build_orch::SeamSourceFetcher),
     );
     let build_ms = Some(build_started.elapsed().as_millis() as u64);
 

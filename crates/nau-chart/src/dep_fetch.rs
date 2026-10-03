@@ -2672,7 +2672,11 @@ fn parse_last_header(path: &Path, name: &str) -> Option<String> {
 /// for free on every full fetch. The body lands via a sibling temp file
 /// renamed over `dest` only on a 200 — a failure never leaves a partial
 /// or empty file at the destination.
-fn http_get_to_file(url: &str, dest: &Path) -> miette::Result<()> {
+///
+/// Public so the root composition can inject it as the multi-source
+/// `SourceFetcher` (ADR-0053 keeps nau-build network-free; the root
+/// wires this retrying seam in, nau-build only sees the trait).
+pub fn http_get_to_file(url: &str, dest: &Path) -> miette::Result<()> {
     let tmp = dest.with_file_name(format!(
         ".{}.tmp-{}",
         dest.file_name()

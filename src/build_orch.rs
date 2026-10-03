@@ -12,6 +12,22 @@ use crate::cache::PackageCache;
 use crate::lock::{LockFile, SourceLockEntry};
 use crate::snap::{PackageInput, SourceSpec};
 
+// ── Injected multi-source fetcher (ADR-0053 composition) ──
+// nau-build is network-free by charter; the root wires the retrying
+// curl seam in as the `SourceFetcher`. `None` call sites (tests) keep
+// the built-in one-shot `curl -fsSL` fallback.
+
+/// Root-composed source fetcher: routes multi-source tarball downloads
+/// through nau-chart's seam — 429/403-Retry-After backoff with the
+/// shared per-process budget, contact UA, atomic temp+rename (0afc6e8).
+pub(crate) struct SeamSourceFetcher;
+
+impl nau_build::SourceFetcher for SeamSourceFetcher {
+    fn fetch(&self, url: &str, dest: &Path) -> miette::Result<()> {
+        crate::dep_fetch::http_get_to_file(url, dest)
+    }
+}
+
 // ── Package name resolution ──
 // If file doesn't exist on disk, try resolving as a package name from
 // local pkgs/ or from initialized input sources.
@@ -555,6 +571,7 @@ fn ensure_dep_payload(
         Some(&scan_listings),
         // Not a drift-observation point.
         false,
+        Some(&SeamSourceFetcher),
     )?;
     if !json && !quiet {
         crate::output::ok(&result.snap_filename);
@@ -1148,6 +1165,7 @@ fn build_dep_archs(
             Some(&scan_listings),
             // Not a drift-observation point.
             false,
+            Some(&SeamSourceFetcher),
         ) {
             Ok(result) => {
                 if !json && !quiet {
@@ -1322,6 +1340,7 @@ fn build_one_arch(
         Some(&scan_listings),
         // Not a drift-observation point.
         false,
+        Some(&SeamSourceFetcher),
     )?;
     if !json {
         crate::output::ok(&result.snap_filename);

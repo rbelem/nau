@@ -122,7 +122,12 @@ cache entry becomes a build input of every downstream package, so the
 blast radius of one compromised key is the whole build graph. The flat
 v1 trust set sharpens this; the interim controls are mandatory digest
 validation, mandatory signatures, revocation-on-reuse, and the
-rebuild-compare ritual. Per-lane compression forks the namespace
+rebuild-compare ritual. The ritual's soundness precondition —
+full-pipeline build determinism — is gate-pinned
+(`tests/payload_reproducibility.rs` for packing,
+`tests/payload_reproducibility_build.rs` for the full build_snap
+pipeline; the A2 serialization bistability was root-caused and fixed in
+c55bcef). Per-lane compression forks the namespace
 explicitly (compression is inside the v5 key): each (closure,
 compression) pair is a distinct valid entry — pin one compression per
 lane role (zstd for LAN; xz or higher zstd for WAN) rather than leaving
