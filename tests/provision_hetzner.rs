@@ -17,11 +17,11 @@ use nau::provision::publish::{
     PublishChannel,
 };
 use nau::provision::{
-    append_worker_entry, issue_wait, issue_wait_nudge, now_epoch_secs, parse_ttl, render_user_data,
-    ProvisionRequest, Provisioner, UserDataParams, BLOCK_BEGIN, BLOCK_END,
-    MKSQUASHFS_ARTIFACT_SHA256, PLAN_MACHINE_IDENTITY, PLAN_PUBLISH_TOKEN, PLAN_PUBLISH_URL,
-    SQUASHFS_TOOLS_RELEASE_DATE, SQUASHFS_TOOLS_TARBALL_URL, SQUASHFS_TOOLS_VERSION,
-    UNSQUASHFS_ARTIFACT_SHA256,
+    append_worker_entry, evict_worker_entry, issue_wait, issue_wait_nudge, managed_entries,
+    now_epoch_secs, parse_ttl, render_user_data, ProvisionRequest, Provisioner, UserDataParams,
+    BLOCK_BEGIN, BLOCK_END, MKSQUASHFS_ARTIFACT_SHA256, PLAN_MACHINE_IDENTITY, PLAN_PUBLISH_TOKEN,
+    PLAN_PUBLISH_URL, SQUASHFS_TOOLS_RELEASE_DATE, SQUASHFS_TOOLS_TARBALL_URL,
+    SQUASHFS_TOOLS_VERSION, UNSQUASHFS_ARTIFACT_SHA256,
 };
 
 /// A shape-valid ed25519 public line — throwaway fixture bytes, no
@@ -849,6 +849,37 @@ fn pin_failure_after_create_tears_down() {
     let text = format!("{err:#}");
     assert!(text.contains("tore down 1 created server"), "{text}");
     assert!(text.contains("config untouched"), "{text}");
+}
+
+/// An absent config is an empty starter: provision's first pin creates
+/// the file with the managed block; teardown on an absent file is a
+/// green no-op that creates nothing (live 2026-10-02: provision tore
+/// down a CREATED server because `--file` did not exist yet).
+#[test]
+fn absent_config_is_an_empty_starter_for_both_directions() {
+    let (_d, config) = workspace("nau.lua");
+    assert!(!config.exists(), "fixture starts absent");
+
+    // Teardown arm: no entries, nothing written.
+    assert_eq!(managed_entries(&config).unwrap().len(), 0);
+    assert!(
+        !evict_worker_entry(&config, "ssh://root@203.0.113.99").unwrap(),
+        "an absent file evicts nothing"
+    );
+    assert!(!config.exists(), "teardown creates nothing");
+
+    // Provision arm: the first pin creates the file, block included.
+    append_worker_entry(
+        &config,
+        "ssh://root@203.0.113.10",
+        "ssh-ed25519 AAAAfirst nau-worker-x",
+        OPERATOR_IDENTITY,
+    )
+    .unwrap();
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(text.contains(BLOCK_BEGIN), "block present: {text}");
+    assert!(text.contains("ssh://root@203.0.113.10"), "entry pinned");
+    assert_eq!(managed_entries(&config).unwrap().len(), 1);
 }
 
 #[test]
