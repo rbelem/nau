@@ -273,3 +273,143 @@ fn same_tree_twice_builds_identical_payloads_through_full_pipeline() {
          variance; kept both payloads under /tmp/nau-a2-build-* for diff"
     );
 }
+
+// ── Large-tree arm ──
+//
+// The tiny-ELF fixture above leaves most of the build-phase machinery
+// under-exercised at scale: the original A2 bistability only reproduced
+// on hermes-agent-sized trees (payload_reproducibility.rs had to add a
+// 4000-file arm even for the pack layer). This arm carries the same
+// full-pipeline proof over a programmatically generated large source
+// tree, so the fetch → extract → build → pack path sees realistic
+// breadth.
+
+/// Deterministic pseudo-random bytes from a seeded 64-bit LCG (Knuth's
+/// constants). No RNG dependency; the same seed and length always
+/// produce the same bytes, so the generated tree is byte-stable across
+/// runs and across machines.
+fn lcg_bytes(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed | 1;
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+/// Files generated in the nested `data/` subtree. 4000 mirrors the
+/// pack-layer scale arm; shrunk only if the pair of full builds
+/// outlives the ~90s budget.
+const LARGE_TREE_FILES: u32 = 4000;
+
+/// Build the large source tarball: the real fixture ELF at `tool` (the
+/// build copies it to $STAGE/bin/tool, so ELF repair and wrapper
+/// authoring see the same target as the tiny arm) plus copies under two
+/// more names, then a generated tree of 4000 files in 20 nested module
+/// directories with mixed LCG-filled sizes and 8 larger 256 KiB blobs.
+fn make_large_source_tarball(server_dir: &Path, name: &str, elf: &Path) -> String {
+    let top = server_dir.join(name);
+    let _ = std::fs::remove_dir_all(&top);
+    std::fs::create_dir_all(&top).unwrap();
+    std::fs::copy(elf, top.join("tool")).unwrap();
+    std::fs::copy(elf, top.join("tool-alt")).unwrap();
+    std::fs::copy(elf, top.join("helper")).unwrap();
+    let data = top.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    for i in 0..LARGE_TREE_FILES {
+        let dir = data.join(format!("mod-{:02}", i % 20));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Size varies with i so the pack sees mixed fragment content.
+        let len = 512 + (i as usize % 4096);
+        let body = lcg_bytes(0x9E37_79B9_7F4A_7C15 ^ (i as u64), len);
+        std::fs::write(dir.join(format!("file-{i:05}.bin")), body).unwrap();
+    }
+    for j in 0..8u32 {
+        let body = lcg_bytes(0xDEAD_BEEF_CAFE_F00D ^ (j as u64), 256 * 1024);
+        std::fs::write(data.join(format!("big-{j}.bin")), body).unwrap();
+    }
+    std::fs::write(
+        top.join("README"),
+        "full-pipeline large-tree determinism fixture\n",
+    )
+    .unwrap();
+    let tarball = server_dir.join(format!("{name}.tar.gz"));
+    let status = Command::new("tar")
+        .args(["czf"])
+        .arg(&tarball)
+        .arg(name)
+        .current_dir(server_dir)
+        .status()
+        .unwrap();
+    assert!(status.success(), "tar failed");
+    format!("{name}.tar.gz")
+}
+
+/// Same meta shape as [`full_pipeline_meta`], but the build command also
+/// copies the generated `data/` subtree into the stage — only staged
+/// files reach the squashfs, so without this the 4000 files would never
+/// enter the payload.
+fn large_tree_pipeline_meta(url: &str, sha256: &str) -> SnapMeta {
+    let mut meta = full_pipeline_meta(url, sha256);
+    meta.name = "repro-build-large".into();
+    meta.description = Some("same-tree-twice large-tree, full build_snap pipeline".into());
+    meta.build = Some(
+        "mkdir -p $STAGE/bin && \
+         cp $SRC/src0/tool $STAGE/bin/tool && \
+         cp $SRC/src0/tool-alt $STAGE/bin/tool-alt && \
+         cp $SRC/src0/helper $STAGE/bin/helper && \
+         chmod +x $STAGE/bin/tool $STAGE/bin/tool-alt $STAGE/bin/helper && \
+         cp -r $SRC/src0/data $STAGE/data"
+            .into(),
+    );
+    meta
+}
+
+/// The large-tree arm of the restore condition: the same full-pipeline
+/// proof over a 4000-file source tree. Closes the gap the pack-layer
+/// scale arm exposed — variance that only fires on large trees must not
+/// sneak past a tiny-fixture-only gate. Both builds run with fresh stage
+/// dirs (fresh mtimes, the production condition) and must yield
+/// identical payload sha3-384.
+#[test]
+fn same_tree_twice_identical_payloads_large_tree() {
+    if !chain_available() {
+        eprintln!("skipping: mksquashfs/unsquashfs/curl/tar unavailable");
+        return;
+    }
+    if c_compiler().is_none() {
+        eprintln!("skipping: no C compiler for the fixture ELF");
+        return;
+    }
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("SOURCE_DATE_EPOCH", "946684800");
+
+    let server = tempfile::tempdir().unwrap();
+    let elf = compile_real_elf(server.path());
+    let tarball_name = make_large_source_tarball(server.path(), "src0-large-1.0", &elf);
+    let tarball_path = server.path().join(&tarball_name);
+    let sha256 = sha256_file(&tarball_path);
+    let port = serve_dir(server.path());
+
+    let meta =
+        large_tree_pipeline_meta(&format!("http://127.0.0.1:{port}/{tarball_name}"), &sha256);
+    let t0 = std::time::Instant::now();
+    let a = build_full_pipeline_once(&meta, 3);
+    let first = t0.elapsed();
+    let b = build_full_pipeline_once(&meta, 4);
+    let total = t0.elapsed();
+    eprintln!(
+        "large-tree arm: build 1 {first:?}, build 2 {:?}, total {total:?} ({} files)",
+        total - first,
+        LARGE_TREE_FILES
+    );
+    assert_eq!(
+        a, b,
+        "large-tree full-pipeline builds diverged — build-phase variance \
+         fires at scale; kept both payloads under /tmp/nau-a2-build-*"
+    );
+}
