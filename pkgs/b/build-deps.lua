@@ -34,6 +34,8 @@ return {
             "gettext",
             "pkg-config",
             "perl", -- pulled by autotools
+            "bison", -- glibc's configure demands it unconditionally
+            "gawk", -- config.status runs awk even with pre-generated parsers
             "toolchain", -- resolves via alias → gcc-gnu-x86_64
         },
     },

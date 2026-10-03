@@ -21,13 +21,14 @@ return {
         architectures = { "amd64", "arm64", "armhf" },
         type = "source",
         requires = { "linux-headers" },
-        -- The build tools the sandbox stages for configure/make (the
-        -- build/link split, ADR-0018): glibc's configure demands bison
-        -- and awk unconditionally (config.status runs awk even with
-        -- pre-generated parsers in the tarball). Live 2026-10-03: a
-        -- build-deps-less glibc died at "./config.status: awk: command
-        -- not found" on the farm and in every fresh pod sandbox.
-        build_deps = { "gcc", "make", "bison", "gawk" },
+        -- NOTE (2026-10-03): glibc cannot declare its own build_deps —
+        -- every build tool requires glibc, and the resolver walks
+        -- build_deps edges with the runtime closure, so glibc → gawk →
+        -- glibc is a hard cycle (live: every daily sync refused after
+        -- the attempt). The build tools ride the ambient build-deps
+        -- floor instead; bison+gawk joined that floor's requires in the
+        -- same window. A scoped build-sandbox resolution (build_deps
+        -- edges outside the runtime closure graph) is the real fix.
         source = {
             url = "https://ftp.gnu.org/gnu/glibc/glibc-2.43.tar.xz",
         },
