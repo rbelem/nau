@@ -411,6 +411,7 @@ impl BuildStep for PoolBuild {
                 None,
                 None,
                 false,
+                Some(&crate::build_orch::SeamSourceFetcher),
             ) {
                 Ok(result) => {
                     *snap_name.lock().unwrap() = Some(result.snap_filename);

@@ -1964,6 +1964,7 @@ pub fn build_snap(
     build_prefix: Option<&Path>,
     leak_scan: Option<&crate::leak_scan::PayloadListings>,
     bypass_source_cache: bool,
+    source_fetcher: Option<&dyn crate::source_fetch::SourceFetcher>,
 ) -> miette::Result<BuildResult> {
     let build_dir = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
@@ -1978,6 +1979,7 @@ pub fn build_snap(
         deps_dir,
         build_prefix,
         bypass_source_cache,
+        source_fetcher,
     )?;
 
     // 1a. Repair native-ELF command binaries for portability (ticket #12):
@@ -2266,6 +2268,7 @@ fn run_build(
     deps_dir: Option<&Path>,
     build_prefix: Option<&Path>,
     bypass_source_cache: bool,
+    source_fetcher: Option<&dyn crate::source_fetch::SourceFetcher>,
 ) -> miette::Result<BuildOutcome> {
     // Build plan: `parts` and `build` are mutually exclusive (the DSL
     // enforces this; re-checked here for non-DSL constructors).
@@ -2329,6 +2332,7 @@ fn run_build(
             deps_dir,
             build_prefix,
             bypass_source_cache,
+            source_fetcher,
         );
     }
 
@@ -2480,6 +2484,7 @@ fn run_build(
 /// `$SRC` (trees are siblings of part work dirs; name collisions are
 /// rejected in the DSL and at the parse boundary). `cwd` is the build
 /// tree root in single-part mode.
+#[allow(clippy::too_many_arguments)]
 fn run_multi_source_build(
     meta: &SnapMeta,
     sources: &std::collections::BTreeMap<String, SourceSpec>,
@@ -2488,6 +2493,7 @@ fn run_multi_source_build(
     deps_dir: Option<&Path>,
     build_prefix: Option<&Path>,
     bypass_source_cache: bool,
+    source_fetcher: Option<&dyn crate::source_fetch::SourceFetcher>,
 ) -> miette::Result<BuildOutcome> {
     let build_dir = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
@@ -2518,6 +2524,7 @@ fn run_multi_source_build(
             &build_path,
             meta.floating,
             bypass_source_cache,
+            source_fetcher,
         )?);
     }
 
@@ -2576,18 +2583,33 @@ fn download_multi_source_tarball(
     expected: &str,
     cache_pin: Option<&str>,
     tarball: &Path,
+    source_fetcher: Option<&dyn crate::source_fetch::SourceFetcher>,
 ) -> miette::Result<String> {
     let dl_spinner = output::spinner(&format!("downloading source '{name}'..."));
-    let curl = floor_tool(nau_infra::tools::ToolName::Curl)?;
-    let status = std::process::Command::new(&curl)
-        .args(["-fsSL", "-o", &tarball.to_string_lossy(), url])
-        .status()
-        .map_err(|e| miette::miette!("curl not found: {}", e))?;
-    if !status.success() {
-        output::finish_err(&dl_spinner, &format!("download failed: {name}"));
-        return Err(miette::miette!(
-            "failed to download {url} (source '{name}')"
-        ));
+    match source_fetcher {
+        Some(fetcher) => {
+            // Injected seam (root composition): retry + UA policy ride
+            // along; its failure shape (`failed to download {url}
+            // (HTTP <code>[, after N attempts])`) replaces the raw
+            // one-shot wording.
+            if let Err(e) = fetcher.fetch(url, tarball) {
+                output::finish_err(&dl_spinner, &format!("download failed: {name}"));
+                return Err(e);
+            }
+        }
+        None => {
+            let curl = floor_tool(nau_infra::tools::ToolName::Curl)?;
+            let status = std::process::Command::new(&curl)
+                .args(["-fsSL", "-o", &tarball.to_string_lossy(), url])
+                .status()
+                .map_err(|e| miette::miette!("curl not found: {}", e))?;
+            if !status.success() {
+                output::finish_err(&dl_spinner, &format!("download failed: {name}"));
+                return Err(miette::miette!(
+                    "failed to download {url} (source '{name}')"
+                ));
+            }
+        }
     }
     output::finish_ok(&dl_spinner, &format!("downloaded source '{name}'"));
 
@@ -2611,6 +2633,7 @@ fn fetch_and_extract_source(
     build_path: &Path,
     floating: bool,
     bypass_source_cache: bool,
+    source_fetcher: Option<&dyn crate::source_fetch::SourceFetcher>,
 ) -> miette::Result<SourceInfo> {
     let url = spec.url();
     if !url.starts_with("http://") && !url.starts_with("https://") {
@@ -2656,7 +2679,9 @@ fn fetch_and_extract_source(
             output::ok(format!("served source '{name}' from the source cache"));
             hit
         }
-        None => download_multi_source_tarball(name, url, expected, cache_pin, &tarball)?,
+        None => {
+            download_multi_source_tarball(name, url, expected, cache_pin, &tarball, source_fetcher)?
+        }
     };
     output::ok(format!(
         "SHA-256 verified for '{name}': {:.16}...",
@@ -5876,6 +5901,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         );
         assert!(result.is_ok());
 
@@ -5947,6 +5973,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(snap_amd64.snap_filename, "multi-test_2.0_amd64.snap");
@@ -5964,6 +5991,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(snap_arm64.snap_filename, "multi-test_2.0_arm64.snap");
@@ -7596,6 +7624,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         let snap_path = output_dir.path().join(&result.snap_filename);
@@ -7711,6 +7740,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         let snap_path = output_dir.path().join(&result.snap_filename);
@@ -7799,6 +7829,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
             )
             .unwrap();
         }
@@ -7859,6 +7890,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         );
         std::env::remove_var(&override_var);
 
@@ -8334,6 +8366,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -8364,6 +8397,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -8503,8 +8537,16 @@ mod tests {
         // and a 65 MiB test tarball must not land in the user's real one.
         with_scratch_home(|_| {
             let stage = tempfile::tempdir().unwrap();
-            let outcome = run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
-                .unwrap_or_else(|e| panic!("extraction must survive the caller PATH's tar: {e:#}"));
+            let outcome = run_build(
+                &meta,
+                stage.path(),
+                StagePolicy::Default,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("extraction must survive the caller PATH's tar: {e:#}"));
             assert_eq!(outcome.sources.len(), 1);
             assert_eq!(outcome.sources[0].sha256, hash);
             // The build command ran against the extracted tree.
@@ -8640,16 +8682,32 @@ mod tests {
             let meta = loopback_source_meta(&env, port, &hash, "false");
 
             let stage = tempfile::tempdir().unwrap();
-            let first = run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
-                .unwrap_or_else(|e| panic!("first build must succeed: {e:#}"));
+            let first = run_build(
+                &meta,
+                stage.path(),
+                StagePolicy::Default,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("first build must succeed: {e:#}"));
             assert_eq!(
                 hits.load(std::sync::atomic::Ordering::Relaxed),
                 1,
                 "first build downloads"
             );
 
-            let second = run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
-                .unwrap_or_else(|e| panic!("second build must succeed: {e:#}"));
+            let second = run_build(
+                &meta,
+                stage.path(),
+                StagePolicy::Default,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("second build must succeed: {e:#}"));
             assert_eq!(
                 hits.load(std::sync::atomic::Ordering::Relaxed),
                 1,
@@ -8686,10 +8744,26 @@ mod tests {
             let meta = loopback_source_meta(&env, port, &hash, "true");
 
             let stage = tempfile::tempdir().unwrap();
-            run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
-                .unwrap_or_else(|e| panic!("first build must succeed: {e:#}"));
-            run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
-                .unwrap_or_else(|e| panic!("second build must succeed: {e:#}"));
+            run_build(
+                &meta,
+                stage.path(),
+                StagePolicy::Default,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("first build must succeed: {e:#}"));
+            run_build(
+                &meta,
+                stage.path(),
+                StagePolicy::Default,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("second build must succeed: {e:#}"));
             assert_eq!(
                 hits.load(std::sync::atomic::Ordering::Relaxed),
                 2,
@@ -8721,10 +8795,26 @@ mod tests {
             let meta = loopback_unpinned_meta(&env, port);
 
             let stage = tempfile::tempdir().unwrap();
-            run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
-                .unwrap_or_else(|e| panic!("first build must succeed: {e:#}"));
-            run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
-                .unwrap_or_else(|e| panic!("second build must succeed: {e:#}"));
+            run_build(
+                &meta,
+                stage.path(),
+                StagePolicy::Default,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("first build must succeed: {e:#}"));
+            run_build(
+                &meta,
+                stage.path(),
+                StagePolicy::Default,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("second build must succeed: {e:#}"));
             assert_eq!(
                 hits.load(std::sync::atomic::Ordering::Relaxed),
                 2,
@@ -8955,12 +9045,71 @@ mod tests {
         // Scratch HOME: the fetch now consults the source cache, and
         // this test must not populate the user's real one.
         with_scratch_home(|_| {
-            let info = fetch_and_extract_source("foo", &spec, build.path(), false, false).unwrap();
+            let info =
+                fetch_and_extract_source("foo", &spec, build.path(), false, false, None).unwrap();
             assert_eq!(info.url, spec.url());
             assert_eq!(info.sha256, hash);
             // The flattening landed the *contents* of foo-1.2 at $SRC/foo.
             assert!(build.path().join("foo/echo.txt").exists());
             assert!(!build.path().join("foo/foo-1.2").exists());
+        });
+    }
+
+    #[test]
+    fn injected_source_fetcher_drives_multi_source_download() {
+        // The root composition injects the retrying curl seam
+        // (ADR-0053: nau-build is network-free); this fake proves the
+        // build path routes through the trait and still enforces the
+        // sha256 pin on the fetched bytes.
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct FakeFetcher {
+            bytes: Vec<u8>,
+            calls: std::cell::Cell<usize>,
+        }
+        impl crate::source_fetch::SourceFetcher for FakeFetcher {
+            fn fetch(&self, _url: &str, dest: &Path) -> miette::Result<()> {
+                self.calls.set(self.calls.get() + 1);
+                std::fs::write(dest, &self.bytes)
+                    .map_err(|e| miette::miette!("fake fetch write: {e}"))
+            }
+        }
+
+        let scratch = tempfile::tempdir().unwrap();
+        let bytes = make_single_root_tarball(scratch.path(), "src0-1.0");
+        let hash = sha256_hex(&bytes);
+        let build = tempfile::tempdir().unwrap();
+        let spec = SourceSpec::Pinned {
+            url: "http://127.0.0.1:9/never-contacted.tar.gz".to_string(),
+            sha256: hash.clone(),
+        };
+
+        // Right bytes: the fetcher is called once and the pin passes.
+        let good = FakeFetcher {
+            bytes: bytes.clone(),
+            calls: std::cell::Cell::new(0),
+        };
+        with_scratch_home(|_| {
+            let info =
+                fetch_and_extract_source("src0", &spec, build.path(), false, false, Some(&good))
+                    .unwrap();
+            assert_eq!(good.calls.get(), 1);
+            assert_eq!(info.sha256, hash);
+        });
+
+        // Wrong bytes: one fetch, then the pin refuses by name.
+        let bad = FakeFetcher {
+            bytes: b"other bytes".to_vec(),
+            calls: std::cell::Cell::new(0),
+        };
+        with_scratch_home(|_| {
+            let err =
+                fetch_and_extract_source("src1", &spec, build.path(), false, false, Some(&bad))
+                    .unwrap_err()
+                    .to_string();
+            assert_eq!(bad.calls.get(), 1);
+            assert!(err.contains("SHA-256 mismatch"), "got: {err}");
         });
     }
 
@@ -8981,7 +9130,7 @@ mod tests {
             sha256: hash.clone(),
         };
         let info = with_scratch_home(|_| {
-            fetch_and_extract_source("deps", &spec, build.path(), false, false).unwrap()
+            fetch_and_extract_source("deps", &spec, build.path(), false, false, None).unwrap()
         });
         assert_eq!(info.sha256, hash);
         // Non-tarball lands at $SRC/<name> as the file itself, addressable
@@ -9005,7 +9154,7 @@ mod tests {
             sha256: "deadbeef".repeat(8), // wrong
         };
         let err = with_scratch_home(|_| {
-            fetch_and_extract_source("pkg", &spec, build.path(), false, false)
+            fetch_and_extract_source("pkg", &spec, build.path(), false, false, None)
                 .unwrap_err()
                 .to_string()
         });
@@ -9035,8 +9184,16 @@ mod tests {
             let meta = two_source_meta(&env, port, &h1, &h2);
 
             let stage = tempfile::tempdir().unwrap();
-            let outcome =
-                run_build(&meta, stage.path(), StagePolicy::Default, None, None, false).unwrap();
+            let outcome = run_build(
+                &meta,
+                stage.path(),
+                StagePolicy::Default,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
             // Two source infos recorded — one per named source, in BTreeMap
             // (sorted-by-name) order.
             assert_eq!(outcome.sources.len(), 2);
@@ -9082,9 +9239,17 @@ mod tests {
             };
 
             let stage = tempfile::tempdir().unwrap();
-            let err = run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
-                .unwrap_err()
-                .to_string();
+            let err = run_build(
+                &meta,
+                stage.path(),
+                StagePolicy::Default,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap_err()
+            .to_string();
             assert!(err.contains("source 'bar'"), "got: {err}");
             assert!(err.contains("SHA-256 mismatch"), "got: {err}");
         })
@@ -10561,6 +10726,7 @@ fi
             None,
             None,
             false,
+            None,
         )
         .unwrap();
 
