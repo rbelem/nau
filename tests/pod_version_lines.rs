@@ -119,26 +119,37 @@ fn serve_one(stream: &mut TcpStream, root: &Path) -> std::io::Result<()> {
 /// `lib/node_modules/npx-cli.js` (the cli scripts), and `bin/npm` /
 /// `bin/npx` as RELATIVE SYMLINKS into those scripts — the exact shape
 /// the official node tarball ships and the real-copy recipe fix (rm +
-/// cp -L) exists for. `<marker>` differs per line so the staged payload
-/// proves WHICH line's source landed.
+/// cp -L) exists for. Both cli scripts REQUIRE a sibling module first
+/// (npm-cli.js its package's lib/cli.js — the real npm-cli.js shape),
+/// so a copy out of `lib/node_modules` loses the require anchor and
+/// dies with MODULE_NOT_FOUND at runtime. `<marker>` differs per line
+/// so the staged payload proves WHICH line's source landed.
 fn make_nodelike_tarball(server_dir: &Path, marker: &str) {
     let pkg = server_dir.join("nodelike");
     let _ = std::fs::remove_dir_all(&pkg);
     std::fs::create_dir_all(pkg.join("bin")).unwrap();
     std::fs::create_dir_all(pkg.join("lib/node_modules/npm/bin")).unwrap();
+    std::fs::create_dir_all(pkg.join("lib/node_modules/npm/lib")).unwrap();
     std::fs::write(
         pkg.join("bin/node"),
         format!("#!/bin/sh\necho node-{marker}\n"),
     )
     .unwrap();
     std::fs::write(
+        pkg.join("lib/node_modules/npm/lib/cli.js"),
+        format!("#!/usr/bin/env node\nconsole.log('npm-resolve-{marker}')\n"),
+    )
+    .unwrap();
+    std::fs::write(
         pkg.join("lib/node_modules/npm/bin/npm-cli.js"),
-        format!("#!/usr/bin/env node\nconsole.log('npm-cli-{marker}')\n"),
+        format!("#!/usr/bin/env node\nrequire('../lib/cli.js')\nconsole.log('npm-cli-{marker}')\n"),
     )
     .unwrap();
     std::fs::write(
         pkg.join("lib/node_modules/npx-cli.js"),
-        format!("#!/usr/bin/env node\nconsole.log('npx-cli-{marker}')\n"),
+        format!(
+            "#!/usr/bin/env node\nrequire('./npm/lib/cli.js')\nconsole.log('npx-cli-{marker}')\n"
+        ),
     )
     .unwrap();
     std::os::unix::fs::symlink(
@@ -149,6 +160,7 @@ fn make_nodelike_tarball(server_dir: &Path, marker: &str) {
     std::os::unix::fs::symlink("../lib/node_modules/npx-cli.js", pkg.join("bin/npx")).unwrap();
     for path in [
         pkg.join("bin/node"),
+        pkg.join("lib/node_modules/npm/lib/cli.js"),
         pkg.join("lib/node_modules/npm/bin/npm-cli.js"),
         pkg.join("lib/node_modules/npx-cli.js"),
     ] {
@@ -385,6 +397,52 @@ gated_test!(default_line_installs_with_real_copy_wrappers, {
 
     let ext = extension_dir(root.path(), "default", "nodelike");
     assert_line_layout(&ext, "26");
+});
+
+gated_test!(wrapped_npm_npx_entries_resolve_from_the_generation_tree, {
+    // The #9 wrapper execs the bare interpreter on the `.real` entry in
+    // the generation tree, so the entry's own relative requires must
+    // resolve THERE — npm-cli.js requires its package's lib/cli.js, and
+    // npm/npx only work when the staged entry keeps that anchor.
+    if !has_tool("node") {
+        eprintln!("skipping: host node unavailable");
+        return;
+    }
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    make_nodelike_tarball(server.path(), "26");
+    write_nodelike_recipe(project.path(), port, &["26"]);
+
+    let (code, _, stderr) = run(project.path(), root.path(), &["add", "nodelike"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let ext = extension_dir(root.path(), "default", "nodelike");
+
+    // The wrapper resolves its interpreter from PATH (the bare `node`
+    // name), so the run needs a real node on PATH — the fixture's own
+    // node stub would only echo. The wrapper is invoked by absolute
+    // path, the way a pod PATH shim reaches it.
+    let path = std::env::var("PATH").unwrap_or_default();
+    for (tool, markers) in [
+        ("npm", vec!["npm-cli-26", "npm-resolve-26"]),
+        ("npx", vec!["npx-cli-26", "npm-resolve-26"]),
+    ] {
+        let out = Command::new(ext.join("usr/bin").join(tool))
+            .env("PATH", &path)
+            .output()
+            .unwrap_or_else(|e| panic!("run wrapped {tool}: {e}"));
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "wrapped {tool} must run from the generation tree; stderr: {err}"
+        );
+        for m in markers {
+            assert!(stdout.contains(m), "{tool} output must carry {m}: {stdout}");
+        }
+    }
 });
 
 gated_test!(constraint_selects_the_22_line_across_pods, {
