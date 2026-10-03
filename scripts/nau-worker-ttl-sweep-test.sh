@@ -100,6 +100,18 @@ cat >"$BIN/hcloud" <<'EOF'
 #!/bin/sh
 case "$1 $2" in
 "server list")
+    # The real hcloud names this flag --selector (-l). Refuse the wrong
+    # spelling so the suite cannot pass while the sweep breaks live
+    # (2026-10-03: the sweep shipped --label-selector; hcloud 1.68 has
+    # no such flag and every real run failed the server-list API).
+    case "$3" in
+    --selector) ;;
+    *) echo "hcloud (fake): server list expects --selector, got: $3" >&2; exit 1 ;;
+    esac
+    case "$*" in
+    *noheader*) ;;
+    *) echo "hcloud (fake): server list expects -o noheader (the NAME header row parses as a server)" >&2; exit 1 ;;
+    esac
     if [ "${HCLOUD_LIST_FAIL:-0}" = "1" ]; then
         echo "hcloud: api failure (fake)" >&2
         exit 1
