@@ -29,7 +29,7 @@ local lines = {
 -- so the lockfile pin `{version, constraint}` reproduces it. A
 -- constraint naming no declared line REFUSES: a line dropped upstream
 -- must fail the sync loud, never silently re-pin another line.
-local line = constraint or "26"
+local line = constraint and constraint:match("^(%d+)") or "26"
 local picked = lines[line]
 if picked == nil then
     error(string.format(
