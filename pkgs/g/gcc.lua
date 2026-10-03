@@ -432,6 +432,13 @@ for p in \
   "libgmp10_$a" "libmpfr6_$a" "libmpc3_$a" "libisl23_$a" \
   "zlib1g_$a" "libzstd1_$a"
 do dpkg-deb -x "$SRC/$p" "$STAGE" || exit 1; done]],
+            -- The cc consumer contract: plain Makefiles hardcode `cc`
+            -- (tree, dos2unix, xxd — every chart without autotools'
+            -- gcc-then-CC dance). Debian ships cc as an alternative
+            -- symlink the deb set does not carry; stage it ourselves.
+            -- Live 2026-10-03 farm window: every plain-Makefile chart
+            -- died at 'make: cc: No such file or directory'.
+            "mkdir -p $STAGE/usr/bin && ln -sf gcc \"$STAGE/usr/bin/cc\"",
             -- Ownership lock (#174): kernel uapi headers belong to the
             -- pool linux-headers payload (transitively in every prefix
             -- carrying gcc, via glibc). No deb in this set may restage

@@ -9,7 +9,7 @@
 return {
     default = snap {
         name = "unzip",
-        version = "6.0",
+        version = "6.0.0",
         summary = "List, test, and extract ZIP archives",
         description = [[
             UnZip is an extraction utility for archives compressed in

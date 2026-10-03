@@ -219,7 +219,8 @@ return {
             "highwayhash",
             "googletest",
             "google-benchmark",
-            "gcc"},
+            "gcc",
+            "gawk"},
 
         -- ADR-0018 interim escape (libsecret precedent): the nix gcc
         -- wrapper bakes RUNPATH=/nau-build-prefix/usr/lib into

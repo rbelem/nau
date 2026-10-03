@@ -4,7 +4,7 @@
 return {
     default = snap {
         name = "automake",
-        version = "1.17",
+        version = "1.17.0",
         summary = "GNU tool for generating Makefile.in files",
         description = [[Automake 1.17 is a tool for automatically generating Makefile.in files from
 templates. It works with Autoconf to produce portable, GNU-standard
