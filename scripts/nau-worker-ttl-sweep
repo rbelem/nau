@@ -128,7 +128,7 @@
 #
 # CLI interfaces used (fake-able via the *_BIN knobs):
 #   hcloud  (unchanged from #269):
-#     server list    --label-selector LABEL -o columns=name
+#     server list    --selector LABEL -o columns=name
 #     server describe NAME -o format='{{.Created.Unix}} {{.PublicNet.IPv4.IP}} {{index .Labels "KEY"}}'
 #     volume list    --server NAME -o columns=id        (must print nothing)
 #     server delete  NAME
@@ -449,7 +449,7 @@ due_track() {
     n_due=$((n_due + 1))
 
     if [ "$d_axis" = "hcloud" ]; then
-        if ! d_vol=$("$HCLOUD_BIN" volume list --server "$d_name" -o columns=id 2>/dev/null); then
+        if ! d_vol=$("$HCLOUD_BIN" volume list --server "$d_name" -o columns=id -o noheader 2>/dev/null); then
             n_api=$((n_api + 1))
             api_names="$api_names $d_name(volume-list)"
             fire_alert "hcloud volume list failed for $d_name — destroy BLOCKED (fail loud)"
@@ -660,7 +660,7 @@ sweep_server() {
 # on API failure (the run continues — other axes still sweep; the failure
 # is counted and alerted).
 fetch_servers() {
-    if ! SERVERS=$("$HCLOUD_BIN" server list --label-selector "$LABEL" -o columns=name 2>/dev/null); then
+    if ! SERVERS=$("$HCLOUD_BIN" server list --selector "$LABEL" -o columns=name -o noheader 2>/dev/null); then
         n_api=$((n_api + 1))
         api_names="$api_names (server-list)"
         fire_alert "hcloud server list failed — sweep skipped, NO server evaluated"
