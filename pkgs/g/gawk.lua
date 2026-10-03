@@ -22,6 +22,15 @@ return {
         source = {
             url = "https://ftp.gnu.org/gnu/gawk/gawk-5.3.1.tar.xz",
         },
+        -- gawk's configure records the sandbox build prefix in its
+        -- RUNPATHs (binaries + every extension .so) when readline sits
+        -- in the merged build prefix — the leak scan refuses the pack
+        -- otherwise (live 2026-10-03 daily converge). The same
+        -- build-only class binutils silences.
+        leaks_ok = {
+            "/nau-build-prefix",
+            "/nau-build-prefix/usr/lib64",
+        },
         build = "./configure --prefix=/usr && make && make install DESTDIR=$STAGE",
     },
 }
