@@ -2,11 +2,21 @@
 
 ## Status
 
-Accepted (deferral). Drafted 2026-10-02 after the rate-limit wave landed
-(0afc6e8: retry with backoff at the curl seam). The research and design
-below were produced by the rate-limit lane and reviewed by council in
-that wave; this ADR records the decision structurally so the deferral
-has a re-open path that is not folklore. Design source of record:
+Implemented (opt-in), 2026-10-03. Originally accepted as a deferral
+(drafted 2026-10-02 after the rate-limit wave landed, 0afc6e8: retry
+with backoff at the curl seam). The operator fired the re-open path on
+2026-10-03 and the frozen design below was implemented as specified —
+see [Implementation](#implementation). The plumbing is live but inert
+unless `GITHUB_TOKEN` is exported: opt-in by construction, unset env =
+byte-identical legacy behavior. Of the Decision 2 triggers, the one
+still ahead is `api.github.com` usage — the moment nau calls the REST
+API, the 5,000/hr quota becomes real and the token stops being a
+courtesy and starts being the point; the codeload secondary-limit
+trigger (throttling the retry budget cannot absorb) remains the
+day-to-day watch item. The research and design below were produced by
+the rate-limit lane and reviewed by council in that wave; this ADR
+records the decision structurally so the deferral had a re-open path
+that is not folklore. Design source of record:
 `/tmp/opencode/ratelimit-design.md` §4 (volatile location — superseded
 by this ADR once read).
 
@@ -82,6 +92,38 @@ and github.com → codeload IS cross-host).
      placement decision (see the multi-source rider); resolution stays
      above the seam as `Option<&str>` per ADR-0042's dependency
      direction.
+
+## Implementation
+
+Landed 2026-10-03, to the frozen design, unchanged:
+
+- **Sourcing** — `GITHUB_TOKEN` is read once at the CLI dispatch
+  boundary (`src/main.rs`, before command dispatch) and installed
+  through `nau_chart::dep_fetch::set_github_token(Option<&str>)`; the
+  core stays env-free and the credential crosses the seam as a plain
+  value, resolution above it (the ADR-0042 D5 carriage). Carriage is a
+  process-global beside `NET_RETRY_BUDGET_MS` (one invocation carries
+  one credential, syncs are serial), so threading `Option<&str>`
+  through every fetch entry point would buy nothing. Empty string =
+  unset.
+- **Redaction** — the seam writes one `Authorization: Bearer …` line to
+  a fresh 0600 sibling temp file and passes `-H @<file>`; the token
+  never appears in argv, stderr, or any error string. The credential
+  file is removed in the same cleanup block as the header dump, on
+  success and failure.
+- **Host scoping** — exact match on `github.com` / `api.github.com`
+  (port, userinfo, and case normalized); no subdomain or suffix
+  matching, so `codeload.github.com` and lookalikes never see the
+  header. No `--location-trusted`: curl's cross-host redirect strip
+  keeps the token off the codeload hop.
+- **Kill switch** — unset (or empty) `GITHUB_TOKEN`: no Authorization
+  header anywhere, byte-identical pre-implementation behavior.
+- **Tests** — loopback probes in `crates/nau-chart/src/dep_fetch.rs`:
+  header arrival plus credential-file removal on an allowed host,
+  absence on a disallowed host even with a credential installed, the
+  unset kill switch (no header even with the test-only loopback
+  allowlist on), a 401 whose error text carries no token, and a pure
+  policy test pinning the exact-host allowlist.
 
 ## Alternatives considered
 
