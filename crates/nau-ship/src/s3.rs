@@ -111,13 +111,20 @@ fn sigv4_signature(
     nau_core::sign::to_hex(&hmac_sha256(&k_signing, string_to_sign.as_bytes()))
 }
 
-/// The HTTP status from a curl `-D` header dump (first response line:
-/// `HTTP/1.1 200 OK`).
+/// The HTTP status from a curl `-D` header dump. 1xx interim responses
+/// (the `Expect: 100-continue` exchange curl runs for large bodies) are
+/// skipped: the FIRST status line is `HTTP/1.1 100 Continue` whenever a
+/// server answers the interim hop, and the final status follows it.
+/// parse takes the first line at or above 200 — a response that only
+/// carries 1xx lines (connection died mid-exchange) parses as None, the
+/// same shape as a garbage dump.
 fn parse_status(head: &str) -> Option<u16> {
-    head.lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
+    head.lines().find_map(|line| {
+        line.split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse::<u16>().ok())
+            .filter(|code| (200..1000).contains(code))
+    })
 }
 
 /// A signed rustfs client bound to one [`S3Target`]: endpoint, bucket,
@@ -225,6 +232,13 @@ impl S3Client {
         ];
         for header in headers {
             argv.extend(["-H".into(), header]);
+        }
+        if body.is_some() {
+            // curl adds `Expect: 100-continue` for bodies past 1 KiB; a
+            // server that answers the interim hop then leaves the dump's
+            // FIRST status line at 100. The empty header value stops curl
+            // from sending Expect at all — the request just uploads.
+            argv.extend(["-H".into(), "Expect:".into()]);
         }
         if let Some(bytes) = body {
             let upload = self.scratch.path().join("upload.bin");
@@ -429,11 +443,48 @@ mod tests {
     }
 
     #[test]
-    fn parse_status_reads_the_first_response_line() {
+    fn parse_status_reads_the_first_final_response_line() {
         assert_eq!(parse_status("HTTP/1.1 200 OK\r\nx: y\r\n"), Some(200));
         assert_eq!(parse_status("HTTP/1.1 404 Not Found\r\n"), Some(404));
         assert_eq!(parse_status("garbage"), None);
         assert_eq!(parse_status(""), None);
+    }
+
+    /// The `Expect: 100-continue` regression (live RustFS, 2026-10-02):
+    /// curl's header dump carries the server's interim `HTTP/1.1 100
+    /// Continue` above the final response, and the first-line parse took
+    /// the 100 as the verdict. 1xx lines are never final.
+    #[test]
+    fn parse_status_skips_interim_100_lines() {
+        let dump = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nx-amz-id-2: y\r\n";
+        assert_eq!(parse_status(dump), Some(200));
+        let failing = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 500 Internal Server Error\r\n";
+        assert_eq!(parse_status(failing), Some(500));
+        assert_eq!(parse_status("HTTP/1.1 100 Continue\r\n\r\n"), None);
+    }
+
+    /// A body-carrying request suppresses `Expect:` outright — curl then
+    /// never opens the 100-continue exchange the dump parser would have
+    /// to skip.
+    #[test]
+    fn put_argv_carries_the_expect_suppression() {
+        let target = S3Target {
+            endpoint: "http://127.0.0.1:9000".into(),
+            bucket: "b".into(),
+            region: "r".into(),
+            access_key: "a".into(),
+            secret_key: "s".into(),
+        };
+        let (fake, calls) = FakeCurl::new(200);
+        let client = S3Client::with_runner(target, Box::new(fake)).unwrap();
+        client.put("k", b"payload").unwrap();
+        let argv = calls.lock().unwrap()[0].clone();
+        let expect_at = argv.iter().position(|a| a == "Expect:").unwrap();
+        assert_eq!(argv[expect_at - 1], "-H", "rides a -H pair");
+        // GET carries no body and no suppression.
+        let _ = client.get("k").unwrap();
+        let get_argv = calls.lock().unwrap()[1].clone();
+        assert!(!get_argv.contains(&"Expect:".to_string()));
     }
 
     /// Runner that emulates curl's file side effects and records each
