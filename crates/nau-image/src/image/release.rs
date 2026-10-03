@@ -242,7 +242,12 @@ pub(crate) fn self_check(
         device: dir.join(img_name),
         manifest: dir.join(manifest_name),
         key: None,
-        slot: super::SlotSelector::Auto,
+        // Slot A explicitly: the factory table is #48's twin table (slot
+        // B ships byte-identical, same derived PARTUUIDs), which the
+        // Auto policy reads as a copied-table ambiguity. The build
+        // flashes slot A; demanding it resolves the twin by position
+        // and keeps the release self-check honest about what it proved.
+        slot: super::SlotSelector::A,
     };
     let outcome = super::verify::verify_device_at(runner, &args, veritysetup, mcopy, keys_dir)?;
     let sums = std::fs::read(dir.join("SHA256SUMS"))
@@ -1149,6 +1154,23 @@ mod tests {
         )
     }
 
+    /// The #48 factory twin table: BOTH slots carry the derived GUIDs
+    /// (slot B ships byte-identical). The self-check's SlotSelector::A
+    /// demand must resolve it by position, not refuse it as copied.
+    fn golden_gpt_json_factory_twin() -> String {
+        let (data, hash) = super::generation_guids_from_roothash(ROOTHASH).unwrap();
+        let (data_up, hash_up) = (data.to_ascii_uppercase(), hash.to_ascii_uppercase());
+        format!(
+            r#"{{"partitiontable": {{"label": "gpt", "sectorsize": 512, "partitions": [
+                {{"start": 2048, "size": 2048, "type": "C12A7328-F81F-11D2-BA4B-00A0C93EC93B", "uuid": "AABBCCDD-0011-2233-4455-667788990011", "name": "ESP"}},
+                {{"start": 4096, "size": 1024, "type": "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709", "uuid": "{data_up}", "name": "nau-demo_1.0.0_a"}},
+                {{"start": 6144, "size": 128, "type": "2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5", "uuid": "{hash_up}", "name": "nau-demo_1.0.0_hash_a"}},
+                {{"start": 8192, "size": 1024, "type": "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709", "uuid": "{data_up}", "name": "_empty"}},
+                {{"start": 9216, "size": 128, "type": "2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5", "uuid": "{hash_up}", "name": "_empty"}}
+            ]}}}}"#
+        )
+    }
+
     const FIXTURE_IMG_NAME: &str = "nau-cassini-1.0.0-amd64.img";
     const FIXTURE_MANIFEST_NAME: &str = "nau-cassini-1.0.0-amd64.manifest.json";
 
@@ -1222,6 +1244,28 @@ mod tests {
             runner.called("veritysetup"),
             "the dm-verity recompute ran in-process"
         );
+    }
+
+    #[test]
+    fn release_self_check_verifies_the_factory_twin_table_as_slot_a() {
+        // The ab=true build ships BOTH slots carrying the derived GUIDs
+        // (#48 rollback twin). The self-check's slot-A demand resolves
+        // the twin by position — a fresh release must pass its own
+        // device-policy check, not refuse its own factory table as a
+        // copied one (live 2026-10-03: the nau-host release died here).
+        let (_work, release, keys, kp) = self_check_fixture("release");
+        let runner = FakeTools::new(golden_gpt_json_factory_twin(), 0);
+        self_check(
+            &runner,
+            &release,
+            FIXTURE_IMG_NAME,
+            FIXTURE_MANIFEST_NAME,
+            &keys,
+            Some(Path::new("veritysetup")),
+            Some(Path::new("mcopy")),
+            &kp,
+        )
+        .expect("the factory twin table verifies as slot A");
     }
 
     #[test]
