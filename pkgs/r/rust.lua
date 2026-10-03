@@ -32,7 +32,7 @@
 return {
     default = snap {
         name = "rust",
-        version = "1.97.1",
+        version = "1.99.0",
         summary = "Rust toolchain — cargo, rustc, std, clippy, rustfmt",
         description = [[
             The official Rust distribution for x86_64-unknown-linux-gnu:
@@ -48,11 +48,11 @@ return {
         architectures = { "amd64" },
 
         source = {
-            url = "https://static.rust-lang.org/dist/2026-07-16/rust-1.97.1-x86_64-unknown-linux-gnu.tar.xz",
-            sha256 = "88f28fa9af20594179f85d6df67078dfd6fa93e2f6da5e1e9b0ac4997988ca4f",
+            url = "https://static.rust-lang.org/dist/2026-10-01/rust-1.99.0-x86_64-unknown-linux-gnu.tar.xz",
+            sha256 = "891c6366d7100feda0bca4c03ce63f3c9ac827cbebbc283e7433061d42c6a376",
         },
 
-        -- $SRC is the dist root (rust-1.97.1-x86_64-unknown-linux-gnu/);
+        -- $SRC is the dist root (rust-1.99.0-x86_64-unknown-linux-gnu/);
         -- each component dir carries its own slice of the classic prefix
         -- layout — merge them into $STAGE/usr. Only rustc ships lib/ +
         -- libexec/ (driver dylibs, bundled LLVM, proc-macro server); the
