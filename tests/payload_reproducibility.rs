@@ -15,7 +15,9 @@
 //! order; payload_reproducibility_build.rs pins the full pipeline), so
 //! the output-compare paths (refresh churn guard, rollback trust,
 //! ADR-0033/ADR-0043) are load-bearing again; these gates keep the
-//! pack layer honest under that trust.
+//! pack layer honest under that trust (the rollback-chain gate is
+//! `refresh_diverge_then_rollback_restores_prior_generation` in
+//! tests/pod_refresh.rs).
 
 use std::path::Path;
 use std::process::Command;
