@@ -3386,7 +3386,17 @@ pub use nau_core::snap_types::SANDBOX_RO_ROOTS;
 /// declared-app sandboxes stay untouched. Each path binds only when it
 /// exists on the host (`ro_bind_if_exists`): distros without
 /// `/etc/ssl/certs` keep building, exactly as before.
-pub const SANDBOX_ETC_RO_PATHS: [&str; 3] = ["/etc/resolv.conf", "/etc/hosts", "/etc/ssl/certs"];
+pub const SANDBOX_ETC_RO_PATHS: [&str; 4] = [
+    "/etc/resolv.conf",
+    "/etc/hosts",
+    "/etc/ssl/certs",
+    // Debian-family hosts route tool names through alternatives symlinks
+    // (/usr/bin/cc → /etc/alternatives/cc → gcc-15): without this bind the
+    // link dangles inside every sandboxed build — `command -v cc` misses
+    // while the host resolves it fine (live 2026-10-03, the cx43 farm
+    // window: the whole plain-Makefile chart class died on it).
+    "/etc/alternatives",
+];
 
 /// The CA bundle the build env defaults `CURL_CA_BUNDLE` to (issue #176).
 /// The same file the ca-certificates payload installs; the sandbox binds
