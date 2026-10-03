@@ -48,6 +48,12 @@ return {
         leaks_ok = {
             "/nau-build-prefix/usr/lib",
             "/nau-build-prefix/usr/lib64",
+            -- book3-resident pods: the sandbox binds /nix, so the host
+            -- nix gcc wrapper wins PATH over the pool gcc payload and
+            -- the produced binary references the build machine's store.
+            -- Runs where it was built (this pod is book3-resident); the
+            -- farm's /nix-less workers never hit this branch.
+            "/nix/store",
         },
 
         apps = {
