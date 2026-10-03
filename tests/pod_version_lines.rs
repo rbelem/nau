@@ -187,7 +187,9 @@ fn make_nodelike_tarball(server_dir: &Path, marker: &str) {
 /// The constraint-selected nodelike recipe, in the shape of
 /// pkgs/n/node.lua: a `lines` table, selection by the `constraint`
 /// global (default "26"), refusal of an undeclared line, and the
-/// real-copy build (rm precedes cp -L) with interpreter apps.
+/// package-anchored bootstrap build (rm precedes the bootstraps) with
+/// interpreter apps. The bootstrap paths mirror the fixture layout
+/// (npx-cli.js sits at lib/node_modules/, not inside npm/).
 /// `declared` controls WHICH lines exist — the drop test removes "22".
 fn write_nodelike_recipe(project: &Path, port: u16, declared: &[&str]) {
     let mut lines = String::new();
@@ -209,7 +211,7 @@ return {{ default = snap {{
     version = picked.version,
     lines = lines,
     source = picked.url,
-    build = "mkdir -p $STAGE/usr && cp -r bin lib $STAGE/usr/ && rm $STAGE/usr/bin/npm $STAGE/usr/bin/npx && cp -L bin/npm bin/npx $STAGE/usr/bin/",
+    build = "mkdir -p $STAGE/usr && cp -r bin lib $STAGE/usr/ && rm $STAGE/usr/bin/npm $STAGE/usr/bin/npx && printf '%s\\n' '#!/usr/bin/env node' \"require('../lib/node_modules/npm/bin/npm-cli.js')\" > $STAGE/usr/bin/npm && printf '%s\\n' '#!/usr/bin/env node' \"require('../lib/node_modules/npx-cli.js')\" > $STAGE/usr/bin/npx",
     type = "source",
     apps = {{
         node = app {{ command = "usr/bin/node" }},
@@ -333,9 +335,14 @@ fn staged_paths(ext: &Path) -> Vec<String> {
 }
 
 /// The wrapper invariant's staged layout (ADR-0047 Decision 7): node is
-/// the plain runtime file; npm/npx are REAL files (the symlinks were
-/// replaced), each preserved at a `.real` sibling carrying the ORIGINAL
-/// script content, and the wrapper execs the bare `node` name.
+/// the plain runtime file; npm/npx are REAL bootstrap files (the
+/// symlinks were replaced), each preserved at a `.real` sibling that
+/// requires the package's own staged entry — the require must name the
+/// in-tree path, because that anchor is what keeps npm's module
+/// resolution inside its staged package. The line marker lives in the
+/// staged entry the bootstrap requires, so WHICH line's payload landed
+/// is still proven from the tree. The wrapper execs the bare `node`
+/// name.
 fn assert_line_layout(ext: &Path, marker: &str) {
     let bin = ext.join("usr/bin");
     assert!(
@@ -343,7 +350,18 @@ fn assert_line_layout(ext: &Path, marker: &str) {
         "node runtime must be staged (ext {:?})",
         ext
     );
-    for tool in ["npm", "npx"] {
+    for (tool, require_rel, entry_rel) in [
+        (
+            "npm",
+            "lib/node_modules/npm/bin/npm-cli.js",
+            "usr/lib/node_modules/npm/bin/npm-cli.js",
+        ),
+        (
+            "npx",
+            "lib/node_modules/npx-cli.js",
+            "usr/lib/node_modules/npx-cli.js",
+        ),
+    ] {
         let wrapper = bin.join(tool);
         let real = bin.join(format!("{tool}.real"));
         let meta = std::fs::symlink_metadata(&wrapper).expect("wrapper must exist");
@@ -353,17 +371,22 @@ fn assert_line_layout(ext: &Path, marker: &str) {
         );
         assert!(
             real.is_file(),
-            "{tool}.real sibling (the original script) must be staged"
+            "{tool}.real sibling (the bootstrap) must be staged"
         );
         let real_content = std::fs::read_to_string(&real).unwrap();
-        let expected = if tool == "npm" {
+        assert!(
+            real_content.contains(&format!("require('../{require_rel}')")),
+            "{tool}.real must bootstrap the staged entry {require_rel}, got: {real_content}"
+        );
+        let entry = std::fs::read_to_string(ext.join(entry_rel)).unwrap();
+        let tag = if tool == "npm" {
             format!("npm-cli-{marker}")
         } else {
             format!("npx-cli-{marker}")
         };
         assert!(
-            real_content.contains(&expected),
-            "{tool}.real must carry the {marker} line's script, got: {real_content}"
+            entry.contains(&tag),
+            "the staged entry {entry_rel} must carry the {marker} line's script, got: {entry}"
         );
         let wrapper_content = std::fs::read_to_string(&wrapper).unwrap();
         assert!(
@@ -417,18 +440,19 @@ gated_test!(wrapped_npm_npx_entries_resolve_from_the_generation_tree, {
 
     let (code, _, stderr) = run(project.path(), root.path(), &["add", "nodelike"]);
     assert_eq!(code, Some(0), "stderr: {stderr}");
-    let ext = extension_dir(root.path(), "default", "nodelike");
 
     // The wrapper resolves its interpreter from PATH (the bare `node`
     // name), so the run needs a real node on PATH — the fixture's own
-    // node stub would only echo. The wrapper is invoked by absolute
-    // path, the way a pod PATH shim reaches it.
+    // node stub would only echo. The command is invoked the way pod
+    // PATH resolves it: the generation's farm shim, whose store blob
+    // derives PODROOT and lands on the extension tree's npm.real.
     let path = std::env::var("PATH").unwrap_or_default();
+    let shim_dir = pod_dir(root.path(), "default").join("current");
     for (tool, markers) in [
         ("npm", vec!["npm-cli-26", "npm-resolve-26"]),
         ("npx", vec!["npx-cli-26", "npm-resolve-26"]),
     ] {
-        let out = Command::new(ext.join("usr/bin").join(tool))
+        let out = Command::new(shim_dir.join(tool))
             .env("PATH", &path)
             .output()
             .unwrap_or_else(|e| panic!("run wrapped {tool}: {e}"));
@@ -568,10 +592,11 @@ gated_test!(sync_refuses_when_a_declared_line_disappears, {
     );
     assert_eq!(entry.constraint.as_deref(), Some("22"));
     let ext = extension_dir(root.path(), "pinned", "nodelike");
-    let real = std::fs::read_to_string(ext.join("usr/bin/npm.real")).unwrap();
+    let entry =
+        std::fs::read_to_string(ext.join("usr/lib/node_modules/npm/bin/npm-cli.js")).unwrap();
     assert!(
-        real.contains("npm-cli-22"),
-        "the installed 22-line content must survive the refusal: {real}"
+        entry.contains("npm-cli-22"),
+        "the installed 22-line content must survive the refusal: {entry}"
     );
 });
 
@@ -652,10 +677,11 @@ gated_test!(requires_edge_constraint_closure_pulls_the_line, {
 
     // The closure member is the 22 LINE: same tree, 22 content.
     let ext = extension_dir(root.path(), "edge", "nodelike");
-    let real = std::fs::read_to_string(ext.join("usr/bin/npm.real")).unwrap();
+    let entry =
+        std::fs::read_to_string(ext.join("usr/lib/node_modules/npm/bin/npm-cli.js")).unwrap();
     assert!(
-        real.contains("npm-cli-22"),
-        "the requires edge must pull the 22 line: {real}"
+        entry.contains("npm-cli-22"),
+        "the requires edge must pull the 22 line: {entry}"
     );
     assert_line_layout(&ext, "22");
 });
@@ -705,9 +731,10 @@ gated_test!(conflicting_requires_lines_refuse_named, {
         "the conflicting consumer must not install"
     );
     let ext = extension_dir(root.path(), "mix", "nodelike");
-    let real = std::fs::read_to_string(ext.join("usr/bin/npm.real")).unwrap();
+    let entry =
+        std::fs::read_to_string(ext.join("usr/lib/node_modules/npm/bin/npm-cli.js")).unwrap();
     assert!(
-        real.contains("npm-cli-22"),
-        "the closure line stays at 22 — no silent winner: {real}"
+        entry.contains("npm-cli-22"),
+        "the closure line stays at 22 — no silent winner: {entry}"
     );
 });
