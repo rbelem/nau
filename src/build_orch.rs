@@ -473,7 +473,10 @@ fn ensure_build_prefix(
             run_stage,
             run_stage_policy,
         )?;
-        payloads.push(crate::build_prefix::Payload { pkg: name, snap });
+        payloads.push(crate::build_prefix::Payload {
+            pkg: name,
+            source: crate::build_prefix::PayloadSource::Snap(snap),
+        });
     }
     let merged = crate::build_prefix::materialize_merged_prefix(&payloads)?;
     if !json && !quiet && !payloads.is_empty() {

@@ -26,11 +26,25 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
+/// Where one dependency payload's file tree comes from.
+#[derive(Debug)]
+pub enum PayloadSource {
+    /// A built `.snap` artifact — unpacked with unsquashfs into the merge
+    /// workspace before merging.
+    Snap(PathBuf),
+    /// An already-materialized payload directory (the farm tree lane:
+    /// manifest blobs fetched and verified straight into a cache dir) —
+    /// merged in place, no squash round-trip. The directory must outlive
+    /// the build; the merged prefix never mutates it.
+    Dir(PathBuf),
+}
+
 /// One dependency payload to merge: the source package name (for conflict
-/// messages) and its built `.snap` file.
+/// messages) and where its file tree comes from.
+#[derive(Debug)]
 pub struct Payload {
     pub pkg: String,
-    pub snap: PathBuf,
+    pub source: PayloadSource,
 }
 
 /// The materialized merged prefix: owns the tempdir backing the tree and
@@ -44,6 +58,10 @@ pub struct MergedPrefix {
     #[allow(dead_code)]
     work: tempfile::TempDir,
     path: PathBuf,
+    /// Every payload's materialized directory, keyed by package — the
+    /// unpack staging for snap payloads, the caller's own directory for
+    /// dir payloads. The leak-scan listings walk these.
+    payload_dirs: BTreeMap<String, PathBuf>,
 }
 
 impl MergedPrefix {
@@ -62,17 +80,10 @@ impl MergedPrefix {
     /// live beside it.
     pub fn payload_files(&self) -> BTreeMap<String, BTreeSet<String>> {
         let mut out = BTreeMap::new();
-        let Ok(payloads) = std::fs::read_dir(self.work.path().join("payloads")) else {
-            return out;
-        };
-        for entry in payloads.flatten() {
-            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            let pkg = entry.file_name().to_string_lossy().into_owned();
+        for (pkg, dir) in &self.payload_dirs {
             let mut names = BTreeSet::new();
-            collect_basenames(&entry.path(), &mut names);
-            out.insert(pkg, names);
+            collect_basenames(dir, &mut names);
+            out.insert(pkg.clone(), names);
         }
         out
     }
@@ -129,16 +140,29 @@ pub fn materialize_merged_prefix(payloads: &[Payload]) -> miette::Result<MergedP
     // rel path → the package that contributed it, so a conflict can name
     // both source packages.
     let mut owners: HashMap<String, String> = HashMap::new();
+    let mut payload_dirs: BTreeMap<String, PathBuf> = BTreeMap::new();
     for payload in payloads {
-        let unpack_dir = work.path().join("payloads").join(&payload.pkg);
-        // unsquashfs requires the destination's parent to exist.
-        std::fs::create_dir_all(&unpack_dir)
-            .map_err(|e| miette::miette!("creating unpack dir for '{}': {e}", payload.pkg))?;
-        unpack_snap(&payload.snap, &unpack_dir)?;
-        merge_tree(&unpack_dir, &payload.pkg, &path, &mut owners)?;
+        let dir = match &payload.source {
+            PayloadSource::Snap(snap) => {
+                let unpack_dir = work.path().join("payloads").join(&payload.pkg);
+                // unsquashfs requires the destination's parent to exist.
+                std::fs::create_dir_all(&unpack_dir).map_err(|e| {
+                    miette::miette!("creating unpack dir for '{}': {e}", payload.pkg)
+                })?;
+                unpack_snap(snap, &unpack_dir)?;
+                unpack_dir
+            }
+            PayloadSource::Dir(dir) => dir.clone(),
+        };
+        merge_tree(&dir, &payload.pkg, &path, &mut owners)?;
+        payload_dirs.insert(payload.pkg.clone(), dir);
     }
     rewrite_prefix_wrappers(&path, payloads, &owners)?;
-    Ok(MergedPrefix { work, path })
+    Ok(MergedPrefix {
+        work,
+        path,
+        payload_dirs,
+    })
 }
 
 /// Resolve a floor tool (issue #101) through the tools module — per-tool
@@ -881,11 +905,11 @@ mod tests {
         let merged = materialize_merged_prefix(&[
             Payload {
                 pkg: "pkg-a".into(),
-                snap: snap_a,
+                source: PayloadSource::Snap(snap_a),
             },
             Payload {
                 pkg: "pkg-b".into(),
-                snap: snap_b,
+                source: PayloadSource::Snap(snap_b),
             },
         ])
         .unwrap();
@@ -926,11 +950,11 @@ mod tests {
         let err = materialize_merged_prefix(&[
             Payload {
                 pkg: "pkg-a".into(),
-                snap: snap_a,
+                source: PayloadSource::Snap(snap_a),
             },
             Payload {
                 pkg: "pkg-b".into(),
-                snap: snap_b,
+                source: PayloadSource::Snap(snap_b),
             },
         ])
         .unwrap_err();
@@ -974,11 +998,11 @@ mod tests {
         let merged = materialize_merged_prefix(&[
             Payload {
                 pkg: "pkg-a".into(),
-                snap: snap_a,
+                source: PayloadSource::Snap(snap_a),
             },
             Payload {
                 pkg: "pkg-b".into(),
-                snap: snap_b,
+                source: PayloadSource::Snap(snap_b),
             },
         ])
         .expect("differing meta/ subtrees must not conflict");
@@ -1025,11 +1049,11 @@ mod tests {
         let merged = materialize_merged_prefix(&[
             Payload {
                 pkg: "glibc".into(),
-                snap: snap_a,
+                source: PayloadSource::Snap(snap_a),
             },
             Payload {
                 pkg: "gcc".into(),
-                snap: snap_b,
+                source: PayloadSource::Snap(snap_b),
             },
         ])
         .expect("differing info dir indexes must not conflict");
@@ -1074,7 +1098,7 @@ mod tests {
         );
         let merged = materialize_merged_prefix(&[Payload {
             pkg: "libfoo".into(),
-            snap,
+            source: PayloadSource::Snap(snap),
         }])
         .unwrap();
         let files = merged.payload_files();
@@ -1124,7 +1148,7 @@ mod tests {
         );
         let merged = materialize_merged_prefix(&[Payload {
             pkg: "python".into(),
-            snap,
+            source: PayloadSource::Snap(snap),
         }])
         .expect("the doubled wrapper must stage");
         let rewritten = std::fs::read_to_string(merged.path().join("usr/bin/python3")).unwrap();
@@ -1184,11 +1208,11 @@ mod tests {
         let merged = materialize_merged_prefix(&[
             Payload {
                 pkg: "cli".into(),
-                snap,
+                source: PayloadSource::Snap(snap),
             },
             Payload {
                 pkg: "python".into(),
-                snap: python,
+                source: PayloadSource::Snap(python),
             },
         ])
         .expect("the wrapper must stage against a requires-provided interpreter");
@@ -1234,7 +1258,7 @@ mod tests {
         );
         let merged = materialize_merged_prefix(&[Payload {
             pkg: "python".into(),
-            snap,
+            source: PayloadSource::Snap(snap),
         }])
         .expect("the python wrapper must stage");
         let rewritten = std::fs::read_to_string(merged.path().join("usr/bin/python3")).unwrap();
@@ -1279,7 +1303,7 @@ mod tests {
         );
         let merged = materialize_merged_prefix(&[Payload {
             pkg: "jq".into(),
-            snap,
+            source: PayloadSource::Snap(snap),
         }])
         .expect("the lib wrapper must stage");
         let rewritten = std::fs::read_to_string(merged.path().join("usr/bin/jq")).unwrap();
@@ -1332,11 +1356,11 @@ mod tests {
         let merged = materialize_merged_prefix(&[
             Payload {
                 pkg: "perltidy".into(),
-                snap: app,
+                source: PayloadSource::Snap(app),
             },
             Payload {
                 pkg: "perl".into(),
-                snap: perl,
+                source: PayloadSource::Snap(perl),
             },
         ])
         .expect("the perl tree wrapper must stage");
@@ -1382,11 +1406,11 @@ mod tests {
         let merged = materialize_merged_prefix(&[
             Payload {
                 pkg: "tool".into(),
-                snap: app,
+                source: PayloadSource::Snap(app),
             },
             Payload {
                 pkg: "perl".into(),
-                snap: perl,
+                source: PayloadSource::Snap(perl),
             },
         ])
         .expect("a requires-provided interpreter resolves");
@@ -1419,7 +1443,7 @@ mod tests {
         );
         let err = materialize_merged_prefix(&[Payload {
             pkg: "tool".into(),
-            snap: app,
+            source: PayloadSource::Snap(app),
         }])
         .unwrap_err();
         let msg = format!("{err:#}");
@@ -1452,7 +1476,7 @@ mod tests {
         );
         let err = materialize_merged_prefix(&[Payload {
             pkg: "python".into(),
-            snap,
+            source: PayloadSource::Snap(snap),
         }])
         .unwrap_err();
         let msg = format!("{err:#}");
@@ -1488,7 +1512,7 @@ mod tests {
         );
         let merged = materialize_merged_prefix(&[Payload {
             pkg: "meson".into(),
-            snap,
+            source: PayloadSource::Snap(snap),
         }])
         .unwrap();
         assert_eq!(

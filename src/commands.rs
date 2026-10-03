@@ -2523,7 +2523,7 @@ pub fn cmd_build_request_run(args: &crate::cli::BuildRequestRunArgs) -> miette::
         PathBuf::from(recipes_root),
         release_cfg,
         *once,
-    );
+    )?;
     let settled = crate::build_request::run_drain(&drain)?;
     let rows: Vec<serde_json::Value> = settled
         .iter()

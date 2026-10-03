@@ -289,6 +289,34 @@ pub struct ReleaseConfig {
 }
 
 impl ReleaseConfig {
+    /// The S3 target the build step's tree reads ride — the same fields
+    /// the release input carries; the signing key and tree base are
+    /// release-only.
+    fn s3_target(&self) -> miette::Result<nau_ship::release::S3Target> {
+        let missing = |what: &str| {
+            miette::miette!(
+                "release not configured: {what} is required \
+                 (--s3-endpoint, --s3-bucket, --s3-region, --s3-access-key, --s3-secret-key)"
+            )
+        };
+        Ok(nau_ship::release::S3Target {
+            endpoint: self
+                .s3_endpoint
+                .clone()
+                .ok_or_else(|| missing("s3-endpoint"))?,
+            bucket: self.s3_bucket.clone().ok_or_else(|| missing("s3-bucket"))?,
+            region: self.s3_region.clone().ok_or_else(|| missing("s3-region"))?,
+            access_key: self
+                .s3_access_key
+                .clone()
+                .ok_or_else(|| missing("s3-access-key"))?,
+            secret_key: self
+                .s3_secret_key
+                .clone()
+                .ok_or_else(|| missing("s3-secret-key"))?,
+        })
+    }
+
     fn build_input(
         &self,
         snap_path: &Path,
@@ -379,7 +407,12 @@ impl Releaser for ShipReleaser {
 /// API, budget from the `workers` conventions) with the single-node
 /// graph the request names; the job runs the normal snap build path
 /// (`crate::snap::build_snap`) over the constraint-resolved meta.
-pub struct PoolBuild;
+/// Production build step: one farm-side build through the pool's
+/// scheduler, the request's bd closure staged against the released tree
+/// first (rbelem/nau#338 — `farm_prefix::farm_build_prefix`).
+pub struct PoolBuild {
+    tree: crate::farm_prefix::S3Tree,
+}
 
 impl BuildStep for PoolBuild {
     fn build(
@@ -395,6 +428,22 @@ impl BuildStep for PoolBuild {
             .into_diagnostic()
             .wrap_err("creating the build stage dir")?;
         let arch = std::env::var("NAU_ARCH").unwrap_or_else(|_| "amd64".into());
+
+        // The bd closure stages BEFORE the scheduler: the merged prefix
+        // owns its tempdir and must outlive the build it feeds. Payloads
+        // come from the released tree first, local builds only for tree
+        // misses (#338).
+        let cache = output_dir.join(".dep-cache");
+        let mut building = Vec::new();
+        let prefix =
+            crate::farm_prefix::farm_build_prefix(&self.tree, &cache, meta, &arch, &mut building)?;
+        // Empty listings when the build materializes no prefix — the scan
+        // contract every wired build path runs (issue #35).
+        let scan_listings = match &prefix {
+            Some(p) => crate::leak_scan::listings_for_build(meta, p)?,
+            None => crate::leak_scan::PayloadListings::default(),
+        };
+
         let snap_name: Mutex<Option<String>> = Mutex::new(None);
         let graph = BTreeMap::from([(request.package.clone(), Vec::new())]);
         let budget =
@@ -406,10 +455,12 @@ impl BuildStep for PoolBuild {
                 output_dir,
                 &arch,
                 nau_build::snap::StagePolicy::Default,
+                // No pod store on the farm: no ELF repair, no wrappers.
                 None,
+                // Ecosystem-deps closures stay pod-only (#338 follow-up).
                 None,
-                None,
-                None,
+                prefix.as_ref().map(|p| p.path()),
+                Some(&scan_listings),
                 false,
                 Some(&crate::build_orch::SeamSourceFetcher),
             ) {
@@ -454,22 +505,27 @@ pub struct Drain {
 
 impl Drain {
     /// The production wiring: the pool build path and the ship release
-    /// seam.
+    /// seam. The build step reads the released tree for its dep closures,
+    /// so an unusable S3 target fails the drain at construction, never
+    /// mid-request (rbelem/nau#338).
     pub fn production(
         queue: BuildQueue,
         recipes_root: PathBuf,
         release_cfg: ReleaseConfig,
         once: bool,
-    ) -> Self {
-        Drain {
+    ) -> miette::Result<Self> {
+        let tree = crate::farm_prefix::S3Tree::new(std::sync::Arc::new(
+            nau_ship::s3::S3Client::new(release_cfg.s3_target()?)?,
+        ));
+        Ok(Drain {
             queue,
             recipes_root,
             release_cfg,
-            build: Box::new(PoolBuild),
+            build: Box::new(PoolBuild { tree }),
             release: Box::new(ShipReleaser),
             once,
             poll_secs: 2,
-        }
+        })
     }
 }
 
