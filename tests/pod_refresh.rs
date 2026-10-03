@@ -23,6 +23,10 @@
 //! - `sync --rebuild-unstamped` opts into the one-time rebuild sweep.
 //! - A blob swap names the pin move, drops the stale deps pin, and
 //!   warns at flip time that rollback strands the pin.
+//! - The rollback chain behind the churn guard: a divergent refresh
+//!   lands generation N+1 and the default rollback restores N —
+//!   digests, executed bytes, and the stranded-pin report (#135)
+//!   all pinned.
 //!
 //! All state (project dirs, pod roots) lives in tempdirs — never the
 //! real home. Gated on the external toolchain (mksquashfs/unsquashfs/
@@ -250,6 +254,35 @@ fn current_farm(root: &Path, pod: &str) -> PathBuf {
     } else {
         pod_dir(root, pod).join(target)
     }
+}
+
+/// The generation the pod's `current` link points at — the middle
+/// component of the `generations/<n>/farm` symlink target.
+fn current_generation(root: &Path, pod: &str) -> u64 {
+    let target = std::fs::read_link(pod_dir(root, pod).join("current")).unwrap();
+    target
+        .components()
+        .rev()
+        .nth(1)
+        .unwrap()
+        .as_os_str()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+/// A generation's manifest as JSON — the installed package records
+/// (the `sha3-384` content pins under test).
+fn gen_manifest(root: &Path, pod: &str, gen: u64) -> serde_json::Value {
+    let bytes = std::fs::read(
+        pod_dir(root, pod)
+            .join("generations")
+            .join(gen.to_string())
+            .join("manifest.json"),
+    )
+    .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
 }
 
 fn farm_output(farm: &Path, bin: &str) -> String {
@@ -1321,3 +1354,255 @@ gated_test!(
         );
     }
 );
+
+// The rollback chain behind the churn guard (a07a1e2 restored
+// output-compare as load-bearing): generation history is a meaningful
+// rollback chain. Every piece is tested individually elsewhere (the
+// churn-free refresh above, the no-op sync of pod_sync_noop_offline,
+// prune keeping current+previous, runtime's default-previous
+// rollback) — this gate ties them into one chain. Arm 1 walks it: a
+// genuinely divergent refresh lands generation N+1, the default
+// rollback flips `current` back to N, the reactivated generation
+// carries the PRE-refresh digests and executes the PRE-refresh bytes,
+// and the chain stays quiet afterwards — a follow-up sync adds no
+// generation, and a later failed rebuild leaves N active. Arm 2 pins
+// the stranded-pin loudness (issue #135): a rollback across a blob
+// swap NAMES the pin the flipped generation does not carry, and the
+// next sync refuses named (the `hold_blob_pinned` bail) instead of
+// silently rebuilding over it.
+gated_test!(refresh_diverge_then_rollback_restores_prior_generation, {
+    // ── Arm 1: refresh → N+1 → rollback → N → quiet ──
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    let (project, root) = sync_fixture_pod(server.path(), port, "p");
+    assert_eq!(current_generation(&root, "p"), 1);
+    let gens = generation_count(&root, "p");
+    assert_eq!(gens, 1, "the fixture starts at generation 1");
+
+    // The pre-refresh truth: what generation 1 carries.
+    let gen1 = gen_manifest(&root, "p", 1);
+    let member_digest = gen1["packages"]["libmember"]["sha3_384"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let app_digest = gen1["packages"]["app"]["sha3_384"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The genuinely divergent recipe (the drift tests' content
+    // swap): the rebuild cannot come back byte-identical.
+    write_pkg(
+        &project,
+        "libmember",
+        &[],
+        "memberbin",
+        "member-v2",
+        port,
+        "member.tar.gz",
+    );
+    let (code, _stdout, stderr) = run(&project, &root, &["--name", "p", "refresh", "libmember"]);
+    assert_eq!(code, Some(0), "divergent refresh failed: {stderr}");
+    assert_eq!(
+        generation_count(&root, "p"),
+        gens + 1,
+        "a divergent refresh must land exactly one generation; stderr={stderr}"
+    );
+    assert_eq!(current_generation(&root, "p"), 2);
+    assert!(
+        farm_output(&current_farm(&root, "p"), "memberbin").contains("member-v2"),
+        "the divergent content must be live before the rollback"
+    );
+
+    // Default rollback: `current` flips back to the pre-refresh
+    // generation, the chain is not churned, and no blob pin is
+    // stranded (a source-built pod pins recipes, not blobs).
+    let (code, _stdout, stderr) = run(&project, &root, &["--name", "p", "rollback"]);
+    assert_eq!(code, Some(0), "rollback failed: {stderr}");
+    assert!(
+        stderr.contains("2 -> 1"),
+        "the rollback must report the flip; stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("does not carry blob pin"),
+        "a source-built pod has no blob pin to strand; stderr={stderr}"
+    );
+    assert_eq!(current_generation(&root, "p"), 1);
+    assert_eq!(
+        generation_count(&root, "p"),
+        gens + 1,
+        "the rollback must not churn the chain"
+    );
+
+    // The reactivated generation IS the pre-refresh one: same
+    // digests, same executed bytes.
+    let gen1_after = gen_manifest(&root, "p", 1);
+    assert_eq!(
+        gen1_after["packages"]["libmember"]["sha3_384"]
+            .as_str()
+            .unwrap(),
+        member_digest,
+        "the reactivated libmember digest must be the pre-refresh one"
+    );
+    assert_eq!(
+        gen1_after["packages"]["app"]["sha3_384"].as_str().unwrap(),
+        app_digest,
+        "the reactivated app digest must be the pre-refresh one"
+    );
+    let rolled_back = farm_output(&current_farm(&root, "p"), "memberbin");
+    assert!(
+        rolled_back.contains("member-ran"),
+        "the rolled-back farm must execute the pre-refresh bytes; got {rolled_back}"
+    );
+    assert!(
+        !rolled_back.contains("member-v2"),
+        "the divergent content must be gone from the farm; got {rolled_back}"
+    );
+
+    // The chain stays quiet: the refresh baselined the drifted
+    // recipe, so the follow-up sync holds at its pins — no
+    // additional generation, `current` untouched.
+    let (code, _stdout, stderr) = run(&project, &root, &["--name", "p", "sync"]);
+    assert_eq!(code, Some(0), "follow-up sync failed: {stderr}");
+    assert_eq!(
+        generation_count(&root, "p"),
+        gens + 1,
+        "a follow-up sync must not churn the rolled-back pod"
+    );
+    assert_eq!(current_generation(&root, "p"), 1);
+
+    // And a later rebuild that FAILS leaves the rolled-back
+    // generation active (the journal/recover guarantee, pinned
+    // end-to-end): the broken build lands nothing, `current`
+    // stays at generation 1.
+    write_failing_pkg(&project, "libmember", &[], port, "member.tar.gz");
+    let (code, _stdout, stderr) = run(&project, &root, &["--name", "p", "refresh", "libmember"]);
+    assert_ne!(
+        code,
+        Some(0),
+        "the broken rebuild must fail loudly: {stderr}"
+    );
+    assert_eq!(
+        generation_count(&root, "p"),
+        gens + 1,
+        "a failed rebuild must not land a generation"
+    );
+    assert_eq!(current_generation(&root, "p"), 1);
+
+    // ── Arm 2: rollback across a blob swap strands the pin, loudly ──
+    let builder = tempfile::tempdir().unwrap().keep();
+    let builder_root = tempfile::tempdir().unwrap().keep();
+    write_pkg(
+        &builder,
+        "libmember",
+        &[],
+        "memberbin",
+        "member-ran",
+        port,
+        "member.tar.gz",
+    );
+    let (code, _, stderr) = run(
+        &builder,
+        &builder_root,
+        &["--name", "b", "add", "libmember"],
+    );
+    assert_eq!(code, Some(0), "builder add failed: {stderr}");
+    let staging = tempfile::tempdir().unwrap().keep();
+    let v1 = staging.join("v1.snap");
+    std::fs::copy(
+        harvest_payload(&builder_root.join("b").join("downloads"), "libmember_1.0_"),
+        &v1,
+    )
+    .unwrap();
+    write_pkg(
+        &builder,
+        "libmember",
+        &[],
+        "memberbin",
+        "member-v2",
+        port,
+        "member.tar.gz",
+    );
+    let (code, _, stderr) = run(&builder, &builder_root, &["--name", "b", "sync"]);
+    assert_eq!(code, Some(0), "builder rebuild failed: {stderr}");
+    let v2 = staging.join("v2.snap");
+    std::fs::copy(
+        harvest_payload(&builder_root.join("b").join("downloads"), "libmember_1.0_"),
+        &v2,
+    )
+    .unwrap();
+    assert_ne!(
+        sha256_of(&v1),
+        sha256_of(&v2),
+        "the fixture must swap distinct blobs"
+    );
+
+    // Target pod: sideload v1 (generation 1), swap in v2
+    // (generation 2) — the blob pin now names v2 while
+    // generation 1 carries v1.
+    let project2 = tempfile::tempdir().unwrap().keep();
+    let root2 = tempfile::tempdir().unwrap().keep();
+    let (code, _, stderr) = run(
+        &project2,
+        &root2,
+        &["add", "--snap", v1.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(code, Some(0), "sideload failed: {stderr}");
+    let (code, _, stderr) = run(
+        &project2,
+        &root2,
+        &["add", "--snap", v2.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(code, Some(0), "swap failed: {stderr}");
+    assert_eq!(current_generation(&root2, "default"), 2);
+    assert_eq!(generation_count(&root2, "default"), 2);
+    let pin = read_lock(&root2, "default")["snaps"]["libmember"]["sha3-384"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let gen1_digest = gen_manifest(&root2, "default", 1)["packages"]["libmember"]["sha3_384"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(
+        pin, gen1_digest,
+        "the fixture must leave the pin stranded across the rollback"
+    );
+
+    // The rollback lands on generation 1 and the report NAMES the
+    // stranded pin (issue #135) — never a silent flip onto content
+    // the pin no longer names.
+    let (code, _stdout, stderr) = run(&project2, &root2, &["rollback"]);
+    assert_eq!(code, Some(0), "blob-pod rollback failed: {stderr}");
+    assert_eq!(current_generation(&root2, "default"), 1);
+    assert!(
+        stderr.contains("does not carry blob pin(s)"),
+        "the rollback report must flag the stranded pin; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("libmember"),
+        "the report must name the stranded pin; stderr={stderr}"
+    );
+
+    // The next sync refuses NAMED (the `hold_blob_pinned` bail) —
+    // the drift is not masked by a silent rebuild.
+    let (code, _stdout, stderr) = run(&project2, &root2, &["sync"]);
+    assert_ne!(
+        code,
+        Some(0),
+        "the stranded pin must refuse the sync: {stderr}"
+    );
+    assert!(
+        stderr.contains("blob-pinned"),
+        "the refusal must name the pin; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("realign it"),
+        "the refusal must name the repair; stderr={stderr}"
+    );
+    assert_eq!(
+        generation_count(&root2, "default"),
+        2,
+        "the refused sync must be zero-write"
+    );
+});
