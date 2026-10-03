@@ -13,6 +13,12 @@ use nau::cli::{
 fn main() -> miette::Result<()> {
     let cli = Cli::parse();
 
+    // Opt-in GitHub credential (ADR-0054): one env read at the
+    // dispatch boundary, per the ADR-0042 D5 carriage — the core stays
+    // env-free. Unset or empty means off: every fetch stays
+    // byte-identical.
+    nau_chart::dep_fetch::set_github_token(std::env::var("GITHUB_TOKEN").ok().as_deref());
+
     match normalize_domain(cli.command) {
         Command::Build { args, .. } => nau::commands::build_command(args),
 

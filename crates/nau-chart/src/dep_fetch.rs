@@ -2392,6 +2392,113 @@ pub fn reset_net_retry_budget() -> miette::Result<()> {
     Ok(())
 }
 
+// ── Opt-in GitHub credential (ADR-0054) ──
+
+/// The operator-supplied GitHub credential for seam fetches. `Some`
+/// only when the CLI boundary read a non-empty `GITHUB_TOKEN`; `None`
+/// is the kill switch — byte-identical legacy behavior. Process-global
+/// like [`NET_RETRY_BUDGET_MS`] (one invocation carries one credential
+/// and syncs are serial), installed once via [`set_github_token`].
+static GITHUB_TOKEN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Install (or clear) the opt-in GitHub credential. Called once at the
+/// CLI dispatch boundary — the boundary reads `GITHUB_TOKEN`, the core
+/// stays env-free, and the credential crosses the seam as a plain
+/// value, resolution above it (the ADR-0042 D5 carriage). An empty or
+/// absent string clears: the unset env IS the kill switch.
+pub fn set_github_token(token: Option<&str>) {
+    let value = token
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    *github_token_lock() = value;
+}
+
+/// Lock helper that survives a poisoned guard: the payload is a plain
+/// `Option<String>` with no invariant to repair.
+fn github_token_lock() -> std::sync::MutexGuard<'static, Option<String>> {
+    GITHUB_TOKEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The lowercased host of an `http(s)` URL — userinfo and port
+/// stripped, `None` when the string carries no authority. Dependency
+/// free on purpose: the seam compares exact host strings only.
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => host,
+        None => authority,
+    };
+    let bare = if host.starts_with('[') {
+        host.split_once(']')?.0 // IPv6 literal: [::1]:8080
+    } else {
+        host.split(':').next()?
+    };
+    Some(bare.to_ascii_lowercase())
+}
+
+/// Hosts the credential may ride (ADR-0054): exactly `github.com` and
+/// `api.github.com` — never a third-party registry (npm, pypi, crates,
+/// goproxy): forwarding a GitHub credential there is a leak. The
+/// codeload hop is deliberately excluded: it ignores Authorization, and
+/// curl's default cross-host redirect strip keeps the token off it.
+fn token_host_allowed(url: &str) -> bool {
+    matches!(
+        url_host(url).as_deref(),
+        Some("github.com") | Some("api.github.com")
+    )
+}
+
+/// Test-only allowlist extension: loopback arrival tests set this so a
+/// `127.0.0.1` server can observe the header. It exists only under
+/// `cfg(test)` — the shipped binary compiles the branch out, so
+/// production scoping is untouched.
+#[cfg(test)]
+static TEST_TOKEN_ANY_HOST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The seam's per-URL credential decision: the token, but only when the
+/// URL rides a token-eligible host. `None` (no attach) for an unset
+/// credential and for every non-GitHub host.
+fn token_for_url(url: &str) -> Option<String> {
+    let token = github_token_lock().clone()?;
+    if token_host_allowed(url) {
+        return Some(token);
+    }
+    #[cfg(test)]
+    {
+        if TEST_TOKEN_ANY_HOST.load(std::sync::atomic::Ordering::Relaxed) {
+            return Some(token);
+        }
+    }
+    None
+}
+
+/// Write one `Authorization: Bearer …` line to `path`, created fresh
+/// and owner-only (0600): the file is the credential's only appearance
+/// outside process memory — never argv, never stderr, never an error
+/// string (the ADR-0042 D8 extension). Failures bail loud naming the
+/// path and errno only.
+fn write_bearer_header(path: &Path, token: &str) -> miette::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    // A stale file from a dead run must not block the fresh creation.
+    let _ = std::fs::remove_file(path);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| {
+            miette::miette!("creating the curl credential file {}: {e}", path.display())
+        })?;
+    file.write_all(format!("Authorization: Bearer {token}\n").as_bytes())
+        .map_err(|e| miette::miette!("writing the curl credential file {}: {e}", path.display()))
+}
+
 /// The retry gate: ONLY a 429, plus a 403 that carries `Retry-After`
 /// (GitHub surfaces secondary limits as 403). A bare 403 is a hard
 /// error — permission failures are never retried. 304/200/5xx and
@@ -2516,7 +2623,11 @@ fn real_sleep(d: std::time::Duration) {
 
 /// [`http_get_conditional`] with the retry policy injected: `knobs`
 /// carry the kill switch and the per-delay cap, `sleep` stands in for
-/// wall-clock (tests pass a no-op plus a zero backoff base).
+/// wall-clock (tests pass a no-op plus a zero backoff base). The
+/// opt-in credential (ADR-0054) is decided here once per call: a
+/// token-eligible URL gets a 0600 credential file whose PATH alone is
+/// handed down, and the file is removed in the same cleanup block as
+/// the header dump, on success and failure.
 fn http_get_conditional_with(
     knobs: &RetryKnobs,
     sleep: &dyn Fn(std::time::Duration),
@@ -2533,16 +2644,38 @@ fn http_get_conditional_with(
             .unwrap_or("body"),
         std::process::id()
     ));
-    let result = retry_curl_get(
-        knobs,
-        sleep,
-        &curl,
-        url,
-        dest_tmp,
-        &header_file,
-        if_none_match,
-    );
+    let auth_file = dest_tmp.with_file_name(format!(
+        ".{}.auth-{}",
+        dest_tmp
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("body"),
+        std::process::id()
+    ));
+    let result = (|| {
+        // The attach decision is per-URL and the URL is fixed for the
+        // whole retry loop: decide once, write the credential file
+        // once, hand only its path down (the bytes stay in the file).
+        let attach = match token_for_url(url) {
+            Some(token) => {
+                write_bearer_header(&auth_file, &token)?;
+                Some(auth_file.as_path())
+            }
+            None => None,
+        };
+        retry_curl_get(
+            knobs,
+            sleep,
+            &curl,
+            url,
+            dest_tmp,
+            &header_file,
+            attach,
+            if_none_match,
+        )
+    })();
     let _ = std::fs::remove_file(&header_file);
+    let _ = std::fs::remove_file(&auth_file);
     result
 }
 
@@ -2550,6 +2683,7 @@ fn http_get_conditional_with(
 /// [`run_curl_get`] through the rate-limit policy ([`should_retry`],
 /// [`plan_delay_ms`], [`reserve_sleep_ms`]); retries exhaust into a
 /// loud terminal failure naming the attempts.
+#[allow(clippy::too_many_arguments)] // one per curl axis, matching the repo's dispatch precedent
 fn retry_curl_get(
     knobs: &RetryKnobs,
     sleep: &dyn Fn(std::time::Duration),
@@ -2557,12 +2691,13 @@ fn retry_curl_get(
     url: &str,
     dest_tmp: &Path,
     header_file: &Path,
+    auth_header: Option<&Path>,
     if_none_match: Option<&str>,
 ) -> miette::Result<CdnFetch> {
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        let fetch = run_curl_get(curl, url, dest_tmp, header_file, if_none_match)?;
+        let fetch = run_curl_get(curl, url, dest_tmp, header_file, auth_header, if_none_match)?;
         // The seconds form only: an HTTP-date (or garbage) parses as
         // None and falls back to the exponential path.
         let retry_after = parse_last_header(header_file, "retry-after")
@@ -2582,16 +2717,26 @@ fn retry_curl_get(
 }
 
 /// The curl invocation of [`http_get_conditional`], split so the
-/// header-dump cleanup above always runs.
+/// header-dump cleanup above always runs. When `auth_header` carries a
+/// path, the credential rides as one `Authorization: Bearer` line read
+/// from that 0600 file — the token itself never appears in argv or in
+/// any error string, and without `--location-trusted` a cross-host
+/// redirect (github.com to codeload) strips it.
 fn run_curl_get(
     curl: &Path,
     url: &str,
     dest_tmp: &Path,
     header_file: &Path,
+    auth_header: Option<&Path>,
     if_none_match: Option<&str>,
 ) -> miette::Result<CdnFetch> {
     let mut cmd = std::process::Command::new(curl);
     cmd.args(["-sSL", "-D"]).arg(header_file);
+    if let Some(path) = auth_header {
+        // The credential rides a file reference, never argv: the
+        // `-H @file` form keeps the token off the process list.
+        cmd.arg("-H").arg(format!("@{}", path.display()));
+    }
     if let Some(etag) = if_none_match {
         cmd.arg("-H").arg(format!("If-None-Match: {etag}"));
     }
@@ -4502,6 +4647,196 @@ require github.com/only/one v0.1.0
         assert!(
             ua.contains("nau/") && ua.contains("(+https://github.com/rbelem/shuttle)"),
             "the UA must carry the contact info: {ua}"
+        );
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // ── Opt-in GitHub credential (ADR-0054) ──
+
+    /// Serializes the credential tests: the token static and the
+    /// test-only loopback allowlist are process-global, and tests run
+    /// in parallel threads. Ordinary loopback tests are inert to an
+    /// extra Authorization header, so only these need the lock.
+    static TOKEN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Holds [`TOKEN_TEST_LOCK`] while a credential test runs, installs
+    /// the requested credential and loopback allowlist state, and
+    /// restores both on drop (the statics must not leak across tests).
+    struct LoopbackTokenGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl LoopbackTokenGuard {
+        fn install(token: Option<&str>, allow_loopback: bool) -> Self {
+            let lock = TOKEN_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            set_github_token(token);
+            TEST_TOKEN_ANY_HOST.store(allow_loopback, std::sync::atomic::Ordering::Relaxed);
+            Self(lock)
+        }
+    }
+
+    impl Drop for LoopbackTokenGuard {
+        fn drop(&mut self) {
+            set_github_token(None);
+            TEST_TOKEN_ANY_HOST.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn token_host_scoping_is_exact_and_github_only() {
+        // Pure policy: no network, no statics touched.
+        assert!(token_host_allowed(
+            "https://github.com/o/r/archive/v1.tar.gz"
+        ));
+        assert!(token_host_allowed(
+            "https://api.github.com/repos/o/r/releases"
+        ));
+        // Port, userinfo, and case are normalized away.
+        assert!(token_host_allowed(
+            "https://github.com:443/o/r/archive/v1.tar.gz"
+        ));
+        assert!(token_host_allowed(
+            "https://user@github.com/o/r/archive/v1.tar.gz"
+        ));
+        assert!(token_host_allowed(
+            "https://GitHub.com/o/r/archive/v1.tar.gz"
+        ));
+        // Third-party registries never see the credential.
+        assert!(!token_host_allowed(
+            "https://registry.npmjs.org/a/-/a-1.0.0.tgz"
+        ));
+        assert!(!token_host_allowed(
+            "https://files.pythonhosted.org/packages/x.whl"
+        ));
+        assert!(!token_host_allowed("https://crates.io/api/v1/crates/x"));
+        assert!(!token_host_allowed("https://goproxy.cn/x/@v/list"));
+        // No subdomain or suffix matching: codeload ignores
+        // Authorization anyway and the redirect strip covers it, and
+        // notgithub.com is a different host, full stop.
+        assert!(!token_host_allowed(
+            "https://codeload.github.com/o/r/tar.gz/v1"
+        ));
+        assert!(!token_host_allowed(
+            "https://notgithub.com/o/r/archive/v1.tar.gz"
+        ));
+        // No scheme means no authority means no attach.
+        assert!(!token_host_allowed("../relative/path.tar.gz"));
+        assert!(!token_host_allowed("github.com/o/r"));
+    }
+
+    #[test]
+    fn bearer_header_arrives_on_an_allowed_host_and_the_credential_file_is_removed() {
+        if !curl_available() {
+            return;
+        }
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let seen_server = seen.clone();
+        let body = b"payload".to_vec();
+        let (url, shutdown) = spawn_http_server(move |req| {
+            *seen_server.lock().unwrap() = Some(String::from_utf8_lossy(req).to_string());
+            http_response("HTTP/1.1 200 OK", &[("ETag", "\"v1\"")], &body)
+        });
+        // The test-only loopback allowlist stands in for a github.com
+        // URL so the server can observe the header; production scoping
+        // is exercised by the policy test above.
+        let _guard = LoopbackTokenGuard::install(Some("loopback-test-token"), true);
+        let work = tempfile::tempdir().unwrap();
+        let tmp = work.path().join("out.bin");
+        let fetch = http_get_conditional(&url, &tmp, None).unwrap();
+        assert_eq!(fetch.code, 200);
+        let request = seen.lock().unwrap().clone().unwrap();
+        assert!(
+            request.contains("Authorization: Bearer loopback-test-token"),
+            "the bearer line must arrive at the server: {request}"
+        );
+        // The credential file is gone after the run, like the header dump.
+        let auth_file = tmp.with_file_name(format!(
+            ".{}.auth-{}",
+            tmp.file_name().and_then(|n| n.to_str()).unwrap_or("body"),
+            std::process::id()
+        ));
+        assert!(!auth_file.exists(), "the credential file must be removed");
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn bearer_header_never_arrives_on_a_disallowed_host() {
+        if !curl_available() {
+            return;
+        }
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let seen_server = seen.clone();
+        let body = b"payload".to_vec();
+        let (url, shutdown) = spawn_http_server(move |req| {
+            *seen_server.lock().unwrap() = Some(String::from_utf8_lossy(req).to_string());
+            http_response("HTTP/1.1 200 OK", &[("ETag", "\"v1\"")], &body)
+        });
+        // Credential installed, loopback allowlist OFF: production
+        // scoping must keep the header off this host entirely.
+        let _guard = LoopbackTokenGuard::install(Some("loopback-test-token"), false);
+        let work = tempfile::tempdir().unwrap();
+        let tmp = work.path().join("out.bin");
+        http_get_conditional(&url, &tmp, None).unwrap();
+        let request = seen.lock().unwrap().clone().unwrap();
+        assert!(
+            !request.contains("Authorization:"),
+            "a disallowed host must never see the header: {request}"
+        );
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn kill_switch_unset_credential_sends_no_authorization_anywhere() {
+        if !curl_available() {
+            return;
+        }
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let seen_server = seen.clone();
+        let body = b"payload".to_vec();
+        let (url, shutdown) = spawn_http_server(move |req| {
+            *seen_server.lock().unwrap() = Some(String::from_utf8_lossy(req).to_string());
+            http_response("HTTP/1.1 200 OK", &[("ETag", "\"v1\"")], &body)
+        });
+        // Even with the test-only allowlist extension ON, an unset
+        // credential attaches nothing — the env kill switch is total.
+        let _guard = LoopbackTokenGuard::install(None, true);
+        let work = tempfile::tempdir().unwrap();
+        let tmp = work.path().join("out.bin");
+        http_get_conditional(&url, &tmp, None).unwrap();
+        let request = seen.lock().unwrap().clone().unwrap();
+        assert!(
+            !request.contains("Authorization:"),
+            "an unset credential must attach no header: {request}"
+        );
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn http_401_error_text_carries_no_token() {
+        if !curl_available() {
+            return;
+        }
+        let (url, shutdown) =
+            spawn_http_server(move |_req| http_response("HTTP/1.1 401 Unauthorized", &[], b""));
+        let _guard = LoopbackTokenGuard::install(Some("loopback-test-token"), true);
+        let work = tempfile::tempdir().unwrap();
+        let dest = work.path().join("src.tar.gz");
+        let err = http_get_to_file(&url, &dest).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("401"), "the status must surface: {msg}");
+        assert!(
+            !msg.contains("loopback-test-token"),
+            "the credential must never leak into error text: {msg}"
+        );
+        // Failure-path cleanup: the 0600 credential file must be gone —
+        // a 401 must not strand the token on disk.
+        let leftovers: Vec<String> = std::fs::read_dir(work.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect();
+        assert!(
+            !leftovers.iter().any(|n| n.contains(".auth-")),
+            "the credential file must be removed on the failure path: {leftovers:?}"
         );
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     }
