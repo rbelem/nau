@@ -7498,7 +7498,6 @@ pod {
     /// Bare SnapMeta with every optional field empty (mirrors the test
     /// helper in manifest.rs).
     fn bare_meta(name: &str, version: &str) -> crate::snap::SnapMeta {
-        use std::collections::HashMap;
         crate::snap::SnapMeta {
             name: name.into(),
             version: version.into(),
@@ -7532,7 +7531,7 @@ pod {
             toolchain: None,
             inputs: None,
             confined: None,
-            apps: HashMap::new(),
+            apps: BTreeMap::new(),
             services: BTreeMap::new(),
             deps: None,
             floating: false,

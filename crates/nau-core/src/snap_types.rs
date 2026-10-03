@@ -11,7 +11,7 @@
 //! (the root crate's `snap` module); re-exports there keep every
 //! pre-existing `crate::snap::` path compiling.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use serde::Serializer;
 use serde::{Deserialize, Serialize};
@@ -352,9 +352,10 @@ pub struct SnapMeta {
 
     /// Package input references. Maps input name to a URL.
     /// Example: `{ packages = { url = "github:rbelem/nau/main" } }`
-    /// Skipped in YAML — build metadata only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inputs: Option<HashMap<String, PackageInput>>,
+    /// Skipped in YAML — build metadata only (never enters `meta/snap.yaml`,
+    /// so its ordering cannot perturb the payload digest).
+    #[serde(default, skip_serializing)]
+    pub inputs: Option<BTreeMap<String, PackageInput>>,
 
     /// Cross-compilation target triplet (e.g. "x86_64-linux-gnu", "aarch64-linux-gnu").
     /// When set, the build sandbox sets CC/CXX/LD/etc to the cross-compiler and
@@ -369,7 +370,7 @@ pub struct SnapMeta {
     pub toolchain: Option<String>,
 
     #[serde(default)]
-    pub apps: HashMap<String, SnapApp>,
+    pub apps: BTreeMap<String, SnapApp>,
 
     /// Services declared by this package (ADR-0032, issue #105), keyed by
     /// service name. Emitted into snap.yaml so it survives the pod build →

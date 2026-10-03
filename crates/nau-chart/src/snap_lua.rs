@@ -10,7 +10,7 @@
 //!
 //! Moved verbatim from root `snap.rs` and `image/mod.rs` (#326).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use mlua::Value;
@@ -656,7 +656,7 @@ impl FromLuaTable for SnapMeta {
         }
         let target: Option<String> = get_opt_string(table, "target")?;
         let toolchain: Option<String> = get_opt_string(table, "toolchain")?;
-        let inputs: Option<HashMap<String, PackageInput>> = get_package_inputs(table)?;
+        let inputs: Option<BTreeMap<String, PackageInput>> = get_package_inputs(table)?;
         let confined = get_opt_table(table, "confined")?
             .map(|t| confinement_from_lua(&t))
             .transpose()?;
@@ -701,7 +701,7 @@ impl FromLuaTable for SnapMeta {
 
         let apps = get_opt_table(table, "apps")?
             .map(|apps_table| {
-                let mut apps = HashMap::new();
+                let mut apps = BTreeMap::new();
                 for pair in apps_table.pairs::<String, Value>() {
                     let (name, value) = pair.map_err(|e| miette::miette!("apps entry: {}", e))?;
                     match value {
@@ -1801,11 +1801,11 @@ fn get_opt_plug_map(
 /// Extract `inputs` table: maps name → PackageInput { url, submodules? }.
 fn get_package_inputs(
     table: &mlua::Table,
-) -> miette::Result<Option<HashMap<String, PackageInput>>> {
+) -> miette::Result<Option<BTreeMap<String, PackageInput>>> {
     let value: Value = table.get("inputs").unwrap_or(Value::Nil);
     match value {
         Value::Table(t) => {
-            let mut inputs = HashMap::new();
+            let mut inputs = BTreeMap::new();
             for pair in t.pairs::<String, Value>() {
                 let (name, val) = pair.map_err(|e| miette::miette!("inputs entry: {e}"))?;
                 match val {
