@@ -237,6 +237,15 @@ pub fn provision_verb(
     dry_run: bool,
     file: &str,
 ) -> miette::Result<()> {
+    // The agent-install preflight: a binary URL no guest can download
+    // means the window dies at cloud-init AFTER the server is billed
+    // and pinned (live 2026-10-02: the default release asset 404'd
+    // publicly and a created server had to be torn down). Refuse before
+    // any API call. A dry run makes no API call and installs nothing —
+    // the probe is skipped there.
+    if !dry_run {
+        probe_binary_url(&nau_infra::command::RealRunner, &default_binary_url())?;
+    }
     let req = ProvisionRequest {
         server_type,
         location,
@@ -252,6 +261,44 @@ pub fn provision_verb(
         ca_fingerprint: run_ca_fingerprint(dry_run)?,
     };
     provision_main(provider, req, run_publish_channel(dry_run)?)
+}
+
+/// The worker-binary preflight: HEAD the URL cloud-init will install
+/// from and refuse unless it answers 2xx over the redirect chain.
+/// Serving fronts must answer HEAD for the binary path
+/// (nau-ops-runbook §1.6 — one `do_HEAD` line in the shim).
+fn probe_binary_url(
+    runner: &dyn nau_infra::command::CommandRunner,
+    url: &str,
+) -> miette::Result<()> {
+    let argv: Vec<String> = vec![
+        "curl".into(),
+        "-sIL".into(),
+        "--connect-timeout".into(),
+        "10".into(),
+        "--max-time".into(),
+        "15".into(),
+        "-o".into(),
+        "/dev/null".into(),
+        "-w".into(),
+        "%{http_code}".into(),
+        url.into(),
+    ];
+    let out = runner
+        .run(&argv)
+        .map_err(|e| miette::miette!("curl not found: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let status: u16 = stdout.trim().parse().unwrap_or(0);
+    if nau_infra::command::exit_code(&out) == 0 && (200..300).contains(&status) {
+        return Ok(());
+    }
+    miette::bail!(
+        "the pinned worker binary URL {url} is not servable (HTTP {status}, curl exit {}) — \
+         no guest can install the agent, so the window would die at cloud-init; \
+         publish the release asset or point NAU_WORKER_BINARY_URL at a serving front \
+         that answers HEAD (nau-ops-runbook §1.6)",
+        nau_infra::command::exit_code(&out)
+    );
 }
 
 /// The `destroy` verb body, scalar entry: destroy one server by name and
@@ -814,22 +861,19 @@ fn run_wrapped(command: &[String]) -> miette::Result<i32> {
     })
 }
 
-/// The `down --all-managed` verb body: resolve the real publish channel
-/// (the machine-linkage store names each pinned address's server) and
-/// drain the block.
+/// The `down --all-managed` verb body: resolve the machine-linkage home
+/// (the store that names each pinned address's server) and drain the
+/// block. Teardown publishes nothing, so the publish URL itself is NOT
+/// demanded — a dead front (the coordinator moved, the funnel is off)
+/// must never block destroying the workers it once fronted.
 pub fn down_all_managed_main(provider: &str, file: &str) -> miette::Result<()> {
-    let channel = run_publish_channel(false)?;
-    let publish_home = match &channel {
-        Some(c) => c.home.clone(),
-        None => {
-            return Err(miette::miette!(
-                "workers down: no publish channel — the machine linkage that names each \
-                 pinned server lives there"
-            ))
-        }
-    };
-    let provisioner = provider_for(provider, channel)?;
-    run_down_all_managed(provisioner.as_ref(), &publish_home, Path::new(file))?;
+    let publish_home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let provisioner = provider_for(provider, None)?;
+    run_down_all_managed(
+        provisioner.as_ref(),
+        Path::new(&publish_home),
+        Path::new(file),
+    )?;
     Ok(())
 }
 
@@ -1715,12 +1759,18 @@ pub struct ManagedEntry {
 }
 
 fn read_config(config: &Path) -> miette::Result<String> {
-    std::fs::read_to_string(config).map_err(|e| {
-        miette::miette!(
+    match std::fs::read_to_string(config) {
+        Ok(text) => Ok(text),
+        // An absent file is an empty starter: provision's pin upserts
+        // the managed block into it (creating the file on write), and
+        // teardown sees no managed entries — a green no-op that creates
+        // nothing. Other failures stay loud.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(miette::miette!(
             "provision: cannot read the worker config {}: {e}",
             config.display()
-        )
-    })
+        )),
+    }
 }
 
 /// Atomically replace `config` (tempfile + rename, the known_hosts-pin
@@ -2100,10 +2150,82 @@ fn is_word_at(b: &[u8], i: usize, word: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nau_infra::command::RunnerOutput;
     use std::sync::Mutex;
 
     /// Serializes the env-mutating tests (process-global state).
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A canned curl: answers with the given exit code and the -w
+    /// status line on stdout.
+    struct FakeCurl {
+        code: i32,
+        status_line: &'static str,
+    }
+
+    impl nau_infra::command::CommandRunner for FakeCurl {
+        fn run(&self, _argv: &[String]) -> std::io::Result<RunnerOutput> {
+            Ok(RunnerOutput {
+                code: self.code,
+                stdout: self.status_line.as_bytes().to_vec(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn binary_probe_accepts_a_2xx_front() {
+        let ok = FakeCurl {
+            code: 0,
+            status_line: "200",
+        };
+        probe_binary_url(&ok, "https://front.example/bin/nau-amd64").expect("a 2xx front installs");
+    }
+
+    #[test]
+    fn binary_probe_accepts_a_redirect_to_a_2xx_target() {
+        // curl -L collapses the chain; -w reports the FINAL hop's code.
+        let ok = FakeCurl {
+            code: 0,
+            status_line: "200",
+        };
+        probe_binary_url(
+            &ok,
+            "https://github.example/x/y/releases/download/v0.1.0/nau-amd64",
+        )
+        .expect("a redirect chain ending 2xx installs");
+    }
+
+    #[test]
+    fn binary_probe_refuses_a_404_before_any_server_exists() {
+        let gone = FakeCurl {
+            code: 0,
+            status_line: "404",
+        };
+        let err = probe_binary_url(
+            &gone,
+            "https://github.example/rbelem/nau/releases/download/v0.1.0/nau-amd64",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("is not servable"), "{err}");
+        assert!(
+            err.contains("NAU_WORKER_BINARY_URL"),
+            "names the override: {err}"
+        );
+    }
+
+    #[test]
+    fn binary_probe_refuses_an_unreachable_front() {
+        let dead = FakeCurl {
+            code: 7,
+            status_line: "000",
+        };
+        let err = probe_binary_url(&dead, "http://10.255.255.1/bin/nau-amd64")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("curl exit 7"), "{err}");
+    }
 
     #[test]
     fn ttl_parses_single_unit_durations() {

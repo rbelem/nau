@@ -169,7 +169,10 @@ destroy (§1.3's "workers live ONLY while a lane uses them"). Distilled
 from two live runs (2026-09-29); every step was executed, not planned.
 
 1. **Preflight channel.** Serve the publish front on `127.0.0.1:8477`
-   (any shim that 404s unknown paths but serves the token paths works)
+   (any shim that 404s unknown paths but serves the token paths works;
+   it must also answer HEAD for the binary path — `provision` probes
+   the pinned binary URL with a HEAD before any API call and refuses a
+   front that cannot serve it)
    and expose it ONLY via `tailscale funnel --https=8443
    127.0.0.1:8477`. The worker binary rides the same front at
    `/bin/nau-amd64`, patchelf'd first: interpreter
