@@ -1494,7 +1494,7 @@ fn bare_meta(name: &str, version: &str) -> SnapMeta {
         toolchain: None,
         inputs: None,
         confined: None,
-        apps: HashMap::new(),
+        apps: BTreeMap::new(),
         services: BTreeMap::new(),
         deps: None,
         floating: false,

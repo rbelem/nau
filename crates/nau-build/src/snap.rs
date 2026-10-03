@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -133,7 +133,7 @@ fn feed_str_list(buf: &mut Vec<u8>, items: &[String]) {
 /// Feed a `HashMap`-backed map in SORTED key order: count, then
 /// key-sorted entries. Never iterate a HashMap directly — its order is
 /// per-process noise.
-fn feed_sorted_map<V, F>(buf: &mut Vec<u8>, map: &HashMap<String, V>, feed_value: F)
+fn feed_sorted_map<V, F>(buf: &mut Vec<u8>, map: &BTreeMap<String, V>, feed_value: F)
 where
     F: Fn(&mut Vec<u8>, &V),
 {
@@ -283,7 +283,7 @@ fn feed_app(buf: &mut Vec<u8>, app: &SnapApp) {
     feed_opt(buf, app.confined.as_ref(), feed_confinement);
 }
 
-fn feed_app_map(buf: &mut Vec<u8>, apps: &HashMap<String, SnapApp>) {
+fn feed_app_map(buf: &mut Vec<u8>, apps: &BTreeMap<String, SnapApp>) {
     feed_sorted_map(buf, apps, feed_app);
 }
 
@@ -323,7 +323,7 @@ fn feed_input(buf: &mut Vec<u8>, input: &PackageInput) {
     }
 }
 
-fn feed_input_map(buf: &mut Vec<u8>, inputs: &HashMap<String, PackageInput>) {
+fn feed_input_map(buf: &mut Vec<u8>, inputs: &BTreeMap<String, PackageInput>) {
     feed_sorted_map(buf, inputs, feed_input);
 }
 
@@ -4610,7 +4610,7 @@ mod tests {
             toolchain: None,
             inputs: None,
             confined: None,
-            apps: HashMap::new(),
+            apps: BTreeMap::new(),
             services: BTreeMap::new(),
             deps: None,
             floating: false,
@@ -4651,7 +4651,7 @@ mod tests {
                 confined: None,
             },
         );
-        let mut inputs = HashMap::new();
+        let mut inputs = BTreeMap::new();
         inputs.insert(
             "pkgs".to_string(),
             PackageInput {
@@ -4696,7 +4696,7 @@ mod tests {
                 confined: None,
             },
         );
-        let mut inputs = HashMap::new();
+        let mut inputs = BTreeMap::new();
         inputs.insert(
             "defs".to_string(),
             PackageInput {
@@ -5226,6 +5226,52 @@ mod tests {
         assert!(
             err.contains("app 'svc': unknown field 'restart_condition'"),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn snap_yaml_app_order_is_key_sorted_and_inputs_stay_out() {
+        // A2 root cause (gen-109..112 payload bistability): `apps` was a
+        // HashMap, so meta/snap.yaml serialized in per-process random
+        // order and the squashfs payload digest wobbled per build while
+        // meta_digest stayed constant. The manifest must render apps
+        // key-sorted, and `inputs` (build metadata) must never enter
+        // the YAML at all.
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return snap {
+                name = "ordered",
+                version = "1.0",
+                apps = {
+                    zeta = { command = "bin/z" },
+                    mid = { command = "bin/m" },
+                    alpha = { command = "bin/a" },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let mut meta = SnapMeta::from_lua_table(&table).unwrap();
+        meta.inputs = Some(std::collections::BTreeMap::from([(
+            "pkg".to_string(),
+            PackageInput {
+                url: "github:rbelem/nau/main".to_string(),
+                submodules: None,
+            },
+        )]));
+        let yaml = meta.to_yaml().unwrap();
+        let alpha = yaml.find("alpha:").unwrap();
+        let mid = yaml.find("mid:").unwrap();
+        let zeta = yaml.find("zeta:").unwrap();
+        assert!(
+            alpha < mid && mid < zeta,
+            "apps block is not key-sorted:\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("inputs"),
+            "inputs leaked into snap.yaml:\n{yaml}"
         );
     }
 
@@ -11165,7 +11211,7 @@ mod wrapper_tests {
             interpreter: interpreter.map(|s| s.to_string()),
             confined: None,
         };
-        let mut apps = HashMap::new();
+        let mut apps = BTreeMap::new();
         apps.insert(app_name.to_string(), app);
         SnapMeta {
             name: "pkg".into(),

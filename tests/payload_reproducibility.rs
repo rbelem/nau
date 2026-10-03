@@ -95,7 +95,7 @@ fn trivial_meta() -> SnapMeta {
         toolchain: None,
         inputs: None,
         confined: None,
-        apps: std::collections::HashMap::new(),
+        apps: std::collections::BTreeMap::new(),
         services: std::collections::BTreeMap::new(),
         deps: None,
         floating: false,

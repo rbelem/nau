@@ -275,7 +275,6 @@ pub fn lint_json(warnings: &[LintWarning]) -> Vec<BTreeMap<&'static str, String>
 mod tests {
     use super::*;
     use nau_core::snap_types::{SnapApp, SnapMeta};
-    use std::collections::HashMap;
 
     fn strict_meta(name: &str) -> SnapMeta {
         SnapMeta {
@@ -311,7 +310,7 @@ mod tests {
             toolchain: None,
             inputs: None,
             confined: None,
-            apps: HashMap::new(),
+            apps: BTreeMap::new(),
             services: BTreeMap::new(),
             deps: None,
             floating: false,
