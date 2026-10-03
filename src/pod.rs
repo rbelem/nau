@@ -6558,6 +6558,13 @@ fn build_pending_snap(
     // provenance proof prepare_snap will rely on (item 6b).
     nau_core::blob_memo::invalidate(&payload);
     let sha3_384 = sha3_384_file_memoized(&payload)?;
+    // Same contract as the dep-ensure path: the sidecar must describe
+    // the bytes NOW on disk. A top-level rebuild that leaves the old
+    // digest behind makes the next sync's reuse check refuse the very
+    // payload this build just wrote (live 2026-10-03: rust, python,
+    // libsecret, node, tree-sitter-perl — each rebuilt at its pin, each
+    // refused as a bd at the next sync).
+    record_dep_payload_digest(&payload, &sha3_384)?;
     Ok((
         build_pending_snap_at(meta, &payload, sha3_384, layer),
         result.source_infos,
@@ -7127,6 +7134,39 @@ pub fn fetch_pod_deps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sidecar contract both payload writers depend on (the top-level
+    /// build path and the dep-ensure path): record after write → verify
+    /// passes; rewrite the bytes without re-recording (and without the
+    /// memo invalidate both paths do) → verify refuses. Pins the
+    /// 2026-10-03 stale-sidecar class (rust, python, libsecret, node,
+    /// tree-sitter-perl — top-level rebuilds left old digests behind and
+    /// the next sync refused them as bd payloads).
+    #[test]
+    fn dep_payload_sidecar_tracks_rewrites() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = dir.path().join("pkg_1.0.0_amd64.snap");
+
+        std::fs::write(&payload, b"content-v1").expect("write v1");
+        let digest = crate::store::sha3_384_file(&payload).expect("hash v1");
+        record_dep_payload_digest(&payload, &digest).expect("record v1");
+        verify_cached_dep_payload(&payload, "pkg").expect("verify v1");
+
+        // Rewrite the bytes without re-recording — memo invalidated the
+        // way both writers invalidate before hashing fresh bytes.
+        std::fs::write(&payload, b"content-v2").expect("write v2");
+        nau_core::blob_memo::invalidate(&payload);
+        assert!(
+            verify_cached_dep_payload(&payload, "pkg").is_err(),
+            "a rewritten payload under a stale sidecar must refuse"
+        );
+
+        // Re-recording after the rewrite heals it — the fixed top-level
+        // build path's behavior.
+        let fresh = crate::store::sha3_384_file(&payload).expect("hash v2");
+        record_dep_payload_digest(&payload, &fresh).expect("record v2");
+        verify_cached_dep_payload(&payload, "pkg").expect("verify v2");
+    }
 
     /// The reconcile-lifetime eval memo (sync-speed plan item 5): a
     /// declaration put under the guard is served by the second lookup
