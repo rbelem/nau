@@ -1,4 +1,4 @@
--- gcc: GNU Compiler Collection 14.2 (C/C++) — FETCH strategy.
+-- gcc: GNU Compiler Collection 15.2 (C/C++) — FETCH strategy.
 --
 -- Issue #164: the gate pod's cargo builds die at build scripts
 -- (`failed to find tool "cc"` — zstd-sys et al.) because the pod carries
@@ -29,22 +29,22 @@
 -- snapshot immutability + distro metadata), spot-verified by hashing
 -- the landed bytes. Source keys are the Debian binary package name;
 -- where that name is arch-generic (ships every port), the snap arch is
--- appended with `_` (Debian filename convention: gcc-14_amd64,
+-- appended with `_` (Debian filename convention: gcc-15_amd64,
 -- libstdc++6_arm64, …); triplet-encoding names are unique per port as
--- shipped (gcc-14-x86-64-linux-gnu / gcc-14-aarch64-linux-gnu /
--- gcc-14-arm-linux-gnueabihf).
+-- shipped (gcc-15-x86-64-linux-gnu / gcc-15-aarch64-linux-gnu /
+-- gcc-15-arm-linux-gnueabihf).
 --
 -- Deb set, per arch:
---   compiler      gcc-14-<triplet> (driver, <triplet>-gcc-14)
---                 + cpp-14-<triplet> (cc1) + gcc-14 (usr/bin/gcc-14
---                 symlink) + gcc-14-base (docs) + libgcc-14-dev (crt .o,
+--   compiler      gcc-15-<triplet> (driver, <triplet>-gcc-15)
+--                 + cpp-15-<triplet> (cc1) + gcc-15 (usr/bin/gcc-15
+--                 symlink) + gcc-15-base (docs) + libgcc-15-dev (crt .o,
 --                 libgcc.a, gcc include/)
---   c++ compiler  g++-14-<triplet> (cc1plus, driver
---                 <triplet>-g++-14) + libstdc++-14-dev (headers,
+--   c++ compiler  g++-15-<triplet> (cc1plus, driver
+--                 <triplet>-g++-15) + libstdc++-15-dev (headers,
 --                 static lib) + libstdc++6 (runtime) — cc-rs probes
 --                 literal `c++` for C++ build scripts just like `cc`
 --                 for C. None of these debs ships a `*-c++-14` binary:
---                 the shim's C++ arm must exec g++-14 (77964ae — the
+--                 the shim's C++ arm must exec g++-15 (77964ae — the
 --                 first cut pointed at x86_64-linux-gnu-c++-14, a file
 --                 Debian never ships, and every C++ probe died ENOENT).
 --   kernel uapi   NONE — the deb set must not restage owned subtrees:
@@ -91,7 +91,7 @@
 -- binaries at runtime). Both already ship in the gate pod.
 --
 -- apps: cc-rs probes the literal `cc` (C build scripts) and `c++` (C++
--- build scripts); gcc-14's binaries are triplet-named drivers, so cc and
+-- build scripts); gcc-15's binaries are triplet-named drivers, so cc and
 -- c++ are declared as apps onto them and land as tree-routed launchers.
 -- gcc/g++ stay exposed too. All four (cc/c++/gcc/g++) route through
 -- `usr/bin/cc`, the LIBRARY_PATH→-L shim (see build) — a raw-driver app
@@ -101,10 +101,10 @@
 return {
     default = snap {
         name = "gcc",
-        version = "14.2.0",
-        summary = "GNU Compiler Collection 14.2 (C/C++) for amd64/arm64/armhf — Debian trixie payload",
+        version = "15.2.0",
+        summary = "GNU Compiler Collection 15.2 (C/C++) for amd64/arm64/armhf — Debian trixie payload",
         description = [[
-            GCC 14.2 C/C++ compilers (drivers + cc1/cc1plus) with
+            GCC 15.2 C/C++ compilers (drivers + cc1/cc1plus) with
             binutils, libstdc++, and cc1's runtime libraries, merged
             into a classic /usr prefix layout from Debian trixie binary
             packages (snapshot.debian.org, timestamp-pinned; one deb set
@@ -126,41 +126,41 @@ return {
 
         sources = {
             -- ── amd64 (x86_64-linux-gnu) ──
-            ["gcc-14-x86-64-linux-gnu"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/gcc-14-x86-64-linux-gnu_14.2.0-19_amd64.deb",
-                sha256 = "a17ef039f1ba482051c3efb5c2c24070002e60dd0bd09fd456ec31481a11b725",
+            ["gcc-15-x86-64-linux-gnu"] = {
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/gcc-15-x86-64-linux-gnu_15.2.0-1_amd64.deb",
+                sha256 = "2da0ad96c83668bb783056589854ccbf03526ee4bffd844ac71ffb906af8df67",
             },
-            ["g++-14-x86-64-linux-gnu"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/g++-14-x86-64-linux-gnu_14.2.0-19_amd64.deb",
-                sha256 = "c66b009fedd340520279d1af2f91d0668e9f64f0c08fe62179ca1c75e556be58",
+            ["g++-15-x86-64-linux-gnu"] = {
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/g++-15-x86-64-linux-gnu_15.2.0-1_amd64.deb",
+                sha256 = "f5ffa50e3fe61d73a51edd62e179eff6aa550c8d15fd398994d434aa808fe9d0",
             },
-            ["cpp-14-x86-64-linux-gnu"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/cpp-14-x86-64-linux-gnu_14.2.0-19_amd64.deb",
-                sha256 = "ef274b5379f5f97fc71619d39ecc84d039d3e184570d207b909c90afaa5d79e0",
+            ["cpp-15-x86-64-linux-gnu"] = {
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/cpp-15-x86-64-linux-gnu_15.2.0-1_amd64.deb",
+                sha256 = "a86f0aff268bbf2a7a519975d82f2ddc51c3adc6ebe428144c24270862a0522a",
             },
             ["binutils-x86-64-linux-gnu"] = {
                 url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/b/binutils/binutils-x86-64-linux-gnu_2.44-3_amd64.deb",
                 sha256 = "e6741ce95ff0f7a131c8d9faa3528ccbbc453078bbc62a97da81340ed7462c53",
             },
-            ["gcc-14_amd64"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/gcc-14_14.2.0-19_amd64.deb",
-                sha256 = "21500408b5019d8d29f70ce58488e2eea469a1adb4b5fd7db45e819b5efcac4e",
+            ["gcc-15_amd64"] = {
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/gcc-15_15.2.0-1_amd64.deb",
+                sha256 = "05598d1193b1664c27b7473b56b0998568f2cad2097516e69b812d9d778aa063",
             },
-            ["gcc-14-base_amd64"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/gcc-14-base_14.2.0-19_amd64.deb",
-                sha256 = "5b6825de4263824b78c4c51f6476414f3b4e89c2ab63e81dc8b9b5501e867cf6",
+            ["gcc-15-base_amd64"] = {
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/gcc-15-base_15.2.0-1_amd64.deb",
+                sha256 = "f2667ee6d742ac39e7e1aed583b385c186c7c4a369284424d9629e99d66741e7",
             },
-            ["libstdc++-14-dev_amd64"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/libstdc++-14-dev_14.2.0-19_amd64.deb",
-                sha256 = "4b962fac5f1af0bd8b1b3f97e0f47b9d8e9a79e88802143f00ebfbd78ad87a7b",
+            ["libstdc++-15-dev_amd64"] = {
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/libstdc++-15-dev_15.2.0-1_amd64.deb",
+                sha256 = "5282f4a78a6192a6a20a51a6f9fb0921cfe3259e1c63e6fc5011ae2c2c22f51f",
             },
             ["libstdc++6_amd64"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/libstdc++6_14.2.0-19_amd64.deb",
-                sha256 = "ab1fa05837aa7a92aae748fd07a18a35f7d18bb4a71c4724fe2bbf0e32089de0",
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/libstdc++6_15.2.0-1_amd64.deb",
+                sha256 = "a120b09a7f30bfd61f66978b5c79efe891d4b4f4401d5ddd7ad26eaab2d4dcc1",
             },
-            ["libgcc-14-dev_amd64"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/libgcc-14-dev_14.2.0-19_amd64.deb",
-                sha256 = "ca6f2d36d96b19b3eb71405b0b80134d8c89380b02204a2512e5c58ceb090628",
+            ["libgcc-15-dev_amd64"] = {
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/libgcc-15-dev_15.2.0-1_amd64.deb",
+                sha256 = "5df600d9307ccaf12751f2e20cca838812def74d660789053dcd48aefeef9a2e",
             },
             -- NO linux-libc-dev here (issue #174): it ships the kernel uapi
             -- headers (usr/include/asm-generic/, linux/), which are owned
@@ -247,25 +247,25 @@ return {
                 url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/b/binutils/libsframe1_2.44-3_arm64.deb",
                 sha256 = "d4a90764fa79858347aaa3197bc4489404f005d9cdbea9b2ec75a607ea5ff518",
             },
-            ["gcc-14_arm64"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/gcc-14_14.2.0-19_arm64.deb",
-                sha256 = "f4ba77903d7efc3c64c69a8a98c7efa8ea1ae4331521bb74abd76bcc43f1b576",
+            ["gcc-15_arm64"] = {
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/gcc-15_15.2.0-1_arm64.deb",
+                sha256 = "f5796965a8d73253444b5060548518919d8e95d676275ef65687686814e6fa0e",
             },
-            ["gcc-14-base_arm64"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/gcc-14-base_14.2.0-19_arm64.deb",
-                sha256 = "34ee90679b018c0e64234747a4c4c0ae6b7f63541115037465a8627c2dfbc594",
+            ["gcc-15-base_arm64"] = {
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/gcc-15-base_15.2.0-1_arm64.deb",
+                sha256 = "22197032375bfcd795314d18de408032d23aa04ca6374ef9e9157a391a14561b",
             },
-            ["libgcc-14-dev_arm64"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/libgcc-14-dev_14.2.0-19_arm64.deb",
-                sha256 = "64b8ebc7182a69aa9525df6eab5e7eb849b947e350d821549f8a8a3e9b19e5ba",
+            ["libgcc-15-dev_arm64"] = {
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/libgcc-15-dev_15.2.0-1_arm64.deb",
+                sha256 = "de803e43926205b40f4055e1116fcbc72f43c0e843902ea321fa108c5cea1e60",
             },
-            ["libstdc++-14-dev_arm64"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/libstdc++-14-dev_14.2.0-19_arm64.deb",
-                sha256 = "8760122d044cd8eb8c69426311d6b5ce7bb8f0f76e9cda1944d153ae878138f8",
+            ["libstdc++-15-dev_arm64"] = {
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/libstdc++-15-dev_15.2.0-1_arm64.deb",
+                sha256 = "48c07786940a1391eed8fc2e3ea586461d2dfb8f1db35462e99fd81eab07fd41",
             },
             ["libstdc++6_arm64"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/libstdc++6_14.2.0-19_arm64.deb",
-                sha256 = "6669b0c52a2e7c6af9adfdabce3ff6e286065cdfbc7b85280862b5f799daebee",
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/libstdc++6_15.2.0-1_arm64.deb",
+                sha256 = "28c6169a45111105b029b3c4d6bc702a419363aaad6c77821be51f8da82c69a7",
             },
             ["libgmp10_arm64"] = {
                 url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gmp/libgmp10_6.3.0+dfsg-3_arm64.deb",
@@ -299,17 +299,17 @@ return {
                 url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/b/binutils/binutils-aarch64-linux-gnu_2.44-3_arm64.deb",
                 sha256 = "79cbf1459118bce3535133ffbf1fd2adbd57af65271f95c829af5cfa7f474168",
             },
-            ["cpp-14-aarch64-linux-gnu"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/cpp-14-aarch64-linux-gnu_14.2.0-19_arm64.deb",
-                sha256 = "8e588ac3efe06f7784b08feac584c70e6965b74c045bae7e4e80bb42938f7dbe",
+            ["cpp-15-aarch64-linux-gnu"] = {
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/cpp-15-aarch64-linux-gnu_15.2.0-1_arm64.deb",
+                sha256 = "b1285534cb08f6d7201104fc7992499fcb598f0cd8803dcdd81ba1e10d0e4661",
             },
-            ["g++-14-aarch64-linux-gnu"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/g++-14-aarch64-linux-gnu_14.2.0-19_arm64.deb",
-                sha256 = "411dac8f1c1d0293e58deddeb170c641ad82c56d51a95f056ee12ba02c24288b",
+            ["g++-15-aarch64-linux-gnu"] = {
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/g++-15-aarch64-linux-gnu_15.2.0-1_arm64.deb",
+                sha256 = "55ee94754af0b8dba9a969e29d492910225e6c323ffe5477c9b01444955de13c",
             },
-            ["gcc-14-aarch64-linux-gnu"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/gcc-14-aarch64-linux-gnu_14.2.0-19_arm64.deb",
-                sha256 = "5ff736a332ba5d60ad463355ed25c8c39da1281acf9155cc2f8a55fc1d478be8",
+            ["gcc-15-aarch64-linux-gnu"] = {
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/gcc-15-aarch64-linux-gnu_15.2.0-1_arm64.deb",
+                sha256 = "1453eca0c95c74007daa1e3d7a80457a06fce8eb981352c1efdb6148a72c7b89",
             },
             -- binary-armhf Packages index at that timestamp ──
             ["binutils_armhf"] = {
@@ -336,25 +336,25 @@ return {
                 url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/b/binutils/libsframe1_2.44-3_armhf.deb",
                 sha256 = "1cc6821b6e4619cf9a5467c473445fff23d1c87c754f0b5bad639e31609303a5",
             },
-            ["gcc-14_armhf"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/gcc-14_14.2.0-19_armhf.deb",
-                sha256 = "d90f54385f550235c66c21f67ceccec1ce291e5fa67f44a94219c3b7718726bc",
+            ["gcc-15_armhf"] = {
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/gcc-15_15.2.0-1_armhf.deb",
+                sha256 = "fd2410e8184c2137095818d086cf1df6f5fde4cb3a792f83f38db5ad4eae12b2",
             },
-            ["gcc-14-base_armhf"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/gcc-14-base_14.2.0-19_armhf.deb",
-                sha256 = "0f702fdd5e5471efda9fece892e09ce73e3447968083e1f8c341f8b66b1fb340",
+            ["gcc-15-base_armhf"] = {
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/gcc-15-base_15.2.0-1_armhf.deb",
+                sha256 = "c1ce039dda2a5a80b761452db27fac937c5042487f7ba089610431c6f88bf31e",
             },
-            ["libgcc-14-dev_armhf"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/libgcc-14-dev_14.2.0-19_armhf.deb",
-                sha256 = "f74912d6d0bc28058471ae7ff98f45edd8d5f6612c903116e218e56d3abbb9d0",
+            ["libgcc-15-dev_armhf"] = {
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/libgcc-15-dev_15.2.0-1_armhf.deb",
+                sha256 = "e4ba12c60efcd976e61336a77182b8edd7ab73c9e94c84669548e254b1cef240",
             },
-            ["libstdc++-14-dev_armhf"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/libstdc++-14-dev_14.2.0-19_armhf.deb",
-                sha256 = "ee738474d840e719905280f62872a5da8c43b01b108b78a3ad10888f55f5cd46",
+            ["libstdc++-15-dev_armhf"] = {
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/libstdc++-15-dev_15.2.0-1_armhf.deb",
+                sha256 = "c57eeeae98d03cb51053b04dfd1ca109780be16e96b2a9c6a2a113fbb1ba9ae6",
             },
             ["libstdc++6_armhf"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/libstdc++6_14.2.0-19_armhf.deb",
-                sha256 = "9c82eecc30961a3da3e062c0dba8ce076736059f4b8e7794c803985e75aea48b",
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/libstdc++6_15.2.0-1_armhf.deb",
+                sha256 = "45612c001aa55ac2d2439763edaf2b836d87d83058002cc1e0d123212319ea77",
             },
             ["libgmp10_armhf"] = {
                 url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gmp/libgmp10_6.3.0+dfsg-3_armhf.deb",
@@ -388,25 +388,25 @@ return {
                 url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/b/binutils/binutils-arm-linux-gnueabihf_2.44-3_armhf.deb",
                 sha256 = "5eaf974e1374eaa2a7a288cd7fc2104048190495785bbe08e2768b0188c093f4",
             },
-            ["cpp-14-arm-linux-gnueabihf"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/cpp-14-arm-linux-gnueabihf_14.2.0-19_armhf.deb",
-                sha256 = "f08547aa63cb983b8f518f4d937a1f73b18f464f2ac3ecdcc239c933df086e14",
+            ["cpp-15-arm-linux-gnueabihf"] = {
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/cpp-15-arm-linux-gnueabihf_15.2.0-1_armhf.deb",
+                sha256 = "f1fbc9645f9141aab006815066f92246da04bebdc0b2b051015de95a82db4d21",
             },
-            ["g++-14-arm-linux-gnueabihf"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/g++-14-arm-linux-gnueabihf_14.2.0-19_armhf.deb",
-                sha256 = "7815d3e654ce282581f33df99dea79abad0ba3b24ba4cae537563774c4d0c729",
+            ["g++-15-arm-linux-gnueabihf"] = {
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/g++-15-arm-linux-gnueabihf_15.2.0-1_armhf.deb",
+                sha256 = "a4a4f14a74ddf9d1bae514d444ece771b5201efa0b90db717a3c4fe125c1a9e0",
             },
-            ["gcc-14-arm-linux-gnueabihf"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/gcc-14-arm-linux-gnueabihf_14.2.0-19_armhf.deb",
-                sha256 = "839169ff58363da8cdf0dc3ab7ab91865b25c7147a01fd184bca0103f488c298",
+            ["gcc-15-arm-linux-gnueabihf"] = {
+                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-15/gcc-15-arm-linux-gnueabihf_15.2.0-1_armhf.deb",
+                sha256 = "a574a8191fb5971a6ff602362e8592ada51fec6426d985d4350a7210041c5d82",
             },
         },
 
         -- Pure file-copy: unpack the build arch's deb set's data.tar
         -- members into the stage, merging the dpkg ./usr trees. busybox
         -- dpkg-deb -x is the sandbox's only deb unpacker (see probe note
-        -- above); -x keeps modes and relative symlinks (gcc-14 ->
-        -- x86_64-linux-gnu-gcc-14, ar -> x86_64-linux-gnu-ar, ...)
+        -- above); -x keeps modes and relative symlinks (gcc-15 ->
+        -- x86_64-linux-gnu-gcc-15, ar -> x86_64-linux-gnu-ar, ...)
         -- verbatim. Arch selection: CONFIGURE_TARGET (exported by the
         -- build env for a --target cross build) else uname -m —
         -- check_cross_build has already refused any arch the host cannot
@@ -425,20 +425,13 @@ case "${CONFIGURE_TARGET:-$(uname -m)}" in
   *) echo "gcc payload: cannot map build arch '${CONFIGURE_TARGET:-$(uname -m)}' to a deb set" >&2; exit 1 ;;
 esac
 for p in \
-  "gcc-14-$dt" "g++-14-$dt" "cpp-14-$dt" "binutils-$dt" \
-  "gcc-14_$a" "gcc-14-base_$a" "libstdc++-14-dev_$a" "libstdc++6_$a" \
-  "libgcc-14-dev_$a" "binutils_$a" "binutils-common_$a" "libbinutils_$a" \
+  "gcc-15-$dt" "g++-15-$dt" "cpp-15-$dt" "binutils-$dt" \
+  "gcc-15_$a" "gcc-15-base_$a" "libstdc++-15-dev_$a" "libstdc++6_$a" \
+  "libgcc-15-dev_$a" "binutils_$a" "binutils-common_$a" "libbinutils_$a" \
   "libsframe1_$a" "libctf0_$a" "libctf-nobfd0_$a" "libjansson4_$a" \
   "libgmp10_$a" "libmpfr6_$a" "libmpc3_$a" "libisl23_$a" \
   "zlib1g_$a" "libzstd1_$a"
 do dpkg-deb -x "$SRC/$p" "$STAGE" || exit 1; done]],
-            -- The cc consumer contract: plain Makefiles hardcode `cc`
-            -- (tree, dos2unix, xxd — every chart without autotools'
-            -- gcc-then-CC dance). Debian ships cc as an alternative
-            -- symlink the deb set does not carry; stage it ourselves.
-            -- Live 2026-10-03 farm window: every plain-Makefile chart
-            -- died at 'make: cc: No such file or directory'.
-            "mkdir -p $STAGE/usr/bin && ln -sf gcc \"$STAGE/usr/bin/cc\"",
             -- Ownership lock (#174): kernel uapi headers belong to the
             -- pool linux-headers payload (transitively in every prefix
             -- carrying gcc, via glibc). No deb in this set may restage
@@ -477,8 +470,8 @@ for p in \$LIBRARY_PATH; do [ -n "\$p" ] && l="\$l -L\$p"; done
 for p in \$CPATH; do [ -n "\$p" ] && c="\$c -idirafter \$p"; done
 IFS=\$ifs
 case "\${0##*/}" in
-  c++|cxx|g++) exec "\$d/$t-g++-14" \$l \$c "\$@" ;;
-  *) exec "\$d/$t-gcc-14" \$l \$c "\$@" ;;
+  c++|cxx|g++) exec "\$d/$t-g++-15" \$l \$c "\$@" ;;
+  *) exec "\$d/$t-gcc-15" \$l \$c "\$@" ;;
 esac
 EOF
 chmod +x "$STAGE/usr/bin/cc" && cp "$STAGE/usr/bin/cc" "$STAGE/usr/bin/c++"]],
@@ -510,7 +503,7 @@ done]],
             -- The driver must find cc1 (usr/libexec) relative to itself
             -- and as/ld on PATH; assert the spine exists so a failed
             -- extraction cannot silently produce an empty toolchain.
-            'test -x "$STAGE/usr/bin/$t-gcc-14"',
+            'test -x "$STAGE/usr/bin/$t-gcc-15"',
             'test -x "$STAGE/usr/bin/cc"',
             'test -x "$STAGE/usr/bin/c++"',
             -- Driver existence alone leaves the 77964ae bug class open:
@@ -518,13 +511,13 @@ done]],
             -- target from the shim text itself and assert each lands
             -- executable — the shim↔payload contract, asserted.
             [[for x in $(sed -n "s/.*exec \"\$d\/\([^\"]*\)\".*/\1/p" "$STAGE/usr/bin/cc"); do test -x "$STAGE/usr/bin/$x" || exit 1; done]],
-            'test -x "$STAGE/usr/libexec/gcc/$t/14/cc1"',
+            'test -x "$STAGE/usr/libexec/gcc/$t/15/cc1"',
             -- The C++ half of the payload must land too (issue #164
             -- follow-up): cc1plus beside cc1, the g++ driver the c++
             -- shim execs, and the runtime libstdc++.so.6 in the
             -- multiarch dir the generation's loader-lib key exposes.
-            'test -x "$STAGE/usr/libexec/gcc/$t/14/cc1plus"',
-            'test -x "$STAGE/usr/bin/$t-g++-14"',
+            'test -x "$STAGE/usr/libexec/gcc/$t/15/cc1plus"',
+            'test -x "$STAGE/usr/bin/$t-g++-15"',
             'test -e "$STAGE/usr/lib/$t/libstdc++.so.6"',
             'test -e "$STAGE/usr/bin/as"',
             'test -e "$STAGE/usr/bin/ld"',
