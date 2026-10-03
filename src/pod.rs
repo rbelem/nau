@@ -6639,7 +6639,7 @@ fn pod_build_prefix(
         let snap = ensure_pod_dep_payload(store, &member.name, &dep_meta, building, false)?;
         payloads.push(crate::build_prefix::Payload {
             pkg: member.name,
-            snap,
+            source: crate::build_prefix::PayloadSource::Snap(snap),
         });
     }
     let merged = crate::build_prefix::materialize_merged_prefix(&payloads)?;

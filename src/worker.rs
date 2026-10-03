@@ -765,7 +765,7 @@ fn materialize_prefix(
         .iter()
         .map(|(pkg, snap)| crate::build_prefix::Payload {
             pkg: pkg.clone(),
-            snap: snap.clone(),
+            source: crate::build_prefix::PayloadSource::Snap(snap.clone()),
         })
         .collect();
     Ok(Some(crate::build_prefix::materialize_merged_prefix(&deps)?))

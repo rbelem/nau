@@ -13,6 +13,7 @@ pub mod commands;
 pub mod coordinator;
 pub mod doctor;
 pub mod farm_dispatch;
+pub mod farm_prefix;
 pub mod leak_scan;
 pub mod pkg_manifest;
 pub mod plugins;
