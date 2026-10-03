@@ -584,8 +584,10 @@ fn candidate_list(typed: &[&GptEntry], indices: &[usize]) -> String {
 ///
 /// Refusals, each by name: no typed partition at all; none carrying the
 /// derived identity (naming every candidate — the mis-selection
-/// diagnostic); a DUPLICATED identity (a copied or rewritten table makes
-/// by-partuuid resolution ambiguous — refuse, never pick); an explicit
+/// diagnostic); a DUPLICATED identity without an explicit slot demand (a
+/// copied or rewritten table makes by-partuuid resolution ambiguous —
+/// refuse, never pick; WITH a demand it is the #48 factory twin table
+/// and the position disambiguates); an explicit
 /// `--slot a|b` demand the identity does not sit at (naming where it
 /// actually sits).
 fn select_by_identity<'t>(
@@ -608,7 +610,7 @@ fn select_by_identity<'t>(
         .filter(|(_, e)| e.partuuid == expected_partuuid)
         .map(|(i, _)| i)
         .collect();
-    if matching.len() > 1 {
+    if matching.len() > 1 && selector.position().is_none() {
         return Err(miette::miette!(
             "duplicate {kind} PARTUUID {expected_partuuid} on partitions {} — \
              refusing (a PARTUUID must be unique: the UKI resolves the root by \
@@ -617,6 +619,10 @@ fn select_by_identity<'t>(
             candidate_list(typed, &matching)
         ));
     }
+    // A duplicate WITH an explicit slot demand is the #48 factory table:
+    // slot B is the byte-identical rollback twin of slot A (same derived
+    // GUIDs until sysupdate rewrites the slot it installs into), so the
+    // ambiguity resolves by the demanded position.
     match selector.position() {
         None => matching
             .first()
@@ -2374,6 +2380,42 @@ mod tests {
                 && err.contains("#3"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn factory_twin_slots_resolve_by_the_demanded_position() {
+        // The #48 factory table: slot B is the byte-identical rollback
+        // twin — BOTH root and BOTH hash partitions carry the derived
+        // GUIDs. Without a demand this is the copied-table refusal; WITH
+        // an explicit demand the position disambiguates and slot B
+        // verifies (the build's release self-check runs exactly this).
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let device = device_file_sized(dir.path(), 16 * 1024 * 1024);
+        let (manifest_path, key_anchor) = signed_manifest_and_anchor(dir.path());
+        let (data_up, hash_up) = expected_guids();
+        let body = format!(
+            r#"{{"partitiontable": {{"label": "gpt", "sectorsize": 512, "partitions": [
+                {{"start": 2048, "size": 2048, "type": "C12A7328-F81F-11D2-BA4B-00A0C93EC93B", "uuid": "AABBCCDD-0011-2233-4455-667788990011", "name": "ESP"}},
+                {{"start": 4096, "size": 2048, "type": "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709", "uuid": "{data_up}", "name": "{}"}},
+                {{"start": 6144, "size": 256, "type": "2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5", "uuid": "{hash_up}", "name": "{}"}},
+                {{"start": 8192, "size": 2048, "type": "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709", "uuid": "{data_up}", "name": "{}"}},
+                {{"start": 12288, "size": 256, "type": "2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5", "uuid": "{hash_up}", "name": "{}"}}
+            ]}}}}"#,
+            slot_partlabel("nau-demo", "1.0.0", 0),
+            hash_partlabel("nau-demo", "1.0.0", 0),
+            slot_partlabel("nau-demo", "1.0.0", 1),
+            hash_partlabel("nau-demo", "1.0.0", 1),
+        );
+        let runner = FakeTools::new(body, 0);
+        let outcome = verify_device_with(
+            &runner,
+            &args_with_slot(&device, &manifest_path, Some(&key_anchor), SlotSelector::B),
+            Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
+        )
+        .unwrap_or_else(|e| panic!("factory twins + explicit demand must resolve: {e}"));
+        assert_eq!(outcome.slot, "b", "slot B resolved by position");
     }
 
     #[test]
