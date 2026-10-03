@@ -4038,6 +4038,9 @@ fn reconcile_pod_scoped(
     // the recipes mid-reconcile (`pod add` writes the declaration
     // BEFORE reconciling).
     let _eval_memo = eval_memo::install();
+    // Per-sync rate-limit budget (council lever 1): one reconcile = one
+    // shared retry-sleep budget across every fetch through the seam.
+    crate::dep_fetch::reset_net_retry_budget()?;
     // Phase timing for perf work: `NAU_SYNC_TRACE=1` prints one wall-time
     // line per reconcile phase to stderr.
     fn trace(name: &str, since: std::time::Instant) {

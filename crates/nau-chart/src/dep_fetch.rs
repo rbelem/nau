@@ -2300,12 +2300,174 @@ fn curl_tool() -> miette::Result<PathBuf> {
 }
 
 /// The User-Agent every registry-facing GET sends (crates.io 403s
-/// requests without one).
+/// requests without one). The URL is contact info: GitHub throttles by
+/// identity and grants exceptions to identified agents (council lever 4
+/// rider on the rate-limit retry).
 const FETCH_USER_AGENT: &str = concat!(
     "nau/",
     env!("CARGO_PKG_VERSION"),
-    " (dependency-closure fetch)"
+    " (+https://github.com/rbelem/shuttle)"
 );
+
+// ── Rate-limit resilience (council lever 1): retry with backoff at
+// the one curl seam ──
+
+/// Default per-sync shared sleep budget, in milliseconds: retries may
+/// spend at most this much wall-clock sleep across ALL fetches of one
+/// sync (`NAU_NET_RETRY_BUDGET` overrides, in seconds).
+const NET_RETRY_BUDGET_DEFAULT_MS: u64 = 150_000;
+/// Default cap on any single honored delay, in milliseconds: a
+/// `Retry-After` over this fails loud instead of clamping
+/// (`NAU_NET_RETRY_CAP_SECS` overrides, in seconds).
+const NET_RETRY_CAP_DEFAULT_MS: u64 = 120_000;
+/// First exponential-backoff delay; doubles per retry (2s → 4s → 8s,
+/// ±50% jitter). No env override — tests inject 0 directly.
+const NET_RETRY_BACKOFF_BASE_MS: u64 = 2_000;
+/// Attempts per request: one initial call plus two retries.
+const NET_RETRY_MAX_ATTEMPTS: u32 = 3;
+
+/// The per-sync shared retry sleep budget (module state): every retry
+/// delay through the seam is reserved here first, so N fetches cannot
+/// multiply per-fetch budgets into an unbounded sync hang. Reset at
+/// sync entry ([`reset_net_retry_budget`]); serial syncs make the
+/// single counter sound (already GitHub's "avoid concurrent requests"
+/// guidance).
+static NET_RETRY_BUDGET_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(NET_RETRY_BUDGET_DEFAULT_MS);
+
+/// Retry knobs for one request through the seam. [`RetryKnobs::from_env`]
+/// is the production shape (kill switch + cap override, env-only per the
+/// provider-cred precedent); tests build them directly with a zero
+/// backoff base and a no-op sleep.
+struct RetryKnobs {
+    /// Master kill switch: false = today's single-attempt behavior
+    /// exactly (`NAU_NET_RETRY=0`).
+    enabled: bool,
+    /// Largest honored `Retry-After`, in milliseconds.
+    cap_ms: u64,
+    /// First exponential-backoff delay, in milliseconds.
+    backoff_base_ms: u64,
+}
+
+impl RetryKnobs {
+    /// Production knobs, read at the seam: `NAU_NET_RETRY=0` disables
+    /// retrying entirely; `NAU_NET_RETRY_CAP_SECS` overrides the 120s
+    /// per-delay cap. An unparsable override fails loud naming the
+    /// variable — never a silently ignored misconfiguration.
+    fn from_env() -> miette::Result<Self> {
+        let enabled = std::env::var("NAU_NET_RETRY")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let cap_ms = env_secs_ms("NAU_NET_RETRY_CAP_SECS")?.unwrap_or(NET_RETRY_CAP_DEFAULT_MS);
+        Ok(Self {
+            enabled,
+            cap_ms,
+            backoff_base_ms: NET_RETRY_BACKOFF_BASE_MS,
+        })
+    }
+}
+
+/// One `*_SECS` env override, in milliseconds: absent → `None`;
+/// unparsable → fail loud naming the variable and value.
+fn env_secs_ms(var: &str) -> miette::Result<Option<u64>> {
+    match std::env::var(var) {
+        Err(_) => Ok(None),
+        Ok(raw) => {
+            let secs: u64 = raw
+                .trim()
+                .parse()
+                .map_err(|e| miette::miette!("{var}={raw}: not a seconds value: {e}"))?;
+            Ok(Some(secs.saturating_mul(1_000)))
+        }
+    }
+}
+
+/// Reset the shared per-sync retry sleep budget — the sync entry's one
+/// move (one reconcile = one budget across every fetch through the
+/// seam). `NAU_NET_RETRY_BUDGET` overrides the default seconds;
+/// unparsable fails loud naming the variable.
+pub fn reset_net_retry_budget() -> miette::Result<()> {
+    let ms = env_secs_ms("NAU_NET_RETRY_BUDGET")?.unwrap_or(NET_RETRY_BUDGET_DEFAULT_MS);
+    NET_RETRY_BUDGET_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// The retry gate: ONLY a 429, plus a 403 that carries `Retry-After`
+/// (GitHub surfaces secondary limits as 403). A bare 403 is a hard
+/// error — permission failures are never retried. 304/200/5xx and
+/// transport deaths keep today's single-shot behavior; `enabled=false`
+/// (the `NAU_NET_RETRY=0` kill switch) is today's behavior exactly.
+fn should_retry(enabled: bool, code: u16, has_retry_after: bool) -> bool {
+    enabled && (code == 429 || (code == 403 && has_retry_after))
+}
+
+/// ±50% jitter without a rand dependency: the clock's sub-second
+/// nanos are plenty random for spacing retries (never crypto).
+fn jittered(ms: u64) -> u64 {
+    let half = ms / 2;
+    let noise = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    ms - half + (noise % (half + 1))
+}
+
+/// The delay before the next attempt: a present `Retry-After` (seconds
+/// form) wins verbatim — over the cap it fails loud NAMING the value,
+/// per the hang-risk ruling (never clamp-and-retry-early: early retries
+/// are the ban-magnet); absent, a jittered exponential backoff.
+fn plan_delay_ms(
+    knobs: &RetryKnobs,
+    url: &str,
+    retry_after_secs: Option<u64>,
+    attempt: u32,
+) -> miette::Result<u64> {
+    if let Some(secs) = retry_after_secs {
+        let ms = secs.saturating_mul(1_000);
+        if ms > knobs.cap_ms {
+            miette::bail!(
+                "failed to download {url}: Retry-After: {secs} exceeds the {}s retry cap \
+                 (refusing to retry early)",
+                knobs.cap_ms / 1_000
+            );
+        }
+        return Ok(ms);
+    }
+    Ok(jittered(knobs.backoff_base_ms << (attempt - 1)))
+}
+
+/// Reserve `delay_ms` from the shared per-sync sleep budget
+/// (compare-exchange so no two fetches can oversubscribe it), then
+/// sleep the reserved amount. An insufficient budget fails loud — the
+/// sync ends instead of hammering through the throttle.
+fn reserve_sleep_ms(
+    url: &str,
+    sleep: &dyn Fn(std::time::Duration),
+    delay_ms: u64,
+) -> miette::Result<()> {
+    use std::sync::atomic::Ordering;
+    let mut current = NET_RETRY_BUDGET_MS.load(Ordering::Relaxed);
+    loop {
+        if current < delay_ms {
+            miette::bail!(
+                "failed to download {url}: shared retry sleep budget exhausted \
+                 ({current} ms left, need {delay_ms} ms this sync)"
+            );
+        }
+        match NET_RETRY_BUDGET_MS.compare_exchange_weak(
+            current,
+            current - delay_ms,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                sleep(std::time::Duration::from_millis(delay_ms));
+                return Ok(());
+            }
+            Err(actual) => current = actual,
+        }
+    }
+}
 
 /// The result of one GET through the curl seam: the final HTTP status
 /// code (after redirects) plus the entity tag the final hop returned,
@@ -2326,7 +2488,38 @@ pub struct CdnFetch {
 /// the LAST HTTP block (github.com 302s to codeload.github.com, which
 /// serves the real ETag). Curl exit nonzero or a `000` code (no HTTP
 /// response at all) bails loud.
+///
+/// Rate-limit contract (council lever 1): a 429 — or a 403 carrying
+/// `Retry-After` — is retried here with an honored-header-seconds-first,
+/// jittered-exponential-else delay, at most 2 retries (3 attempts) per
+/// request; every sleep draws from the shared per-sync budget and any
+/// delay over the cap fails loud. Exhaustion fails loud as
+/// `failed to download {url} (HTTP <code>, after <n> attempts)` — a 429
+/// NEVER becomes a hold or a drift verdict: the sync fails, no pin
+/// moves, and the next sync re-probes. 200/304/5xx and transport deaths
+/// are single-shot exactly as before; `NAU_NET_RETRY=0` restores
+/// today's behavior.
 fn http_get_conditional(
+    url: &str,
+    dest_tmp: &Path,
+    if_none_match: Option<&str>,
+) -> miette::Result<CdnFetch> {
+    let knobs = RetryKnobs::from_env()?;
+    http_get_conditional_with(&knobs, &real_sleep, url, dest_tmp, if_none_match)
+}
+
+/// Wall-clock sleep — the production sleeper, injected into
+/// [`http_get_conditional_with`] so tests run with a no-op.
+fn real_sleep(d: std::time::Duration) {
+    std::thread::sleep(d);
+}
+
+/// [`http_get_conditional`] with the retry policy injected: `knobs`
+/// carry the kill switch and the per-delay cap, `sleep` stands in for
+/// wall-clock (tests pass a no-op plus a zero backoff base).
+fn http_get_conditional_with(
+    knobs: &RetryKnobs,
+    sleep: &dyn Fn(std::time::Duration),
     url: &str,
     dest_tmp: &Path,
     if_none_match: Option<&str>,
@@ -2340,9 +2533,52 @@ fn http_get_conditional(
             .unwrap_or("body"),
         std::process::id()
     ));
-    let result = run_curl_get(&curl, url, dest_tmp, &header_file, if_none_match);
+    let result = retry_curl_get(
+        knobs,
+        sleep,
+        &curl,
+        url,
+        dest_tmp,
+        &header_file,
+        if_none_match,
+    );
     let _ = std::fs::remove_file(&header_file);
     result
+}
+
+/// The retry loop behind [`http_get_conditional_with`]: drive
+/// [`run_curl_get`] through the rate-limit policy ([`should_retry`],
+/// [`plan_delay_ms`], [`reserve_sleep_ms`]); retries exhaust into a
+/// loud terminal failure naming the attempts.
+fn retry_curl_get(
+    knobs: &RetryKnobs,
+    sleep: &dyn Fn(std::time::Duration),
+    curl: &Path,
+    url: &str,
+    dest_tmp: &Path,
+    header_file: &Path,
+    if_none_match: Option<&str>,
+) -> miette::Result<CdnFetch> {
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let fetch = run_curl_get(curl, url, dest_tmp, header_file, if_none_match)?;
+        // The seconds form only: an HTTP-date (or garbage) parses as
+        // None and falls back to the exponential path.
+        let retry_after = parse_last_header(header_file, "retry-after")
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        if !should_retry(knobs.enabled, fetch.code, retry_after.is_some()) {
+            return Ok(fetch);
+        }
+        if attempt >= NET_RETRY_MAX_ATTEMPTS {
+            miette::bail!(
+                "failed to download {url} (HTTP {}, after {attempt} attempts)",
+                fetch.code
+            );
+        }
+        let delay_ms = plan_delay_ms(knobs, url, retry_after, attempt)?;
+        reserve_sleep_ms(url, sleep, delay_ms)?;
+    }
 }
 
 /// The curl invocation of [`http_get_conditional`], split so the
@@ -2408,17 +2644,27 @@ fn parse_http_code(stdout: &[u8], url: &str) -> miette::Result<u16> {
 /// yields `None` — the fetch succeeds, only the free etag capture is
 /// lost.
 fn parse_last_etag(path: &Path) -> Option<String> {
+    parse_last_header(path, "etag")
+}
+
+/// The LAST value of header `name` (case-insensitive, colon appended)
+/// in a curl `-D` header dump: each new status line resets the capture
+/// so the final hop wins after `-L` hops. A missing or unreadable dump
+/// yields `None`. Core of [`parse_last_etag`] and the retry policy's
+/// `Retry-After` read.
+fn parse_last_header(path: &Path, name: &str) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     let text = String::from_utf8_lossy(&bytes);
-    let mut etag = None;
+    let prefix = format!("{name}:");
+    let mut value = None;
     for line in text.lines() {
         if line.starts_with("HTTP/") {
-            etag = None;
-        } else if line.len() > 5 && line[..5].eq_ignore_ascii_case("etag:") {
-            etag = Some(line[5..].trim().to_string());
+            value = None;
+        } else if line.len() > prefix.len() && line[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+            value = Some(line[prefix.len()..].trim().to_string());
         }
     }
-    etag
+    value
 }
 
 /// curl download (the codebase's one network mechanism): an unconditional
@@ -3937,6 +4183,322 @@ require github.com/only/one v0.1.0
             "bail must keep today's wording plus the status: {msg}"
         );
         assert!(!work.path().join("src").exists());
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // ── Retry on 429 (council lever 1: rate-limit resilience) ──
+
+    /// Serializes mutations of the module-global retry budget and the
+    /// `NAU_NET_RETRY` env pin — both process globals, the same window
+    /// pattern as the env lock in src/sign.rs.
+    static RETRY_GLOBAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Knobs for retry tests: retrying on, generous cap, zero backoff
+    /// base so the no-op sleep never stalls the suite.
+    fn retry_test_knobs(cap_ms: u64) -> RetryKnobs {
+        RetryKnobs {
+            enabled: true,
+            cap_ms,
+            backoff_base_ms: 0,
+        }
+    }
+
+    /// The test sleeper: policy timing runs, wall-clock does not.
+    fn noop_sleep(_: std::time::Duration) {}
+
+    /// Council scenario (a): 429 + `Retry-After: 0` then 200 — one
+    /// retry, and the etag capture of the final hop stays intact.
+    #[test]
+    fn http_get_conditional_retries_429_with_retry_after_zero_then_succeeds() {
+        if !curl_available() {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let body = b"payload-bytes".to_vec();
+        let hits_server = hits.clone();
+        let (url, shutdown) = spawn_http_server(move |_req| {
+            let n = hits_server.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                http_response(
+                    "HTTP/1.1 429 Too Many Requests",
+                    &[("Retry-After", "0")],
+                    b"",
+                )
+            } else {
+                http_response("HTTP/1.1 200 OK", &[("ETag", "\"v2\"")], &body)
+            }
+        });
+        let work = tempfile::tempdir().unwrap();
+        let tmp = work.path().join("out.bin");
+        let fetch =
+            http_get_conditional_with(&retry_test_knobs(120_000), &noop_sleep, &url, &tmp, None)
+                .unwrap();
+        assert_eq!(fetch.code, 200);
+        assert_eq!(
+            fetch.etag.as_deref(),
+            Some("\"v2\""),
+            "etag capture must survive the retry"
+        );
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"payload-bytes");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "429 + Retry-After: 0 must retry exactly once before the 200"
+        );
+        shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Council scenario (b): bare 429s ride the jittered-backoff path
+    /// (base 0ms injected) and succeed on the third attempt.
+    #[test]
+    fn http_get_conditional_retries_bare_429_through_the_backoff_path() {
+        if !curl_available() {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_server = hits.clone();
+        let (url, shutdown) = spawn_http_server(move |_req| {
+            let n = hits_server.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                http_response("HTTP/1.1 429 Too Many Requests", &[], b"")
+            } else {
+                http_response("HTTP/1.1 200 OK", &[("ETag", "\"v3\"")], b"third-try")
+            }
+        });
+        let work = tempfile::tempdir().unwrap();
+        let tmp = work.path().join("out.bin");
+        let fetch =
+            http_get_conditional_with(&retry_test_knobs(120_000), &noop_sleep, &url, &tmp, None)
+                .unwrap();
+        assert_eq!(fetch.code, 200);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            3,
+            "two bare 429s must exhaust both retries before the 200"
+        );
+        shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Council scenario (c): `Retry-After: 9999` over the 120s cap
+    /// fails loud naming the value, and never fires a second request —
+    /// clamp-and-retry-early is the ban-magnet.
+    #[test]
+    fn http_get_conditional_fails_loud_when_retry_after_exceeds_the_cap() {
+        if !curl_available() {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_server = hits.clone();
+        let (url, shutdown) = spawn_http_server(move |_req| {
+            hits_server.fetch_add(1, Ordering::SeqCst);
+            http_response(
+                "HTTP/1.1 429 Too Many Requests",
+                &[("Retry-After", "9999")],
+                b"",
+            )
+        });
+        let work = tempfile::tempdir().unwrap();
+        let tmp = work.path().join("out.bin");
+        let err =
+            http_get_conditional_with(&retry_test_knobs(120_000), &noop_sleep, &url, &tmp, None)
+                .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("failed to download") && msg.contains("9999"),
+            "over-cap Retry-After must fail loud naming the value: {msg}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "an over-cap Retry-After must never fire a second request"
+        );
+        shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Council scenario (d): the shared per-sync sleep budget (amended
+    /// over the doc's count cap — N fetches must not multiply budgets)
+    /// fails loud immediately when the next honored delay cannot fit.
+    #[test]
+    fn http_get_conditional_fails_loud_when_the_shared_sleep_budget_is_spent() {
+        if !curl_available() {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let _window = RETRY_GLOBAL_LOCK.lock().unwrap();
+        NET_RETRY_BUDGET_MS.store(100, std::sync::atomic::Ordering::Relaxed);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_server = hits.clone();
+        let (url, shutdown) = spawn_http_server(move |_req| {
+            hits_server.fetch_add(1, Ordering::SeqCst);
+            http_response(
+                "HTTP/1.1 429 Too Many Requests",
+                &[("Retry-After", "60")],
+                b"",
+            )
+        });
+        let work = tempfile::tempdir().unwrap();
+        let tmp = work.path().join("out.bin");
+        let err =
+            http_get_conditional_with(&retry_test_knobs(120_000), &noop_sleep, &url, &tmp, None)
+                .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("failed to download") && msg.contains("budget"),
+            "a spent shared budget must fail loud: {msg}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "an unservable delay must fail on first sight of the 429"
+        );
+        NET_RETRY_BUDGET_MS.store(
+            NET_RETRY_BUDGET_DEFAULT_MS,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Council scenario (e): after the last attempt the message keeps
+    /// today's shape and names the attempts — a 429 stays a loud sync
+    /// failure, never a hold or a drift verdict.
+    #[test]
+    fn http_get_conditional_names_attempts_when_retries_are_exhausted() {
+        if !curl_available() {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_server = hits.clone();
+        let (url, shutdown) = spawn_http_server(move |_req| {
+            hits_server.fetch_add(1, Ordering::SeqCst);
+            http_response("HTTP/1.1 429 Too Many Requests", &[], b"")
+        });
+        let work = tempfile::tempdir().unwrap();
+        let tmp = work.path().join("out.bin");
+        let err =
+            http_get_conditional_with(&retry_test_knobs(120_000), &noop_sleep, &url, &tmp, None)
+                .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("failed to download")
+                && msg.contains("(HTTP 429")
+                && msg.contains("after 3 attempts"),
+            "exhaustion must keep the download-failure shape plus attempts: {msg}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            3,
+            "exactly the 3 attempts, no more"
+        );
+        shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Council scenario (f): a bare 403 is a hard error — permission
+    /// failures are never retried, today's single-shot behavior.
+    #[test]
+    fn http_get_conditional_never_retries_a_bare_403() {
+        if !curl_available() {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_server = hits.clone();
+        let (url, shutdown) = spawn_http_server(move |_req| {
+            hits_server.fetch_add(1, Ordering::SeqCst);
+            http_response("HTTP/1.1 403 Forbidden", &[], b"")
+        });
+        let work = tempfile::tempdir().unwrap();
+        let tmp = work.path().join("out.bin");
+        let fetch =
+            http_get_conditional_with(&retry_test_knobs(120_000), &noop_sleep, &url, &tmp, None)
+                .unwrap();
+        assert_eq!(fetch.code, 403);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a bare 403 must never retry"
+        );
+        shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// The `NAU_NET_RETRY=0` kill switch is today's behavior exactly:
+    /// one request, the caller's `(HTTP 429)` shape, no `after` clause.
+    #[test]
+    fn http_get_conditional_kill_switch_keeps_todays_single_attempt_behavior() {
+        if !curl_available() {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let _window = RETRY_GLOBAL_LOCK.lock().unwrap();
+        std::env::set_var("NAU_NET_RETRY", "0");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_server = hits.clone();
+        let (url, shutdown) = spawn_http_server(move |_req| {
+            hits_server.fetch_add(1, Ordering::SeqCst);
+            http_response("HTTP/1.1 429 Too Many Requests", &[], b"")
+        });
+        let work = tempfile::tempdir().unwrap();
+        let tmp = work.path().join("out.bin");
+        let fetch = http_get_conditional(&url, &tmp, None).unwrap();
+        assert_eq!(fetch.code, 429);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the kill switch means one request"
+        );
+        let dest = work.path().join("via-to-file.bin");
+        let err = http_get_to_file(&url, &dest).unwrap_err();
+        let msg = format!("{err}");
+        std::env::remove_var("NAU_NET_RETRY");
+        assert!(
+            msg.contains("(HTTP 429)") && !msg.contains("after"),
+            "the kill switch keeps today's caller-facing shape: {msg}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "one request per fetch, still"
+        );
+        shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Council lever 4 rider: the UA carries contact info so GitHub can
+    /// identify (and except) the agent.
+    #[test]
+    fn http_get_conditional_sends_the_contact_user_agent() {
+        if !curl_available() {
+            return;
+        }
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let seen_server = seen.clone();
+        let (url, shutdown) = spawn_http_server(move |req| {
+            *seen_server.lock().unwrap() = Some(String::from_utf8_lossy(req).into_owned());
+            http_response("HTTP/1.1 200 OK", &[], b"")
+        });
+        let work = tempfile::tempdir().unwrap();
+        let tmp = work.path().join("out.bin");
+        let fetch = http_get_conditional(&url, &tmp, None).unwrap();
+        assert_eq!(fetch.code, 200);
+        let head = seen.lock().unwrap().clone().unwrap();
+        let ua = head
+            .lines()
+            .find(|l| l.len() > 12 && l[..11].eq_ignore_ascii_case("user-agent:"))
+            .unwrap_or_else(|| panic!("request must carry a User-Agent: {head}"));
+        assert!(
+            ua.contains("nau/") && ua.contains("(+https://github.com/rbelem/shuttle)"),
+            "the UA must carry the contact info: {ua}"
+        );
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
