@@ -731,6 +731,21 @@ gated_test!(refresh_keeps_unnamed_member_whose_source_server_is_down, {
         "no source fetch may run for the unnamed member: {stderr}"
     );
 
+    // #344 loud silence: the refresh consumed libmember's STALE cached
+    // payload — its recipe moved before the refresh (the dead-port
+    // re-point), so its recorded content key no longer matches, yet the
+    // payload is still reused (#177: no churn). The silence must be
+    // loud: the report names the member and the rebuild remedy.
+    assert!(
+        stderr.contains("dep payload libmember 1.0 is stale"),
+        "the stale build-dep payload must be reported, not consumed \
+         silently: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("pod refresh libmember"),
+        "the report must name the `pod refresh` remedy: {stderr}"
+    );
+
     // The named member rebuilt (byte-identical here — the churn guard
     // keeps the store content); the unnamed member's installed content
     // survived untouched.
