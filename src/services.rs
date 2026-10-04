@@ -326,8 +326,9 @@ struct ResolveCtx<'a> {
     pod: &'a str,
     /// `$HOME` (the `%h` expansion; the pod.rs fallback applies).
     home: &'a str,
-    /// The absolute extensions dir through `current` (the one built-in
-    /// `${extensions}` reference).
+    /// The absolute extensions dir through `current/../` (`current`
+    /// points at the farm, while extensions live beside it in the
+    /// generation dir, the built-in `${extensions}` reference).
     extensions: String,
     /// The generation's recorded env (ADR-0030), composed into the unit.
     gen_env: BTreeMap<String, String>,
@@ -1961,7 +1962,7 @@ mod tests {
         assert!(text.contains("Description=nau pod 'pilot' service 'valkey'\n"));
         assert!(text.contains("Type=simple\n"));
         assert!(text.contains(&format!(
-            "ExecStart='{current}/valkey' '--port' '7002' '--dir' '{}/data/pilot' '--loadmodule' '{current}/extensions/valkey-search.so'\n",
+            "ExecStart='{current}/valkey' '--port' '7002' '--dir' '{}/data/pilot' '--loadmodule' '{current}/../extensions/valkey-search.so'\n",
             home()
         )));
         assert!(text.contains("Environment=\"QUIET=yes\"\n"));
