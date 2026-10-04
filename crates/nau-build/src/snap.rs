@@ -3581,6 +3581,21 @@ fn default_curl_ca_bundle(
     Some(("CURL_CA_BUNDLE", SANDBOX_CA_BUNDLE.to_string()))
 }
 
+/// The default `MAKEFLAGS` for a build command: `-j` at the host's
+/// available parallelism (cgroup-aware via `available_parallelism`, so
+/// pod quotas apply). Sandbox builds ran serial — autotools make never
+/// saw a `-j`: one `cc1` pegged a single core while the worker idled,
+/// and glibc took ~1 h single-threaded on an 8-core EPYC (the
+/// wl-clipboard drain, 2026-10-04). Recipes override via `extra_env`
+/// (the #138 ambient-trust rule): an ambient `MAKEFLAGS` always wins.
+fn default_make_flags(ambient: Option<&str>) -> Option<(&'static str, String)> {
+    if ambient.is_some() {
+        return None;
+    }
+    let jobs = std::thread::available_parallelism().map_or(1, |n| n.get());
+    Some(("MAKEFLAGS", format!("-j{jobs}")))
+}
+
 /// The C-toolchain env the merged build prefix contributes (issue #44):
 /// `CC`/`CXX` pointed at the pool toolchain drivers (bare names — the
 /// prefix's `usr/bin` leads the sandbox PATH in both the bwrap and
@@ -4296,6 +4311,14 @@ fn run_bwrapped(
     if let Some((key, val)) =
         default_curl_ca_bundle(ambient_ca, Path::new(SANDBOX_CA_BUNDLE).exists())
     {
+        cmd_proc.env(key, val);
+    }
+    if let Some((key, val)) = default_make_flags(
+        extra_env
+            .iter()
+            .find(|(k, _)| k == "MAKEFLAGS")
+            .map(|(_, v)| v.as_str()),
+    ) {
         cmd_proc.env(key, val);
     }
     if deps_dir.is_some() {
@@ -11373,6 +11396,22 @@ fi
     fn default_curl_ca_bundle_never_clobbers_an_ambient_value() {
         // The #138 ambient-trust rule: the caller's own trust choice wins.
         assert!(default_curl_ca_bundle(Some("/my/own/bundle.pem"), true).is_none());
+    }
+
+    #[test]
+    fn default_make_flags_issues_parallel_jobs() {
+        let (key, val) = default_make_flags(None).expect("default issued");
+        assert_eq!(key, "MAKEFLAGS");
+        let jobs = std::thread::available_parallelism().unwrap().get();
+        assert_eq!(val, format!("-j{jobs}"));
+        assert!(jobs >= 1);
+    }
+
+    #[test]
+    fn default_make_flags_never_clobbers_an_ambient_value() {
+        // The #138 ambient-trust rule: a recipe's own MAKEFLAGS wins —
+        // including a deliberate serial build.
+        assert!(default_make_flags(Some("-j1")).is_none());
     }
 
     #[test]
