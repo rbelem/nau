@@ -514,9 +514,8 @@ impl Drain {
         release_cfg: ReleaseConfig,
         once: bool,
     ) -> miette::Result<Self> {
-        let tree = crate::farm_prefix::S3Tree::new(std::sync::Arc::new(
-            nau_ship::s3::S3Client::new(release_cfg.s3_target()?)?,
-        ));
+        let tree =
+            crate::farm_prefix::S3Tree::new(nau_ship::s3::S3Client::new(release_cfg.s3_target()?)?);
         Ok(Drain {
             queue,
             recipes_root,
