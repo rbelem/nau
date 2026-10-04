@@ -33,5 +33,10 @@ return {
             url = "https://ftp.gnu.org/gnu/coreutils/coreutils-9.11.tar.xz",
         },
         build = "./configure --prefix=/usr --without-selinux && make && make install DESTDIR=$STAGE",
+        -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22),
+        -- the tree/tmux/htop/tig precedent: the nix gcc wrapper bakes
+        -- RUNPATH=/nau-build-prefix/usr/lib64 into the binaries, and
+        -- that path does not exist at runtime.
+        leaks_ok = { "/nau-build-prefix/usr/lib64" },
     },
 }
