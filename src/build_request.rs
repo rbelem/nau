@@ -419,7 +419,7 @@ impl BuildStep for PoolBuild {
         &self,
         request: &BuildRequest,
         meta: &nau_core::snap_types::SnapMeta,
-        _recipe: &Path,
+        recipe: &Path,
         output_dir: &Path,
     ) -> miette::Result<PathBuf> {
         // The build phase needs its own scratch (the dep-build shape):
@@ -443,6 +443,17 @@ impl BuildStep for PoolBuild {
             Some(p) => crate::leak_scan::listings_for_build(meta, p)?,
             None => crate::leak_scan::PayloadListings::default(),
         };
+        // The interpreted-deps closure (#338-b): tree-first via the pin
+        // doc, resolved + published by this build on a first miss. The
+        // resolver is the pod's own path — the recipe's shipped input
+        // locks pin it, so both sides pack identical bytes.
+        let deps_dir =
+            crate::farm_prefix::ensure_farm_deps_closure(&self.tree, &cache, meta, || {
+                let deps = meta.deps.as_ref().ok_or_else(|| {
+                    miette::miette!("internal: closure resolution for a package with no deps")
+                })?;
+                nau_chart::dep_fetch::resolve_closure_bytes(meta, deps, recipe.parent())
+            })?;
 
         let snap_name: Mutex<Option<String>> = Mutex::new(None);
         let graph = BTreeMap::from([(request.package.clone(), Vec::new())]);
@@ -457,8 +468,7 @@ impl BuildStep for PoolBuild {
                 nau_build::snap::StagePolicy::Default,
                 // No pod store on the farm: no ELF repair, no wrappers.
                 None,
-                // Ecosystem-deps closures stay pod-only (#338 follow-up).
-                None,
+                deps_dir.as_deref(),
                 prefix.as_ref().map(|p| p.path()),
                 Some(&scan_listings),
                 false,
