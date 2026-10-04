@@ -95,6 +95,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use miette::{IntoDiagnostic, WrapErr};
@@ -405,11 +406,21 @@ fn is_executable(path: &Path) -> bool {
 
 /// One walked payload entry. Blobs are content-addressed; symlinks are
 /// recreated verbatim (never followed — a link out of the payload must
-/// not pull outside trees into the store).
+/// not pull outside trees into the store). `executable` carries the
+/// ingest-time exec bit so materialization can re-impose it: a blob
+/// whose bits a past extraction lost would otherwise poison every
+/// tree that hardlinks it (the store dedups by content hash alone).
 #[derive(Debug, Clone)]
 enum TreeEntry {
-    Blob { rel: String, sha256: String },
-    Symlink { rel: String, target: String },
+    Blob {
+        rel: String,
+        sha256: String,
+        executable: bool,
+    },
+    Symlink {
+        rel: String,
+        target: String,
+    },
 }
 
 /// The payload path prefix font files live under: every payload blob
@@ -426,7 +437,7 @@ const FONTS_PAYLOAD_PREFIX: &str = "usr/share/fonts/";
 fn record_fonts(entries: &[TreeEntry]) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for entry in entries {
-        if let TreeEntry::Blob { rel, sha256 } = entry {
+        if let TreeEntry::Blob { rel, sha256, .. } = entry {
             if let Some(rest) = rel.strip_prefix(FONTS_PAYLOAD_PREFIX) {
                 out.insert(rest.to_string(), sha256.clone());
             }
@@ -1351,7 +1362,7 @@ impl RuntimeStore {
         } else if meta.is_dir() {
             self.descend_or_skip(root, path, is_top, &rel, skip, entries)
         } else if meta.is_file() {
-            self.record_file(path, rel, entries)
+            self.record_file(path, rel, meta.permissions().mode(), entries)
         } else {
             Err(miette::miette!(
                 "unsupported file type at {} (fifos/sockets/devices are not \
@@ -1396,11 +1407,16 @@ impl RuntimeStore {
         &self,
         path: &Path,
         rel: String,
+        mode: u32,
         entries: &mut Vec<TreeEntry>,
     ) -> miette::Result<()> {
         let sha256 = sha256_file(path)?;
         self.blob_content_address(path, &sha256)?;
-        entries.push(TreeEntry::Blob { rel, sha256 });
+        entries.push(TreeEntry::Blob {
+            rel,
+            sha256,
+            executable: mode & 0o111 != 0,
+        });
         Ok(())
     }
 
@@ -1455,7 +1471,21 @@ impl RuntimeStore {
                 .wrap_err_with(|| format!("creating {}", parent.display()))?;
         }
         match entry {
-            TreeEntry::Blob { sha256, .. } => self.hardlink_blob(sha256, &dest),
+            TreeEntry::Blob {
+                sha256, executable, ..
+            } => {
+                self.hardlink_blob(sha256, &dest)?;
+                if *executable {
+                    // Re-impose the ingest-time exec bit: the hardlink
+                    // shares the canonical blob's inode, so this also
+                    // repairs a stale blob whose bits a past extraction
+                    // lost (mode-blind content dedup would keep it).
+                    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+                        .into_diagnostic()
+                        .wrap_err_with(|| format!("restoring exec bit on {}", dest.display()))?;
+                }
+                Ok(())
+            }
             TreeEntry::Symlink { target, .. } => std::os::unix::fs::symlink(target, &dest)
                 .into_diagnostic()
                 .wrap_err_with(|| format!("linking {}", dest.display())),
@@ -2475,6 +2505,7 @@ mod tests {
             TreeEntry::Blob {
                 rel: "usr/share/fonts/truetype/nerd-fonts-hack/HackNerdFont-Regular.ttf".into(),
                 sha256: "aa11".into(),
+                executable: false,
             },
             TreeEntry::Symlink {
                 rel: "usr/share/fonts/truetype/escape.ttf".into(),
@@ -2483,6 +2514,7 @@ mod tests {
             TreeEntry::Blob {
                 rel: "usr/bin/jq".into(),
                 sha256: "bb22".into(),
+                executable: false,
             },
         ];
         let fonts = record_fonts(&entries);
@@ -2578,6 +2610,57 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert(p.name.clone(), p);
         m
+    }
+
+    // ── Exec-bit restoration at materialize ──
+
+    #[test]
+    fn materialize_reimposes_the_ingest_exec_bit_on_a_stale_blob() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fixture();
+        let hash = "aa".repeat(32);
+        // The canonical blob was left 644 by a past extraction that
+        // lost the exec bit; mode-blind content dedup keeps it forever.
+        let blob_path = f.store.blob_path(&hash);
+        std::fs::create_dir_all(blob_path.parent().unwrap()).unwrap();
+        std::fs::write(&blob_path, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&blob_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let tree = f._dir.path().join("tree");
+        let entries = vec![TreeEntry::Blob {
+            rel: "usr/bin/tool".into(),
+            sha256: hash.clone(),
+            executable: true,
+        }];
+        f.store.materialize_tree(&entries, &tree).unwrap();
+
+        // TreeEntry rels carry the payload's own usr/ prefix; the tree
+        // adds the sysext usr/ root on top.
+        let dest = tree.join("usr").join("usr").join("bin").join("tool");
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "materialized file must be executable");
+        // The hardlink shares the blob's inode: the repair reaches the
+        // canonical blob too.
+        let blob_mode = std::fs::metadata(&blob_path).unwrap().permissions().mode();
+        assert_eq!(blob_mode & 0o777, 0o755, "stale canonical blob is repaired");
+
+        // Non-exec content keeps the blob's own mode — no blanket chmod.
+        let hash2 = "bb".repeat(32);
+        let blob2 = f.store.blob_path(&hash2);
+        std::fs::create_dir_all(blob2.parent().unwrap()).unwrap();
+        std::fs::write(&blob2, b"data").unwrap();
+        let entries2 = vec![TreeEntry::Blob {
+            rel: "usr/share/data".into(),
+            sha256: hash2,
+            executable: false,
+        }];
+        let tree2 = f._dir.path().join("tree2");
+        f.store.materialize_tree(&entries2, &tree2).unwrap();
+        let mode2 = std::fs::metadata(tree2.join("usr").join("usr").join("share").join("data"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode2 & 0o111, 0, "non-exec content must stay non-exec");
     }
 
     // ── EMLINK copy fallback (issue #213) ──
@@ -3866,14 +3949,17 @@ plugs:
             TreeEntry::Blob {
                 rel: "usr/bin/pi".into(),
                 sha256: "h1".into(),
+                executable: false,
             },
             TreeEntry::Blob {
                 rel: "usr/bin/package.json".into(),
                 sha256: "h2".into(),
+                executable: false,
             },
             TreeEntry::Blob {
                 rel: "usr/bin/theme/now.txt".into(),
                 sha256: "h3".into(),
+                executable: false,
             },
             TreeEntry::Symlink {
                 rel: "usr/bin/export-html".into(),
@@ -3883,10 +3969,12 @@ plugs:
             TreeEntry::Blob {
                 rel: "usr/share/doc/readme".into(),
                 sha256: "h4".into(),
+                executable: false,
             },
             TreeEntry::Blob {
                 rel: "bin/other".into(),
                 sha256: "h5".into(),
+                executable: false,
             },
         ];
         let asm = sibling_assembly(&entries, "usr/bin/pi");
@@ -3915,10 +4003,12 @@ plugs:
             TreeEntry::Blob {
                 rel: "usr/bin/rg".into(),
                 sha256: "h1".into(),
+                executable: false,
             },
             TreeEntry::Blob {
                 rel: "usr/share/man/rg.1".into(),
                 sha256: "h2".into(),
+                executable: false,
             },
         ];
         let asm = sibling_assembly(&entries, "usr/bin/rg");
@@ -3937,10 +4027,12 @@ plugs:
             TreeEntry::Blob {
                 rel: "bin/pytool".into(),
                 sha256: "wrapper".into(),
+                executable: false,
             },
             TreeEntry::Blob {
                 rel: "bin/pytool.real".into(),
                 sha256: "script".into(),
+                executable: false,
             },
         ];
         let asm = sibling_assembly(&entries, "bin/pytool");
@@ -3950,10 +4042,12 @@ plugs:
             TreeEntry::Blob {
                 rel: "bin/cli.js".into(),
                 sha256: "wrapper".into(),
+                executable: false,
             },
             TreeEntry::Blob {
                 rel: "bin/cli.real.js".into(),
                 sha256: "script".into(),
+                executable: false,
             },
         ];
         let asm = sibling_assembly(&entries, "bin/cli.js");
