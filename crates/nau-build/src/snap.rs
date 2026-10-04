@@ -3462,6 +3462,18 @@ pub fn build_prefix_env(prefix: &str) -> Vec<(&'static str, String)> {
         // to bare `libc.so.6` and only searches -L/LIBRARY_PATH dirs for
         // it, so the runtime slibdir has to be on this list too.
         ("LD_LIBRARY_PATH", build_prefix_ld_library_path(prefix)),
+        // glibc's iconv() loads its conversion modules from the
+        // compiled-in sysconfdir (/usr/lib64/gconv) — inside the sandbox
+        // that is the ROOT filesystem, never this prefix, so a
+        // prefix-provided msgfmt/gettext refuses every non-ASCII
+        // conversion ("msgfmt relies on iconv(), and iconv() does not
+        // support this conversion" — observed live: gcc 14.2.0's po step
+        // died on fr.mo/de.mo in the wl-clipboard farm drain,
+        // 2026-10-04, with 258 gconv modules sitting in the staged
+        // glibc payload). GCONV_PATH points the prefix glibc at its own
+        // modules; the two layouts the payloads stage are both listed,
+        // and absent dirs are ignored by glibc.
+        ("GCONV_PATH", build_prefix_gconv_dirs(prefix)),
         // The gcc payload's cc/c++ shims compose -L/-idirafter flags from
         // these (gcc.lua shim contract: it mirrors the farm LD wrapper,
         // which exports them for farm-side builds). Without them the shim
@@ -3499,6 +3511,16 @@ fn build_prefix_ld_library_path(prefix: &str) -> String {
         "{}/usr/lib:{}/usr/lib64:{}/lib64:{}/usr/lib/x86_64-linux-gnu:{}/usr/lib/aarch64-linux-gnu:{}/usr/lib/arm-linux-gnueabihf",
         prefix, prefix, prefix, prefix, prefix, prefix
     )
+}
+
+/// The gconv module dirs `GCONV_PATH` exposes for the merged prefix:
+/// the slibdir layout the glibc payload stages (`usr/lib64/gconv` — the
+/// same root-lib64 half the LD list covers) plus the Debian-style
+/// `usr/lib/gconv` other payloads may ship. glibc searches each dir for
+/// its gconv-modules cache and ignores missing ones, so listing both
+/// layouts unconditionally is safe.
+fn build_prefix_gconv_dirs(prefix: &str) -> String {
+    format!("{}/usr/lib64/gconv:{}/usr/lib/gconv", prefix, prefix)
 }
 
 /// The `-L` list `LDFLAGS` exposes for the merged prefix: one flag per
@@ -11832,6 +11854,26 @@ mod wrapper_tests {
             "#!/usr/bin/env bash\necho hi\n"
         );
         assert!(!stage.path().join("usr/bin/tool.real").exists());
+    }
+
+    /// glibc's iconv() resolves its gconv modules from GCONV_PATH (or the
+    /// compiled-in /usr path, which the sandbox ROOT owns — never the
+    /// mounted prefix): the prefix env must expose the staged glibc
+    /// payload's module dirs, or any prefix-provided gettext refuses
+    /// every non-ASCII conversion (the wl-clipboard farm drain's gcc po
+    /// failure, 2026-10-04).
+    #[test]
+    fn build_prefix_env_carries_gconv_dirs() {
+        let env = build_prefix_env("/nau-build-prefix");
+        let gconv = env
+            .iter()
+            .find(|(k, _)| *k == "GCONV_PATH")
+            .map(|(_, v)| v.as_str())
+            .expect("GCONV_PATH is wired");
+        assert_eq!(
+            gconv, "/nau-build-prefix/usr/lib64/gconv:/nau-build-prefix/usr/lib/gconv",
+            "the slibdir layout leads, Debian-style second"
+        );
     }
 
     /// An interpreter provided by the package's OWN payload resolves too:
