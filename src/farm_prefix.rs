@@ -114,7 +114,7 @@ fn payload_dir(cache: &Path, name: &str, version: &str, arch: &str) -> PathBuf {
 /// compromise equals the manifest's attacker class. Signing with the
 /// release keypair is the filed follow-up.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct ClosurePin {
+pub(crate) struct ClosurePin {
     deps_hash: String,
     #[serde(default)]
     key: String,
@@ -266,7 +266,7 @@ fn require_sha256_grammar(pin: &str, pkg: &str) -> miette::Result<()> {
     if pin.len() == 64
         && pin
             .bytes()
-            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'z'))
+            .all(|b: u8| b.is_ascii_digit() || b.is_ascii_lowercase())
     {
         return Ok(());
     }
@@ -771,7 +771,7 @@ mod tests {
             .unwrap()
             .expect("a resolved closure yields a dir");
 
-        let pin = nau_core::cache_key::sha256_hex(&tiny_closure_blob());
+        let pin = nau_core::cache_key::sha256_hex(tiny_closure_blob());
         assert!(out.ends_with(format!("deps-{pin}")), "dir named by the pin");
         let puts = tree.puts.borrow();
         assert_eq!(puts.len(), 2, "blob + pin doc: {:?}", puts);
