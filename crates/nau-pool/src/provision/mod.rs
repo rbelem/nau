@@ -1375,12 +1375,12 @@ pub const SQUASHFS_TOOLS_SHA256: &str =
 /// this const together; no worker ever installs bytes this const does
 /// not name (the runcmd gates on it BEFORE anything runs or installs).
 pub const MKSQUASHFS_ARTIFACT_SHA256: &str =
-    "b8b43077806da524d2e6b6be1bb1377f20c30e4107a5cd762ef76750994d13d6";
+    "5b5b6220c7f68e237b16e61939a861bea142901cc22fd2d409a566f144a12492";
 
 /// sha256 of the prebuilt artifact `unsquashfs` binary (see
 /// [`MKSQUASHFS_ARTIFACT_SHA256`]).
 pub const UNSQUASHFS_ARTIFACT_SHA256: &str =
-    "6b97812c869c1254466e361732717d7c590c64cc89e6757d7f2e0d4039a4caf3";
+    "1363f4a4cac68cda5ea94724ae3d155ac550b33ca76bec2b41666a77e4f0196a";
 
 /// Everything the template needs. Nothing here is optional: a provision
 /// without a CA pin, a login key, a TTL, or a publish channel is not a
