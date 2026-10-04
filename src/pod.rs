@@ -4995,6 +4995,11 @@ fn build_own_package(
         // counterfactual): a named refresh member never takes a cache
         // hit, so moved upstream bytes still refuse the build.
         build.refresh_members.contains(&meta.name),
+        // #344 content freshness rides normal syncs only — a refresh
+        // reconcile must never churn an unnamed member's cached payload
+        // (issue #177), and staleness it skips here is caught on the
+        // next normal sync.
+        build.refresh_members.is_empty(),
     )?;
     // Floating sources (issue #175): the build re-resolved the pin, so
     // the observed hashes restamp the lockfile's `sources` record once
@@ -5384,6 +5389,9 @@ fn build_loaded_member(
         // Same drift-observation rule as the own path: a named refresh
         // member never takes a cache hit.
         build.refresh_members.contains(&meta.name),
+        // Same #344 scoping as the own path: strict on normal syncs,
+        // integrity-only during refresh reconciles (#177).
+        build.refresh_members.is_empty(),
     ) {
         Ok((pending, _)) => {
             push_meta_desktop_claims(
@@ -5495,6 +5503,9 @@ fn install_requires_closure(
             &dep_meta,
             &mut building,
             drifted || refresh,
+            // Runtime requires members: drift stamps + refresh own their
+            // freshness — a refresh must never churn an unnamed member.
+            false,
         )?;
         // Memo hit: the ensure above already hashed this payload (its
         // verify or fresh-build record) — the per-sync memo makes the
@@ -6511,6 +6522,7 @@ fn build_pending_snap(
     deps_pin: Option<&crate::lock::PackageDepsLock>,
     source_pod: Option<&str>,
     bypass_source_cache: bool,
+    content_check: bool,
 ) -> miette::Result<(crate::runtime::PendingSnap, Vec<crate::snap::SourceInfo>)> {
     set_pod_build_epoch();
     let deps_dir = resolve_build_deps_dir(store, meta, deps_pin, source_pod)?;
@@ -6518,7 +6530,7 @@ fn build_pending_snap(
     // payloads ensured + merged, exactly like the pool path. None when the
     // package runs no build or declares neither list.
     let mut building: Vec<String> = vec![meta.name.clone()];
-    let build_prefix = pod_build_prefix(store, meta, &mut building)?;
+    let build_prefix = pod_build_prefix(store, meta, &mut building, content_check)?;
     let scan_listings = match &build_prefix {
         Some(p) => Some(crate::leak_scan::listings_for_build(meta, p)?),
         None => Some(crate::leak_scan::PayloadListings::default()),
@@ -6604,6 +6616,7 @@ fn pod_build_prefix(
     store: &crate::runtime::RuntimeStore,
     meta: &crate::snap::SnapMeta,
     building: &mut Vec<String>,
+    content_check: bool,
 ) -> miette::Result<Option<crate::build_prefix::MergedPrefix>> {
     // Only source builds consume a build prefix — meta/store snaps and
     // fetch-only declarations never run a build command.
@@ -6621,7 +6634,18 @@ fn pod_build_prefix(
     let mut payloads = Vec::new();
     for member in closure {
         let dep_meta = load_meta_memoized(&member.name, member.constraint.as_deref())?;
-        let snap = ensure_pod_dep_payload(store, &member.name, &dep_meta, building, false)?;
+        let snap = ensure_pod_dep_payload(
+            store,
+            &member.name,
+            &dep_meta,
+            building,
+            false,
+            // The build-prefix lane owns the #344 freshness check —
+            // bounded by the reconcile mode: a refresh never churns an
+            // unnamed member (#177), so refresh reconciles run the
+            // prefix lane integrity-only.
+            content_check,
+        )?;
         payloads.push(crate::build_prefix::Payload {
             pkg: member.name,
             source: crate::build_prefix::PayloadSource::Snap(snap),
@@ -6659,12 +6683,21 @@ fn pod_build_prefix(
 /// ([`dep_payload_digest_path`] sidecar), through the per-sync blob memo
 /// so a payload this sync already hashed costs nothing. Own fail-closed
 /// check — deliberately NOT folded into the #125 deps-blob story.
+/// `check_content` scopes the #344 freshness half of the reuse check:
+/// the build-PREFIX lane (build_deps) checks it — drift stamps don't
+/// cover a bd payload's recipe — while the runtime `requires` lane runs
+/// with `false`: its members' freshness is already owned by the drift
+/// detector's `recipe_sha256` stamps + refresh semantics, and a refresh
+/// must never churn an unnamed member. A missing content key BASELINES
+/// (loud, no rebuild) instead of forcing a rebuild — dead sources make
+/// forced rebuilds unbounded damage.
 fn ensure_pod_dep_payload(
     store: &crate::runtime::RuntimeStore,
     name: &str,
     dep_meta: &crate::snap::SnapMeta,
     building: &mut Vec<String>,
     force_build: bool,
+    check_content: bool,
 ) -> miette::Result<std::path::PathBuf> {
     set_pod_build_epoch();
     let downloads = store.downloads_dir();
@@ -6678,14 +6711,11 @@ fn ensure_pod_dep_payload(
     ));
     if existing.exists() && !force_build {
         verify_cached_dep_payload(&existing, name)?;
-        let key = dep_content_key(name, dep_meta)?;
-        if read_dep_content_key(&existing).as_deref() == Some(key.as_str()) {
+        if !check_content || cached_dep_content_ok(&existing, name, dep_meta)? {
             return Ok(existing);
         }
-        crate::output::status(format!(
-            "dep payload {name} {} is stale (recipe or closure content changed) — rebuilding",
-            dep_meta.version
-        ));
+        // Stale (present key, changed recipes): fall through to the
+        // rebuild, which re-records both sidecars.
     }
 
     if building.iter().any(|n| n == name) {
@@ -6698,7 +6728,7 @@ fn ensure_pod_dep_payload(
 
     // The dependency's own build prefix (its requires ∪ build_deps,
     // transitively — a dep build is a build like any other, ADR-0018).
-    let dep_prefix = pod_build_prefix(store, dep_meta, building)?;
+    let dep_prefix = pod_build_prefix(store, dep_meta, building, check_content)?;
     let scan_listings = match &dep_prefix {
         Some(p) => Some(crate::leak_scan::listings_for_build(dep_meta, p)?),
         None => Some(crate::leak_scan::PayloadListings::default()),
@@ -6740,6 +6770,41 @@ fn ensure_pod_dep_payload(
     // (digest + content key) the next sync's reuse check verifies.
     record_built_payload_provenance(&fresh, name, dep_meta)?;
     Ok(fresh)
+}
+
+/// The #344 freshness decision for a cached build-prefix payload: `true`
+/// reuses the cache, `false` falls through to a rebuild. A present key
+/// that differs means the recipes moved since the build — rebuild. An
+/// ABSENT key (a pre-#344 payload) BASELINES loudly and reuses — the
+/// drift detector's migration contract (issues #142 + #172): stamp what
+/// the current recipes hash to, name the limit, point at `nau pod
+/// refresh` as the escape hatch. Forcing a rebuild there would break
+/// dead-source members on every sync.
+fn cached_dep_content_ok(
+    existing: &Path,
+    name: &str,
+    dep_meta: &crate::snap::SnapMeta,
+) -> miette::Result<bool> {
+    let key = dep_content_key(name, dep_meta)?;
+    match read_dep_content_key(existing) {
+        Some(recorded) if recorded == key => Ok(true),
+        Some(_) => {
+            crate::output::status(format!(
+                "dep payload {name} {} is stale (recipe or closure content changed) — rebuilding",
+                dep_meta.version
+            ));
+            Ok(false)
+        }
+        None => {
+            record_dep_content_key(existing, &key)?;
+            crate::output::status(format!(
+                "baseline recorded for '{name}': pre-#344 payload carries no content key — \
+                 a recipe edit predating it is unrecoverable from the cache; run \
+                 `nau pod refresh {name}` to rebuild from its current recipe"
+            ));
+            Ok(true)
+        }
+    }
 }
 
 /// The provenance a (re)build must leave beside its payload before the
@@ -9494,6 +9559,7 @@ pod {
             None,
             Some("codegraph"),
             false,
+            false,
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -9512,6 +9578,7 @@ pod {
             crate::farm::ClaimLayer::Own,
             None,
             None,
+            false,
             false,
         )
         .unwrap_err();
