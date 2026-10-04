@@ -40,9 +40,9 @@ pub(crate) trait TreeSource {
         })
     }
 
-    /// The recorded interpreted-deps pin for `pkg` (#338-b), `None` when
-    /// the tree has none — the first-build case that then publishes.
-    fn closure_pin(&self, pkg: &str) -> miette::Result<Option<String>>;
+    /// The recorded interpreted-deps pin doc for `pkg` (#338-b), `None`
+    /// when the tree has none — the first-build case that then publishes.
+    fn closure_pin(&self, pkg: &str) -> miette::Result<Option<ClosurePin>>;
 
     /// Publish bytes at an exact object key (`blobs/<sha256>`,
     /// `closures/<pkg>.json`). Idempotent: content-addressed keys carry
@@ -70,7 +70,7 @@ impl TreeSource for S3Tree {
         self.client.get(&format!("blobs/{sha256}"))
     }
 
-    fn closure_pin(&self, pkg: &str) -> miette::Result<Option<String>> {
+    fn closure_pin(&self, pkg: &str) -> miette::Result<Option<ClosurePin>> {
         let Some(bytes) = self.client.get(&format!("closures/{pkg}.json"))? else {
             return Ok(None);
         };
@@ -79,7 +79,7 @@ impl TreeSource for S3Tree {
                 "tree closure pin at closures/{pkg}.json does not parse — refusing it: {e}"
             )
         })?;
-        Ok(Some(pin.deps_hash))
+        Ok(Some(pin))
     }
 
     fn put_object(&self, key: &str, bytes: &[u8]) -> miette::Result<()> {
@@ -100,14 +100,70 @@ fn payload_dir(cache: &Path, name: &str, version: &str, arch: &str) -> PathBuf {
 }
 
 /// The tree's recorded interpreted-deps pin for one package (#338-b):
-/// `closures/<pkg>.json` names the blob the closure builds from. The
-/// worker publishes it at the first build that resolves the closure —
-/// the same writer class as `manifests/<pkg>.json`, so the request
-/// envelope stays identity-only (ADR-0052) and the submitter can never
-/// select tree content.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+/// `closures/<pkg>.json` names the blob the closure builds from AND the
+/// recipe-dep key it was resolved from — a recipe or recipe-lock edit
+/// mints a new key, the recorded one mismatches, and the closure
+/// re-resolves (the #344 class designed out on this lane too). A doc
+/// from before keys existed parses with an empty key, which matches
+/// nothing — a graceful one-time re-resolve.
+///
+/// Trust boundary, stated precisely: the doc is worker-published but
+/// UNSIGNED — unlike the signed manifests, tree-write alone (leaked S3
+/// creds, a non-signing component with PUT access) can repoint the pin
+/// at an attacker blob that the next build mounts. Only whole-worker
+/// compromise equals the manifest's attacker class. Signing with the
+/// release keypair is the filed follow-up.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ClosurePin {
     deps_hash: String,
+    #[serde(default)]
+    key: String,
+}
+
+/// The recipe-dep key the pin doc is validated against: the recipe bytes,
+/// the deps declaration, and every recipe-local lockfile's bytes — the
+/// inputs farm-side resolution is pinned by. A change to any of them
+/// invalidates the recorded closure (the in-source lockfile bytes of a
+/// FLOATING source are the documented gap: they are only knowable after
+/// a fetch, so a floating recipe with in-source locks re-resolves on
+/// recipe edits but not upstream lock drift — filed follow-up).
+pub(crate) fn recipe_dep_key(
+    recipe: &Path,
+    meta: &crate::snap::SnapMeta,
+) -> miette::Result<String> {
+    let mut material = std::fs::read(recipe)
+        .map_err(|e| miette::miette!("reading the recipe {}: {e}", recipe.display()))?;
+    let mut decl = String::new();
+    if let Some(deps) = meta.deps.as_ref() {
+        for (name, spec) in [
+            ("cargo", deps.cargo.as_ref()),
+            ("go", deps.go.as_ref()),
+            ("npm", deps.npm.as_ref()),
+            ("pip", deps.pip.as_ref()),
+        ] {
+            let Some(spec) = spec else { continue };
+            decl.push_str(&format!("{name}={spec:?}\n"));
+            let recipe_dir = recipe
+                .parent()
+                .ok_or_else(|| miette::miette!("recipe {} has no parent dir", recipe.display()))?;
+            let mut push_lock = |declared: &str| -> miette::Result<()> {
+                if let Some(rest) = declared.strip_prefix("recipe/") {
+                    let path = recipe_dir.join(rest);
+                    let bytes = std::fs::read(&path).map_err(|e| {
+                        miette::miette!("reading the recipe-local lock {}: {e}", path.display())
+                    })?;
+                    material.extend_from_slice(&bytes);
+                }
+                Ok(())
+            };
+            push_lock(&spec.lock)?;
+            if let Some(sum) = &spec.sum {
+                push_lock(sum)?;
+            }
+        }
+    }
+    material.extend_from_slice(decl.as_bytes());
+    Ok(nau_core::cache_key::sha256_hex(&material))
 }
 
 /// The interpreted-deps closure for a farm build (#338-b), the tree-first
@@ -131,6 +187,7 @@ pub(crate) fn ensure_farm_deps_closure<T: TreeSource, R>(
     tree: &T,
     cache: &Path,
     meta: &crate::snap::SnapMeta,
+    dep_key: &str,
     resolve: R,
 ) -> miette::Result<Option<PathBuf>>
 where
@@ -142,18 +199,38 @@ where
     std::fs::create_dir_all(cache)
         .map_err(|e| miette::miette!("creating the farm dep cache {}: {e}", cache.display()))?;
 
-    if let Some(pin) = tree.closure_pin(&meta.name)? {
-        require_sha256_grammar(&pin, &meta.name)?;
-        let dir = cache.join(format!("deps-{pin}"));
-        if !dir.is_dir() {
-            let bytes = tree.blob(&pin)?;
-            materialize_closure(&bytes, &pin, cache)?;
-            crate::output::status(format!(
-                "closure for {} staged from the tree ({:.12}…)",
-                meta.name, pin
-            ));
+    let hit = match tree.closure_pin(&meta.name)? {
+        Some(recorded) if recorded.key == dep_key => {
+            require_sha256_grammar(&recorded.deps_hash, &meta.name)?;
+            let dir = cache.join(format!("deps-{}", recorded.deps_hash));
+            if !dir.is_dir() {
+                let bytes = tree.blob_opt(&recorded.deps_hash)?.ok_or_else(|| {
+                    miette::miette!(
+                        "closures/{}.json names blob {} but the tree does not serve it — \
+                             a broken tree, refusing to resolve over it",
+                        meta.name,
+                        recorded.deps_hash
+                    )
+                })?;
+                materialize_closure(&bytes, &recorded.deps_hash, cache)?;
+                crate::output::status(format!(
+                    "closure for {} staged from the tree ({:.12}…)",
+                    meta.name, recorded.deps_hash
+                ));
+            }
+            Some(dir)
         }
-        prune_stale_closures(cache);
+        Some(_) => {
+            crate::output::status(format!(
+                "closure for {} was resolved from an earlier recipe state — re-resolving",
+                meta.name
+            ));
+            None
+        }
+        None => None,
+    };
+    if let Some(dir) = hit {
+        prune_stale_closures(cache, Some(&dir));
         return Ok(Some(dir));
     }
 
@@ -164,6 +241,7 @@ where
     tree.put_object(&format!("blobs/{pin}"), &bytes)?;
     let doc = serde_json::to_vec(&ClosurePin {
         deps_hash: pin.clone(),
+        key: dep_key.to_string(),
     })
     .map_err(|e| miette::miette!("serializing the closure pin for '{}': {e}", meta.name))?;
     tree.put_object(&format!("closures/{}.json", meta.name), &doc)?;
@@ -175,18 +253,25 @@ where
         "closure for {} resolved + published to the tree ({:.12}…) — later builds skip the resolvers",
         meta.name, pin
     ));
-    prune_stale_closures(cache);
+    prune_stale_closures(cache, Some(&dir));
     Ok(Some(dir))
 }
 
 /// A pin becomes a filesystem path segment and a blob key — a non-sha256
-/// pin is a broken or hostile tree object, refused before use.
+/// pin is a broken or hostile tree object, refused before use. Lowercase
+/// only: the publisher writes lowercase, S3 keys are case-sensitive, and
+/// an uppercase pin would pass here only to 404 as a confusing
+/// broken-tree error.
 fn require_sha256_grammar(pin: &str, pkg: &str) -> miette::Result<()> {
-    if pin.len() == 64 && pin.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if pin.len() == 64
+        && pin
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'z'))
+    {
         return Ok(());
     }
     miette::bail!(
-        "tree closure pin for '{pkg}' is not a sha256: '{pin}' — refusing the \
+        "tree closure pin for '{pkg}' is not a lowercase sha256: '{pin}' — refusing the \
          closures/<pkg>.json object"
     )
 }
@@ -222,12 +307,18 @@ fn materialize_closure(bytes: &[u8], pin: &str, cache: &Path) -> miette::Result<
 /// re-fetch from the tree by construction, so age-based removal is safe.
 /// The deps lane is the one with unbounded growth (a floating recipe
 /// mints a new pin per moved closure); best-effort, never fails a build.
-fn prune_stale_closures(cache: &Path) {
+/// `exclude` names the dir this call is about to return — reuse does not
+/// refresh mtime, so without the exclusion a 14-day-old hit would be
+/// evicted out from under the build it was just handed to.
+fn prune_stale_closures(cache: &Path, exclude: Option<&Path>) {
     const PRUNE_AFTER: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 3600);
     let Ok(entries) = std::fs::read_dir(cache) else {
         return;
     };
     for entry in entries.flatten() {
+        if exclude.is_some_and(|keep| entry.path() == keep) {
+            continue;
+        }
         let name = entry.file_name();
         let Some(rest) = name.to_str().and_then(|n| n.strip_prefix("deps-")) else {
             continue;
@@ -509,7 +600,7 @@ mod tests {
     struct FakeTree {
         manifests: BTreeMap<String, Vec<u8>>,
         blobs: RefCell<BTreeMap<String, Vec<u8>>>,
-        closure_pins: RefCell<BTreeMap<String, String>>,
+        closure_pins: RefCell<BTreeMap<String, ClosurePin>>,
         blob_gets: Cell<usize>,
         puts: RefCell<Vec<(String, Vec<u8>)>>,
     }
@@ -526,11 +617,17 @@ mod tests {
         }
 
         /// Record the closure blob + pin doc the way the real publish
-        /// path does (content-addressed).
-        fn publish_closure(&mut self, pkg: &str, bytes: &[u8]) {
+        /// path does (content-addressed, key bound).
+        fn publish_closure(&mut self, pkg: &str, bytes: &[u8], key: &str) {
             let pin = nau_core::cache_key::sha256_hex(bytes);
             self.blobs.borrow_mut().insert(pin.clone(), bytes.to_vec());
-            self.closure_pins.borrow_mut().insert(pkg.to_string(), pin);
+            self.closure_pins.borrow_mut().insert(
+                pkg.to_string(),
+                ClosurePin {
+                    deps_hash: pin,
+                    key: key.to_string(),
+                },
+            );
         }
 
         fn release(&mut self, pkg: &str, version: &str, revision: u32, content: &[u8]) {
@@ -565,7 +662,7 @@ mod tests {
             Ok(self.blobs.borrow().get(sha256).cloned())
         }
 
-        fn closure_pin(&self, pkg: &str) -> miette::Result<Option<String>> {
+        fn closure_pin(&self, pkg: &str) -> miette::Result<Option<ClosurePin>> {
             Ok(self.closure_pins.borrow().get(pkg).cloned())
         }
 
@@ -583,9 +680,7 @@ mod tests {
             {
                 let pin: ClosurePin = serde_json::from_slice(bytes)
                     .map_err(|e| miette::miette!("test tree: bad pin doc for {pkg}: {e}"))?;
-                self.closure_pins
-                    .borrow_mut()
-                    .insert(pkg.to_string(), pin.deps_hash);
+                self.closure_pins.borrow_mut().insert(pkg.to_string(), pin);
             }
             Ok(())
         }
@@ -616,10 +711,11 @@ mod tests {
         let tree = FakeTree::new();
         let meta = bare_meta("app", "1.0.0");
         let cache = tempfile::tempdir().unwrap();
-        let out = crate::farm_prefix::ensure_farm_deps_closure(&tree, cache.path(), &meta, || {
-            panic!("the resolver must not run without declared deps")
-        })
-        .unwrap();
+        let out =
+            crate::farm_prefix::ensure_farm_deps_closure(&tree, cache.path(), &meta, "k1", || {
+                panic!("the resolver must not run without declared deps")
+            })
+            .unwrap();
         assert!(out.is_none());
         assert_eq!(tree.blob_gets.get(), 0);
         assert!(tree.puts.borrow().is_empty());
@@ -630,15 +726,16 @@ mod tests {
     #[test]
     fn tree_pin_serves_materialized_closure() {
         let mut tree = FakeTree::new();
-        tree.publish_closure("app", &tiny_closure_blob());
+        tree.publish_closure("app", &tiny_closure_blob(), "k1");
         let meta = deps_meta("app", "1.0.0");
         let cache = tempfile::tempdir().unwrap();
 
-        let out = crate::farm_prefix::ensure_farm_deps_closure(&tree, cache.path(), &meta, || {
-            panic!("a tree hit must not resolve")
-        })
-        .unwrap()
-        .expect("a tree hit yields a dir");
+        let out =
+            crate::farm_prefix::ensure_farm_deps_closure(&tree, cache.path(), &meta, "k1", || {
+                panic!("a tree hit must not resolve")
+            })
+            .unwrap()
+            .expect("a tree hit yields a dir");
         let content = std::fs::read_to_string(out.join("hello")).unwrap();
         assert_eq!(content, "world", "the canonical archive unpacked");
         assert_eq!(tree.blob_gets.get(), 1);
@@ -648,7 +745,7 @@ mod tests {
         );
 
         let again =
-            crate::farm_prefix::ensure_farm_deps_closure(&tree, cache.path(), &meta, || {
+            crate::farm_prefix::ensure_farm_deps_closure(&tree, cache.path(), &meta, "k1", || {
                 panic!("a complete cache dir must not resolve")
             })
             .unwrap()
@@ -666,12 +763,13 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let resolved = std::cell::Cell::new(0);
 
-        let out = crate::farm_prefix::ensure_farm_deps_closure(&tree, cache.path(), &meta, || {
-            resolved.set(resolved.get() + 1);
-            Ok(tiny_closure_blob())
-        })
-        .unwrap()
-        .expect("a resolved closure yields a dir");
+        let out =
+            crate::farm_prefix::ensure_farm_deps_closure(&tree, cache.path(), &meta, "k1", || {
+                resolved.set(resolved.get() + 1);
+                Ok(tiny_closure_blob())
+            })
+            .unwrap()
+            .expect("a resolved closure yields a dir");
 
         let pin = nau_core::cache_key::sha256_hex(&tiny_closure_blob());
         assert!(out.ends_with(format!("deps-{pin}")), "dir named by the pin");
@@ -681,7 +779,7 @@ mod tests {
         assert_eq!(puts[1].0, "closures/app.json", "pin doc lands second");
         assert_eq!(
             puts[1].1,
-            format!("{{\"deps_hash\":\"{pin}\"}}").into_bytes(),
+            format!("{{\"deps_hash\":\"{pin}\",\"key\":\"k1\"}}").into_bytes(),
             "the pin doc names the blob"
         );
         drop(puts);
@@ -690,7 +788,7 @@ mod tests {
         // The published pin serves the next build: no second resolve, no
         // second publish.
         let again =
-            crate::farm_prefix::ensure_farm_deps_closure(&tree, cache.path(), &meta, || {
+            crate::farm_prefix::ensure_farm_deps_closure(&tree, cache.path(), &meta, "k1", || {
                 panic!("the published pin must preempt resolution")
             })
             .unwrap()
@@ -699,22 +797,66 @@ mod tests {
         assert_eq!(tree.puts.borrow().len(), 2, "nothing republished");
     }
 
-    /// A pin that is not a sha256 is refused before it becomes a path
-    /// segment or a blob key — the grammar gate on the tree's pin doc.
+    /// A pin that is not a lowercase sha256 is refused before it becomes
+    /// a path segment or a blob key — the grammar gate on the pin doc.
     #[test]
     fn malformed_closure_pin_refuses() {
         let tree = FakeTree::new();
-        tree.closure_pins
-            .borrow_mut()
-            .insert("app".into(), "short-and-dirty".into());
+        tree.closure_pins.borrow_mut().insert(
+            "app".into(),
+            ClosurePin {
+                deps_hash: "short-and-dirty".into(),
+                key: "k1".into(),
+            },
+        );
         let meta = deps_meta("app", "1.0.0");
         let cache = tempfile::tempdir().unwrap();
 
-        let err = crate::farm_prefix::ensure_farm_deps_closure(&tree, cache.path(), &meta, || {
-            panic!("a malformed pin must fall hard, never to the resolver")
-        })
-        .unwrap_err();
-        assert!(format!("{err:#}").contains("is not a sha256"), "{err:#}");
+        let err =
+            crate::farm_prefix::ensure_farm_deps_closure(&tree, cache.path(), &meta, "k1", || {
+                panic!("a malformed pin must fall hard, never to the resolver")
+            })
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("is not a lowercase sha256"),
+            "{err:#}"
+        );
+    }
+
+    /// A recipe-dep key change (a recipe or recipe-lock edit) invalidates
+    /// the recorded pin: the closure re-resolves and republishes — the
+    /// farm never freezes at its first resolution (#344's class, this
+    /// lane's version).
+    #[test]
+    fn recipe_change_republishes() {
+        let mut tree = FakeTree::new();
+        tree.publish_closure("app", &tiny_closure_blob(), "k1");
+        let meta = deps_meta("app", "1.0.0");
+        let cache = tempfile::tempdir().unwrap();
+
+        // The recipe changed: the recorded key no longer matches.
+        let out =
+            crate::farm_prefix::ensure_farm_deps_closure(&tree, cache.path(), &meta, "k2", || {
+                Ok(b"F 100644 6 hello2\nworld2END\n".to_vec())
+            })
+            .unwrap()
+            .expect("a re-resolve yields the new dir");
+
+        let new_blob = b"F 100644 6 hello2\nworld2END\n";
+        let new_pin = nau_core::cache_key::sha256_hex(new_blob);
+        assert!(
+            out.ends_with(format!("deps-{new_pin}")),
+            "the dir is named by the NEW pin: {}",
+            out.display()
+        );
+        let puts = tree.puts.borrow();
+        assert_eq!(puts.len(), 2, "the stale pair is overwritten: {puts:?}");
+        assert_eq!(puts[0].0, format!("blobs/{new_pin}"));
+        assert_eq!(
+            puts[1].1,
+            format!("{{\"deps_hash\":\"{new_pin}\",\"key\":\"k2\"}}").into_bytes(),
+            "the republished doc binds the new key"
+        );
     }
 
     /// A blob whose bytes do not hash to the recorded pin is a broken
@@ -726,14 +868,21 @@ mod tests {
         tree.blobs
             .borrow_mut()
             .insert(pin.clone(), b"not the empty string".to_vec());
-        tree.closure_pins.borrow_mut().insert("app".into(), pin);
+        tree.closure_pins.borrow_mut().insert(
+            "app".into(),
+            ClosurePin {
+                deps_hash: pin,
+                key: "k1".into(),
+            },
+        );
         let meta = deps_meta("app", "1.0.0");
         let cache = tempfile::tempdir().unwrap();
 
-        let err = crate::farm_prefix::ensure_farm_deps_closure(&tree, cache.path(), &meta, || {
-            panic!("a broken tree must fall hard, never to the resolver")
-        })
-        .unwrap_err();
+        let err =
+            crate::farm_prefix::ensure_farm_deps_closure(&tree, cache.path(), &meta, "k1", || {
+                panic!("a broken tree must fall hard, never to the resolver")
+            })
+            .unwrap_err();
         assert!(format!("{err:#}").contains("hash mismatch"), "{err:#}");
     }
 
