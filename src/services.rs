@@ -245,7 +245,7 @@ pub fn record_in(
     let ctx = ResolveCtx {
         pod,
         home: &std::env::var("HOME").unwrap_or_else(|_| ".".into()),
-        extensions: current.join("extensions").to_string_lossy().into_owned(),
+        extensions: current.join("../extensions").to_string_lossy().into_owned(),
         gen_env: read_generation_env(&crate::farm::env_path(&store.store_view(), gen.n))?,
         loader_libs: crate::farm::loader_lib_dirs(&store.store_view(), gen),
         current: current.to_string_lossy().into_owned(),
@@ -1670,7 +1670,7 @@ fn pod_endpoint_claims(pod_dir: &std::path::Path) -> miette::Result<Vec<Endpoint
     let ctx = ResolveCtx {
         pod: &pod,
         home: &home,
-        extensions: current.join("extensions").to_string_lossy().into_owned(),
+        extensions: current.join("../extensions").to_string_lossy().into_owned(),
         gen_env: BTreeMap::new(), // expansion-only: env/loader-libs are render-time inputs
         loader_libs: Vec::new(),
         current: current.to_string_lossy().into_owned(),
