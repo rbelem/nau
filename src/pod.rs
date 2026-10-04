@@ -6513,14 +6513,7 @@ fn build_pending_snap(
     bypass_source_cache: bool,
 ) -> miette::Result<(crate::runtime::PendingSnap, Vec<crate::snap::SourceInfo>)> {
     set_pod_build_epoch();
-    let deps_dir = match (meta.deps.as_ref(), deps_pin) {
-        (Some(_), Some(pin)) => Some(crate::dep_fetch::materialize_deps_entry(
-            &store.blob_store(),
-            &pin.deps_hash,
-        )?),
-        (Some(_), None) => return Err(deps_gate_error(&meta.name, source_pod)),
-        (None, _) => None,
-    };
+    let deps_dir = resolve_build_deps_dir(store, meta, deps_pin, source_pod)?;
     // Merged build prefix (ADR-0018, issue #35): `requires` ∪ `build_deps`
     // payloads ensured + merged, exactly like the pool path. None when the
     // package runs no build or declares neither list.
@@ -6556,15 +6549,7 @@ fn build_pending_snap(
     // The build just (re)wrote these bytes: any memo entry for the path
     // predates the overwrite, and the fresh digest is the Built
     // provenance proof prepare_snap will rely on (item 6b).
-    nau_core::blob_memo::invalidate(&payload);
-    let sha3_384 = sha3_384_file_memoized(&payload)?;
-    // Same contract as the dep-ensure path: the sidecar must describe
-    // the bytes NOW on disk. A top-level rebuild that leaves the old
-    // digest behind makes the next sync's reuse check refuse the very
-    // payload this build just wrote (live 2026-10-03: rust, python,
-    // libsecret, node, tree-sitter-perl — each rebuilt at its pin, each
-    // refused as a bd at the next sync).
-    record_dep_payload_digest(&payload, &sha3_384)?;
+    let sha3_384 = record_built_payload_provenance(&payload, &meta.name, meta)?;
     Ok((
         build_pending_snap_at(meta, &payload, sha3_384, layer),
         result.source_infos,
@@ -6693,7 +6678,14 @@ fn ensure_pod_dep_payload(
     ));
     if existing.exists() && !force_build {
         verify_cached_dep_payload(&existing, name)?;
-        return Ok(existing);
+        let key = dep_content_key(name, dep_meta)?;
+        if read_dep_content_key(&existing).as_deref() == Some(key.as_str()) {
+            return Ok(existing);
+        }
+        crate::output::status(format!(
+            "dep payload {name} {} is stale (recipe or closure content changed) — rebuilding",
+            dep_meta.version
+        ));
     }
 
     if building.iter().any(|n| n == name) {
@@ -6719,7 +6711,7 @@ fn ensure_pod_dep_payload(
     // build path takes the `nau_core::blob_store` seam handle (issue
     // // #326 PR 2), not the runtime store itself.
     let blob_store = store.blob_store();
-    let result = crate::snap::build_snap(
+    let result = match crate::snap::build_snap(
         dep_meta,
         stage.path(),
         &downloads,
@@ -6732,16 +6724,58 @@ fn ensure_pod_dep_payload(
         // A dependency payload fetch is not a drift-observation point.
         false,
         Some(&crate::build_orch::SeamSourceFetcher),
-    )?;
+    ) {
+        Ok(result) => result,
+        // Pop on the way out too — a leaked name would report a false
+        // circular dependency on the next member.
+        Err(e) => {
+            building.pop();
+            return Err(e);
+        }
+    };
     building.pop();
     let fresh = downloads.join(&result.snap_filename);
     // Fresh bytes at a possibly-reused path: drop any memo record of the
-    // overwritten content, hash the new bytes, and record the digest the
-    // next sync's reuse check verifies against.
-    nau_core::blob_memo::invalidate(&fresh);
-    let sha3_384 = sha3_384_file_memoized(&fresh)?;
-    record_dep_payload_digest(&fresh, &sha3_384)?;
+    // overwritten content, hash the new bytes, and record both sidecars
+    // (digest + content key) the next sync's reuse check verifies.
+    record_built_payload_provenance(&fresh, name, dep_meta)?;
     Ok(fresh)
+}
+
+/// The provenance a (re)build must leave beside its payload before the
+/// caller can trust the bytes on the next sync (shared by the dep-ensure
+/// and top-level build paths): invalidate the stale memo entry, hash the
+/// fresh bytes, record the sha3-384 sidecar (9a8fdb0's contract), and
+/// record the content key (issue #344 — what the bytes were built FROM).
+fn record_built_payload_provenance(
+    payload: &Path,
+    name: &str,
+    meta: &crate::snap::SnapMeta,
+) -> miette::Result<String> {
+    nau_core::blob_memo::invalidate(payload);
+    let sha3_384 = sha3_384_file_memoized(payload)?;
+    record_dep_payload_digest(payload, &sha3_384)?;
+    record_dep_content_key(payload, &dep_content_key(name, meta)?)?;
+    Ok(sha3_384)
+}
+
+/// The deps-closure gate (ADR-0048 Decision 1), extracted: a package that
+/// declares deps builds against the closure its lock pin names; no pin is
+/// the named refusal.
+fn resolve_build_deps_dir(
+    store: &crate::runtime::RuntimeStore,
+    meta: &crate::snap::SnapMeta,
+    deps_pin: Option<&crate::lock::PackageDepsLock>,
+    source_pod: Option<&str>,
+) -> miette::Result<Option<tempfile::TempDir>> {
+    match (meta.deps.as_ref(), deps_pin) {
+        (Some(_), Some(pin)) => Ok(Some(crate::dep_fetch::materialize_deps_entry(
+            &store.blob_store(),
+            &pin.deps_hash,
+        )?)),
+        (Some(_), None) => Err(deps_gate_error(&meta.name, source_pod)),
+        (None, _) => Ok(None),
+    }
 }
 
 /// The sidecar carrying a built dep payload's recorded sha3-384 (the
@@ -6753,6 +6787,83 @@ fn dep_payload_digest_path(payload: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// The sidecar carrying a built dep payload's CONTENT KEY (issue #344):
+/// `<payload>.content-key` beside the payload. The key is the drift
+/// detector's recipe-closure hash over the dep's own recipe bytes plus
+/// its `build_deps` members' — everything that determines the payload
+/// bytes — so a recipe-content fix (python 3.14.7 r2's shim) or a member
+/// edit mints a new key and invalidates the cache with no operator rm.
+fn dep_content_key_path(payload: &Path) -> PathBuf {
+    let mut name = payload.as_os_str().to_os_string();
+    name.push(".content-key");
+    PathBuf::from(name)
+}
+
+/// Compute a dep payload's content key: [`recipe_closure_hash`] (the
+/// drift scheme — one canonicalization, not two) over the dep's own
+/// recipe bytes followed by its `build_deps` members'. Same recipes →
+/// same key; any content edit → a different key.
+fn dep_content_key(name: &str, dep_meta: &crate::snap::SnapMeta) -> miette::Result<String> {
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    entries.push((name.to_string(), own_recipe_bytes(name)?));
+    let seeds = crate::deps::build_dep_seeds(dep_meta);
+    if !seeds.is_empty() {
+        for member in crate::deps::resolve_dep_specs(&seeds, true)? {
+            if let Some(bytes) = recipe_bytes(&member.name) {
+                entries.push((member.name, bytes));
+            }
+        }
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(recipe_closure_hash(&entries))
+}
+
+/// One recipe's bytes, resolved the way the drift probe resolves them:
+/// file path or collection content. `None` when unresolvable — the
+/// caller skips such members (the drift probe's behavior too).
+fn recipe_bytes(name: &str) -> Option<Vec<u8>> {
+    match crate::pkg_source::resolve_pkg(name) {
+        crate::pkg_source::PkgResult::File(path) => std::fs::read(&path).ok(),
+        crate::pkg_source::PkgResult::Found { content, .. } => Some(content.into_bytes()),
+        crate::pkg_source::PkgResult::NotFound => None,
+    }
+}
+
+/// The dep's OWN recipe bytes — a dep without a resolvable recipe cannot
+/// have a content key at all.
+fn own_recipe_bytes(name: &str) -> miette::Result<Vec<u8>> {
+    recipe_bytes(name)
+        .ok_or_else(|| miette::miette!("recipe of '{name}' not found for the content-key probe"))
+}
+
+/// Read a payload's recorded content key; `None` when absent or empty
+/// (payloads written before content keys existed — those REBUILD, never
+/// adopt: re-adopting possibly-stale bytes is the bug this fixes).
+fn read_dep_content_key(payload: &Path) -> Option<String> {
+    std::fs::read_to_string(dep_content_key_path(payload))
+        .ok()
+        .map(|recorded| recorded.trim().to_string())
+        .filter(|recorded| !recorded.is_empty())
+}
+
+/// Record a dep payload's content key into its sidecar (same atomic
+/// temp-file + rename pattern as [`record_dep_payload_digest`]).
+fn record_dep_content_key(payload: &Path, key: &str) -> miette::Result<()> {
+    let key_path = dep_content_key_path(payload);
+    let tmp = payload.with_file_name(format!(
+        ".{}.tmp-{}",
+        key_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("payload.content-key"),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, key).map_err(|e| miette::miette!("writing {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &key_path)
+        .map_err(|e| miette::miette!("finalizing {}: {e}", key_path.display()))?;
+    Ok(())
+}
+
 /// Verify a cached dep payload against its recorded digest before a
 /// build consumes it (sync-speed plan item 6e, fail-closed):
 ///
@@ -6760,10 +6871,9 @@ fn dep_payload_digest_path(payload: &Path) -> PathBuf {
 ///   file is corrupted or tampered with, and a build prefix would feed
 ///   it into every consumer silently. Remedy: delete the payload and
 ///   re-run the sync (it rebuilds).
-/// - sidecar absent (payloads written before digest recording existed,
-///   or by a path that records no sidecar): ADOPT — hash now, record the
-///   digest for every later sync. The first post-upgrade reuse rides at
-///   the old trust level once; strictly improved from then on.
+/// - sidecar absent: REFUSE (issue #344) — a payload whose integrity is
+///   unrecorded has no provenance, and adopting it (hash-now, record)
+///   would bless possibly-stale bytes. Same remedy: delete and re-run.
 ///
 /// The hash rides the per-sync blob memo, so a payload already hashed
 /// this sync (a previous member's ensure, the build's own record)
@@ -6772,11 +6882,11 @@ fn verify_cached_dep_payload(payload: &Path, name: &str) -> miette::Result<()> {
     let digest_path = dep_payload_digest_path(payload);
     let recorded = match std::fs::read_to_string(&digest_path) {
         Ok(recorded) => recorded.trim().to_string(),
-        Err(_) => {
-            let actual = sha3_384_file_memoized(payload)?;
-            record_dep_payload_digest(payload, &actual)?;
-            return Ok(());
-        }
+        Err(_) => miette::bail!(
+            "cached build payload '{name}' has no recorded digest sidecar — its integrity \
+             is unproven; refusing to build against it — delete {} and re-run the sync",
+            payload.display()
+        ),
     };
     let actual = sha3_384_file_memoized(payload)?;
     if actual != recorded {
@@ -7166,6 +7276,53 @@ mod tests {
         let fresh = crate::store::sha3_384_file(&payload).expect("hash v2");
         record_dep_payload_digest(&payload, &fresh).expect("record v2");
         verify_cached_dep_payload(&payload, "pkg").expect("verify v2");
+    }
+
+    /// Issue #344: a payload with NO digest sidecar has no provenance —
+    /// refuse, never adopt-and-record (that blessed possibly-stale bytes).
+    #[test]
+    fn missing_digest_sidecar_refuses_never_adopts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = dir.path().join("pkg_1.0.0_amd64.snap");
+        std::fs::write(&payload, b"content").expect("write");
+        assert!(
+            verify_cached_dep_payload(&payload, "pkg").is_err(),
+            "a sidecar-less payload must refuse, not adopt"
+        );
+    }
+
+    /// Issue #344: the content-key sidecar is file-level: absent/empty
+    /// reads as None, recording is atomic, and a recorded key reads back.
+    #[test]
+    fn content_key_sidecar_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = dir.path().join("dep_1.0.0_amd64.snap");
+        std::fs::write(&payload, b"content").expect("write");
+
+        assert!(read_dep_content_key(&payload).is_none(), "absent → None");
+        record_dep_content_key(&payload, "abc123").expect("record");
+        assert_eq!(
+            read_dep_content_key(&payload).as_deref(),
+            Some("abc123"),
+            "a recorded key reads back"
+        );
+    }
+
+    /// Issue #344: a cached payload whose content-key sidecar is absent
+    /// (pre-#344 payload) or names a different key is STALE — the reuse
+    /// comparison rebuilds, never adopts.
+    #[test]
+    fn content_key_mismatch_reads_stale() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = dir.path().join("dep_1.0.0_amd64.snap");
+        std::fs::write(&payload, b"content").expect("write");
+
+        // Absent key: not a match (stale → rebuild).
+        assert_ne!(read_dep_content_key(&payload).as_deref(), Some("k1"));
+
+        // A recorded key that still matches reads fresh.
+        record_dep_content_key(&payload, "k1").expect("record");
+        assert_eq!(read_dep_content_key(&payload).as_deref(), Some("k1"));
     }
 
     /// The reconcile-lifetime eval memo (sync-speed plan item 5): a
