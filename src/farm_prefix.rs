@@ -17,7 +17,6 @@
 //! needs a worker-side keychain decision and stays open on #338.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use nau_ship::s3::S3Client;
 
@@ -34,20 +33,19 @@ pub(crate) trait TreeSource {
 }
 
 /// The production tree source: the drain's S3 target.
-#[derive(Clone)]
 pub(crate) struct S3Tree {
-    client: Arc<S3Client>,
+    client: S3Client,
 }
 
 impl S3Tree {
-    pub(crate) fn new(client: Arc<S3Client>) -> Self {
+    pub(crate) fn new(client: S3Client) -> Self {
         S3Tree { client }
     }
 }
 
 impl TreeSource for S3Tree {
     fn manifest(&self, pkg: &str) -> miette::Result<Option<Vec<u8>>> {
-        Ok(self.client.get(&format!("manifests/{pkg}.json"))?)
+        self.client.get(&format!("manifests/{pkg}.json"))
     }
 
     fn blob(&self, sha256: &str) -> miette::Result<Vec<u8>> {
