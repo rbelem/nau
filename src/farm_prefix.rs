@@ -148,6 +148,10 @@ where
         if !dir.is_dir() {
             let bytes = tree.blob(&pin)?;
             materialize_closure(&bytes, &pin, cache)?;
+            crate::output::status(format!(
+                "closure for {} staged from the tree ({:.12}…)",
+                meta.name, pin
+            ));
         }
         prune_stale_closures(cache);
         return Ok(Some(dir));
@@ -167,6 +171,10 @@ where
     if !dir.is_dir() {
         materialize_closure(&bytes, &pin, cache)?;
     }
+    crate::output::status(format!(
+        "closure for {} resolved + published to the tree ({:.12}…) — later builds skip the resolvers",
+        meta.name, pin
+    ));
     prune_stale_closures(cache);
     Ok(Some(dir))
 }
@@ -689,6 +697,24 @@ mod tests {
             .expect("the pin doc yields the dir");
         assert_eq!(again, out);
         assert_eq!(tree.puts.borrow().len(), 2, "nothing republished");
+    }
+
+    /// A pin that is not a sha256 is refused before it becomes a path
+    /// segment or a blob key — the grammar gate on the tree's pin doc.
+    #[test]
+    fn malformed_closure_pin_refuses() {
+        let tree = FakeTree::new();
+        tree.closure_pins
+            .borrow_mut()
+            .insert("app".into(), "short-and-dirty".into());
+        let meta = deps_meta("app", "1.0.0");
+        let cache = tempfile::tempdir().unwrap();
+
+        let err = crate::farm_prefix::ensure_farm_deps_closure(&tree, cache.path(), &meta, || {
+            panic!("a malformed pin must fall hard, never to the resolver")
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("is not a sha256"), "{err:#}");
     }
 
     /// A blob whose bytes do not hash to the recorded pin is a broken
