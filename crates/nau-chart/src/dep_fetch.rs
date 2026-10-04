@@ -257,15 +257,58 @@ fn fetch_deps_closure(
     // lockfile's sha for the pin. The per-resolver fetches re-read the
     // same tiny files.
     let lock_sha256 = recipe_lock_sha256(deps, &src_root, recipe_dir)?;
-    let tree = fetch_tree_dir(work.path())?;
-    fetch_all_resolvers(deps, &src_root, recipe_dir, &tree, work.path())?;
-    let bytes = pack_canonical(&tree)?;
+    let bytes = resolve_and_pack(deps, &src_root, recipe_dir, work.path())?;
     let hash = store.write_blob(&bytes)?;
     Ok(DepsFetchOutcome::Resolved(DepsFetch {
         hash,
         lock_sha256,
         source: observed_source,
     }))
+}
+
+/// The resolver core the pod sync and the farm build share: run every
+/// declared resolver against the fetched source tree and pack the
+/// canonical closure archive.
+fn resolve_and_pack(
+    deps: &nau_core::snap_types::PackageDeps,
+    src_root: &Path,
+    recipe_dir: Option<&Path>,
+    work: &Path,
+) -> miette::Result<Vec<u8>> {
+    let tree = fetch_tree_dir(work)?;
+    fetch_all_resolvers(deps, src_root, recipe_dir, &tree, work)?;
+    pack_canonical(&tree)
+}
+
+/// The farm-side closure resolution (rbelem/nau#338-b): the same resolve
+/// path `nau deps fetch` runs pod-side, minus the pod blob store — the
+/// caller publishes the bytes to the released tree itself. The recipe's
+/// shipped input locks (Cargo.lock and friends) pin the resolution, so
+/// the same recipe resolves to the same bytes on any host.
+///
+/// The source fetch here is the farm build's SECOND download of the
+/// source tarball (build_snap fetches it again for the build itself) —
+/// an accepted v1 cost; the tree-published blob makes the resolution a
+/// once-per-recipe-change cost.
+pub fn resolve_closure_bytes(
+    meta: &SnapMeta,
+    deps: &nau_core::snap_types::PackageDeps,
+    recipe_dir: Option<&Path>,
+) -> miette::Result<Vec<u8>> {
+    let work = tempfile::tempdir().map_err(|e| miette::miette!("tempdir: {e}"))?;
+    let src_root = if deps.all_locks_recipe_local() {
+        work.path().to_path_buf()
+    } else {
+        match fetch_source_tree(meta, work.path(), None)? {
+            SourceTree::Fetched { root, .. } => root,
+            // Unreachable without validators: the 304 arm needs a
+            // conditional GET, and none is sent here.
+            SourceTree::Unchanged { .. } => {
+                miette::bail!("source probe reported 304 without validators")
+            }
+        }
+    };
+    resolve_and_pack(deps, &src_root, recipe_dir, work.path())
 }
 
 /// The scratch dir the materialized closure tree is packed from.
@@ -2154,7 +2197,7 @@ fn collect_tree(
 /// plan item 6c): the reader is consumed entry by entry, so a
 /// multi-gigabyte closure blob never lands in memory whole — the caller
 /// hands in a `BufReader` over the store blob (or a cursor in tests).
-fn unpack_canonical<R: std::io::Read>(mut reader: R, dest: &Path) -> miette::Result<()> {
+pub fn unpack_canonical<R: std::io::Read>(mut reader: R, dest: &Path) -> miette::Result<()> {
     loop {
         let line = read_archive_line(&mut reader)?;
         let Some(line) = line else {
