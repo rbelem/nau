@@ -20,16 +20,34 @@ use std::path::{Path, PathBuf};
 
 use nau_ship::s3::S3Client;
 
-/// The tree reads the farm dep ensure needs — a thin seam over
-/// [`S3Client`] so tests fake the tree without a network (the
+/// The tree reads and publishes the farm dep ensure's objects — a thin
+/// seam over [`S3Client`] so tests fake the tree without a network (the
 /// `BuildStep`/`Releaser` seam pattern).
 pub(crate) trait TreeSource {
     /// The package's signed manifest bytes; `None` when unreleased.
     fn manifest(&self, pkg: &str) -> miette::Result<Option<Vec<u8>>>;
 
+    /// One content blob; `None` when absent. The caller decides whether
+    /// absence is a miss to fill (a closure first build) or a broken
+    /// tree (a manifest-pinned payload blob — use [`Self::blob`]).
+    fn blob_opt(&self, sha256: &str) -> miette::Result<Option<Vec<u8>>>;
+
     /// One content blob by sha256. A pinned blob that is missing is a
     /// broken tree, not a miss — a hard error, never a fallback.
-    fn blob(&self, sha256: &str) -> miette::Result<Vec<u8>>;
+    fn blob(&self, sha256: &str) -> miette::Result<Vec<u8>> {
+        self.blob_opt(sha256)?.ok_or_else(|| {
+            miette::miette!("tree blob 'blobs/{sha256}' is missing though the manifest pins it")
+        })
+    }
+
+    /// The recorded interpreted-deps pin for `pkg` (#338-b), `None` when
+    /// the tree has none — the first-build case that then publishes.
+    fn closure_pin(&self, pkg: &str) -> miette::Result<Option<String>>;
+
+    /// Publish bytes at an exact object key (`blobs/<sha256>`,
+    /// `closures/<pkg>.json`). Idempotent: content-addressed keys carry
+    /// the same bytes from every writer.
+    fn put_object(&self, key: &str, bytes: &[u8]) -> miette::Result<()>;
 }
 
 /// The production tree source: the drain's S3 target.
@@ -48,11 +66,24 @@ impl TreeSource for S3Tree {
         self.client.get(&format!("manifests/{pkg}.json"))
     }
 
-    fn blob(&self, sha256: &str) -> miette::Result<Vec<u8>> {
-        let key = format!("blobs/{sha256}");
-        self.client.get(&key)?.ok_or_else(|| {
-            miette::miette!("tree blob '{key}' is missing though the manifest pins it")
-        })
+    fn blob_opt(&self, sha256: &str) -> miette::Result<Option<Vec<u8>>> {
+        self.client.get(&format!("blobs/{sha256}"))
+    }
+
+    fn closure_pin(&self, pkg: &str) -> miette::Result<Option<String>> {
+        let Some(bytes) = self.client.get(&format!("closures/{pkg}.json"))? else {
+            return Ok(None);
+        };
+        let pin: ClosurePin = serde_json::from_slice(&bytes).map_err(|e| {
+            miette::miette!(
+                "tree closure pin at closures/{pkg}.json does not parse — refusing it: {e}"
+            )
+        })?;
+        Ok(Some(pin.deps_hash))
+    }
+
+    fn put_object(&self, key: &str, bytes: &[u8]) -> miette::Result<()> {
+        self.client.put(key, bytes)
     }
 }
 
@@ -66,6 +97,146 @@ fn marker_path(cache: &Path, name: &str, version: &str, arch: &str) -> PathBuf {
 
 fn payload_dir(cache: &Path, name: &str, version: &str, arch: &str) -> PathBuf {
     cache.join(format!("{name}_{version}_{arch}.payload"))
+}
+
+/// The tree's recorded interpreted-deps pin for one package (#338-b):
+/// `closures/<pkg>.json` names the blob the closure builds from. The
+/// worker publishes it at the first build that resolves the closure —
+/// the same writer class as `manifests/<pkg>.json`, so the request
+/// envelope stays identity-only (ADR-0052) and the submitter can never
+/// select tree content.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ClosurePin {
+    deps_hash: String,
+}
+
+/// The interpreted-deps closure for a farm build (#338-b), the tree-first
+/// shape of the payload lane: the tree's `closures/<pkg>.json` names the
+/// pin and `blobs/<deps_hash>` serves the bytes after the first build
+/// published them; a miss runs `resolve` — the same resolver path the pod
+/// runs, pinned by the recipe's shipped input locks — and PUBLISHES both
+/// objects, so every later build (and every other worker) skips the
+/// resolvers.
+///
+/// Publish order mirrors the release lane: the blob lands BEFORE the pin
+/// doc names it, so a torn publish leaves no pin and re-resolves. The
+/// materialized dir is named `deps-<pin>` in the (worker-persistent) dep
+/// cache: the pin IS the completion record. A build unpacks through a
+/// sibling staging dir renamed in atomically, so a torn unpack leaves no
+/// complete-looking dir and two concurrent drains cannot poison each
+/// other — the rename loser adopts the winner's dir, whose bytes are
+/// identical by content addressing. A blob whose bytes do not hash to
+/// the pin is a broken tree — hard error, never a fallback.
+pub(crate) fn ensure_farm_deps_closure<T: TreeSource, R>(
+    tree: &T,
+    cache: &Path,
+    meta: &crate::snap::SnapMeta,
+    resolve: R,
+) -> miette::Result<Option<PathBuf>>
+where
+    R: FnOnce() -> miette::Result<Vec<u8>>,
+{
+    if meta.deps.is_none() {
+        return Ok(None);
+    }
+    std::fs::create_dir_all(cache)
+        .map_err(|e| miette::miette!("creating the farm dep cache {}: {e}", cache.display()))?;
+
+    if let Some(pin) = tree.closure_pin(&meta.name)? {
+        require_sha256_grammar(&pin, &meta.name)?;
+        let dir = cache.join(format!("deps-{pin}"));
+        if !dir.is_dir() {
+            let bytes = tree.blob(&pin)?;
+            materialize_closure(&bytes, &pin, cache)?;
+        }
+        prune_stale_closures(cache);
+        return Ok(Some(dir));
+    }
+
+    let bytes = resolve()?;
+    let pin = nau_core::cache_key::sha256_hex(&bytes);
+    // Blob first, pin doc second: a torn publish leaves no pin and the
+    // next build re-resolves (the release lane's blobs-first rule).
+    tree.put_object(&format!("blobs/{pin}"), &bytes)?;
+    let doc = serde_json::to_vec(&ClosurePin {
+        deps_hash: pin.clone(),
+    })
+    .map_err(|e| miette::miette!("serializing the closure pin for '{}': {e}", meta.name))?;
+    tree.put_object(&format!("closures/{}.json", meta.name), &doc)?;
+    let dir = cache.join(format!("deps-{pin}"));
+    if !dir.is_dir() {
+        materialize_closure(&bytes, &pin, cache)?;
+    }
+    prune_stale_closures(cache);
+    Ok(Some(dir))
+}
+
+/// A pin becomes a filesystem path segment and a blob key — a non-sha256
+/// pin is a broken or hostile tree object, refused before use.
+fn require_sha256_grammar(pin: &str, pkg: &str) -> miette::Result<()> {
+    if pin.len() == 64 && pin.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(());
+    }
+    miette::bail!(
+        "tree closure pin for '{pkg}' is not a sha256: '{pin}' — refusing the \
+         closures/<pkg>.json object"
+    )
+}
+
+/// Unpack the verified closure bytes into `cache/deps-<pin>` via a
+/// sibling staging dir renamed in atomically (the payload lane's EXDEV
+/// rule: stage INSIDE the cache). An existing target dir is a concurrent
+/// winner — its bytes are identical by content addressing, so losing the
+/// rename is success.
+fn materialize_closure(bytes: &[u8], pin: &str, cache: &Path) -> miette::Result<()> {
+    let actual = nau_core::cache_key::sha256_hex(bytes);
+    if actual != pin {
+        miette::bail!(
+            "dependency closure hash mismatch: expected {pin}, found {actual} — the tree \
+             entry is corrupted or tampered with; refusing to build against it"
+        );
+    }
+    let staging = tempfile::TempDir::new_in(cache)
+        .map_err(|e| miette::miette!("closure cache staging dir: {e}"))?;
+    nau_chart::dep_fetch::unpack_canonical(std::io::Cursor::new(bytes), staging.path())?;
+    let dir = cache.join(format!("deps-{pin}"));
+    match std::fs::rename(staging.path(), &dir) {
+        Ok(()) => Ok(()),
+        Err(_) if dir.is_dir() => Ok(()),
+        Err(e) => Err(miette::miette!(
+            "finalizing the closure cache dir {}: {e}",
+            dir.display()
+        )),
+    }
+}
+
+/// Lossless eviction of stale closure dirs: content-addressed dirs
+/// re-fetch from the tree by construction, so age-based removal is safe.
+/// The deps lane is the one with unbounded growth (a floating recipe
+/// mints a new pin per moved closure); best-effort, never fails a build.
+fn prune_stale_closures(cache: &Path) {
+    const PRUNE_AFTER: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 3600);
+    let Ok(entries) = std::fs::read_dir(cache) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix("deps-")) else {
+            continue;
+        };
+        if rest.len() != 64 || !rest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let fresh = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|m| m.elapsed().map_or(true, |age| age <= PRUNE_AFTER))
+            .unwrap_or(true);
+        if !fresh {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// Ensure one `requires`/`build_deps` member's payload for the merged farm
@@ -320,25 +491,38 @@ pub(crate) fn farm_build_prefix<T: TreeSource>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
 
-    /// An in-memory tree: manifests + content blobs, with a fetch counter
-    /// the reuse assertions read.
+    /// An in-memory tree: manifests + content blobs + closure pins, with
+    /// a fetch counter the reuse assertions read and a PUT log the
+    /// publish-order assertions read.
     struct FakeTree {
         manifests: BTreeMap<String, Vec<u8>>,
-        blobs: BTreeMap<String, Vec<u8>>,
+        blobs: RefCell<BTreeMap<String, Vec<u8>>>,
+        closure_pins: RefCell<BTreeMap<String, String>>,
         blob_gets: Cell<usize>,
+        puts: RefCell<Vec<(String, Vec<u8>)>>,
     }
 
     impl FakeTree {
         fn new() -> Self {
             FakeTree {
                 manifests: BTreeMap::new(),
-                blobs: BTreeMap::new(),
+                blobs: RefCell::new(BTreeMap::new()),
+                closure_pins: RefCell::new(BTreeMap::new()),
                 blob_gets: Cell::new(0),
+                puts: RefCell::new(Vec::new()),
             }
+        }
+
+        /// Record the closure blob + pin doc the way the real publish
+        /// path does (content-addressed).
+        fn publish_closure(&mut self, pkg: &str, bytes: &[u8]) {
+            let pin = nau_core::cache_key::sha256_hex(bytes);
+            self.blobs.borrow_mut().insert(pin.clone(), bytes.to_vec());
+            self.closure_pins.borrow_mut().insert(pkg.to_string(), pin);
         }
 
         fn release(&mut self, pkg: &str, version: &str, revision: u32, content: &[u8]) {
@@ -357,7 +541,7 @@ mod tests {
                 signer: String::new(),
                 signature: String::new(),
             };
-            self.blobs.insert(sha, content.to_vec());
+            self.blobs.borrow_mut().insert(sha, content.to_vec());
             self.manifests
                 .insert(pkg.to_string(), serde_json::to_vec(&manifest).unwrap());
         }
@@ -368,13 +552,163 @@ mod tests {
             Ok(self.manifests.get(pkg).cloned())
         }
 
-        fn blob(&self, sha256: &str) -> miette::Result<Vec<u8>> {
+        fn blob_opt(&self, sha256: &str) -> miette::Result<Option<Vec<u8>>> {
             self.blob_gets.set(self.blob_gets.get() + 1);
-            self.blobs
-                .get(sha256)
-                .cloned()
-                .ok_or_else(|| miette::miette!("missing blob {sha256}"))
+            Ok(self.blobs.borrow().get(sha256).cloned())
         }
+
+        fn closure_pin(&self, pkg: &str) -> miette::Result<Option<String>> {
+            Ok(self.closure_pins.borrow().get(pkg).cloned())
+        }
+
+        fn put_object(&self, key: &str, bytes: &[u8]) -> miette::Result<()> {
+            self.puts
+                .borrow_mut()
+                .push((key.to_string(), bytes.to_vec()));
+            if let Some(sha) = key.strip_prefix("blobs/") {
+                self.blobs
+                    .borrow_mut()
+                    .insert(sha.to_string(), bytes.to_vec());
+            } else if let Some(pkg) = key
+                .strip_prefix("closures/")
+                .and_then(|rest| rest.strip_suffix(".json"))
+            {
+                let pin: ClosurePin = serde_json::from_slice(bytes)
+                    .map_err(|e| miette::miette!("test tree: bad pin doc for {pkg}: {e}"))?;
+                self.closure_pins
+                    .borrow_mut()
+                    .insert(pkg.to_string(), pin.deps_hash);
+            }
+            Ok(())
+        }
+    }
+
+    /// A minimal canonical (SHDEP) archive: one file, `hello`, with
+    /// `world` as its content.
+    fn tiny_closure_blob() -> Vec<u8> {
+        b"F 100644 5 hello\nworldEND\n".to_vec()
+    }
+
+    /// A meta that declares (empty) deps — enough to reach the closure
+    /// lane without any resolver.
+    fn deps_meta(name: &str, version: &str) -> crate::snap::SnapMeta {
+        let mut meta = bare_meta(name, version);
+        meta.deps = Some(nau_core::snap_types::PackageDeps {
+            npm: None,
+            pip: None,
+            cargo: None,
+            go: None,
+        });
+        meta
+    }
+
+    /// A package with no deps never touches the tree or the resolver.
+    #[test]
+    fn deps_none_yields_no_tree_traffic() {
+        let tree = FakeTree::new();
+        let meta = bare_meta("app", "1.0.0");
+        let cache = tempfile::tempdir().unwrap();
+        let out = crate::farm_prefix::ensure_farm_deps_closure(&tree, cache.path(), &meta, || {
+            panic!("the resolver must not run without declared deps")
+        })
+        .unwrap();
+        assert!(out.is_none());
+        assert_eq!(tree.blob_gets.get(), 0);
+        assert!(tree.puts.borrow().is_empty());
+    }
+
+    /// The tree's pin serves the closure: materialized from the blob,
+    /// reused without a second GET on the next ensure, never republished.
+    #[test]
+    fn tree_pin_serves_materialized_closure() {
+        let mut tree = FakeTree::new();
+        tree.publish_closure("app", &tiny_closure_blob());
+        let meta = deps_meta("app", "1.0.0");
+        let cache = tempfile::tempdir().unwrap();
+
+        let out = crate::farm_prefix::ensure_farm_deps_closure(&tree, cache.path(), &meta, || {
+            panic!("a tree hit must not resolve")
+        })
+        .unwrap()
+        .expect("a tree hit yields a dir");
+        let content = std::fs::read_to_string(out.join("hello")).unwrap();
+        assert_eq!(content, "world", "the canonical archive unpacked");
+        assert_eq!(tree.blob_gets.get(), 1);
+        assert!(
+            tree.puts.borrow().is_empty(),
+            "a tree hit publishes nothing"
+        );
+
+        let again =
+            crate::farm_prefix::ensure_farm_deps_closure(&tree, cache.path(), &meta, || {
+                panic!("a complete cache dir must not resolve")
+            })
+            .unwrap()
+            .expect("the second ensure returns the same dir");
+        assert_eq!(again, out);
+        assert_eq!(tree.blob_gets.get(), 1, "the complete dir skips the GET");
+    }
+
+    /// A tree miss resolves, publishes blob-then-pin-doc, materializes,
+    /// and a second ensure takes the pin path (no second resolve).
+    #[test]
+    fn tree_miss_resolves_publishes_and_materializes() {
+        let tree = FakeTree::new();
+        let meta = deps_meta("app", "1.0.0");
+        let cache = tempfile::tempdir().unwrap();
+        let resolved = std::cell::Cell::new(0);
+
+        let out = crate::farm_prefix::ensure_farm_deps_closure(&tree, cache.path(), &meta, || {
+            resolved.set(resolved.get() + 1);
+            Ok(tiny_closure_blob())
+        })
+        .unwrap()
+        .expect("a resolved closure yields a dir");
+
+        let pin = nau_core::cache_key::sha256_hex(&tiny_closure_blob());
+        assert!(out.ends_with(format!("deps-{pin}")), "dir named by the pin");
+        let puts = tree.puts.borrow();
+        assert_eq!(puts.len(), 2, "blob + pin doc: {:?}", puts);
+        assert_eq!(puts[0].0, format!("blobs/{pin}"), "blob lands first");
+        assert_eq!(puts[1].0, "closures/app.json", "pin doc lands second");
+        assert_eq!(
+            puts[1].1,
+            format!("{{\"deps_hash\":\"{pin}\"}}").into_bytes(),
+            "the pin doc names the blob"
+        );
+        drop(puts);
+        assert_eq!(resolved.get(), 1);
+
+        // The published pin serves the next build: no second resolve, no
+        // second publish.
+        let again =
+            crate::farm_prefix::ensure_farm_deps_closure(&tree, cache.path(), &meta, || {
+                panic!("the published pin must preempt resolution")
+            })
+            .unwrap()
+            .expect("the pin doc yields the dir");
+        assert_eq!(again, out);
+        assert_eq!(tree.puts.borrow().len(), 2, "nothing republished");
+    }
+
+    /// A blob whose bytes do not hash to the recorded pin is a broken
+    /// tree — hard error, never a fallback to the resolver.
+    #[test]
+    fn corrupt_closure_blob_refuses() {
+        let tree = FakeTree::new();
+        let pin = nau_core::cache_key::sha256_hex(b"");
+        tree.blobs
+            .borrow_mut()
+            .insert(pin.clone(), b"not the empty string".to_vec());
+        tree.closure_pins.borrow_mut().insert("app".into(), pin);
+        let meta = deps_meta("app", "1.0.0");
+        let cache = tempfile::tempdir().unwrap();
+
+        let err = crate::farm_prefix::ensure_farm_deps_closure(&tree, cache.path(), &meta, || {
+            panic!("a broken tree must fall hard, never to the resolver")
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("hash mismatch"), "{err:#}");
     }
 
     fn bare_meta(name: &str, version: &str) -> crate::snap::SnapMeta {
@@ -512,7 +846,7 @@ mod tests {
     fn missing_pinned_blob_is_a_hard_error_not_a_fallback() {
         let mut tree = FakeTree::new();
         tree.release("dep", "1.0", 1, b"tool v1 bytes");
-        tree.blobs.clear(); // a broken tree: manifest pins, blobs gone
+        tree.blobs.borrow_mut().clear(); // a broken tree: manifest pins, blobs gone
         let cache = tempfile::tempdir().unwrap();
         let meta = bare_meta("dep", "1.0");
         let mut building = Vec::new();
