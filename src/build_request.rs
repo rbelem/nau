@@ -447,13 +447,25 @@ impl BuildStep for PoolBuild {
         // doc, resolved + published by this build on a first miss. The
         // resolver is the pod's own path — the recipe's shipped input
         // locks pin it, so both sides pack identical bytes.
-        let deps_dir =
-            crate::farm_prefix::ensure_farm_deps_closure(&self.tree, &cache, meta, || {
+        // The interpreted-deps closure (#338-b): tree-first via the pin
+        // doc, resolved + published by this build on a first miss. The
+        // resolver is the pod's own path — the recipe's shipped input
+        // locks pin it, so both sides pack identical bytes. The pin is
+        // validated against the recipe-dep key, so a recipe or lock edit
+        // re-resolves instead of freezing at the first publish.
+        let dep_key = crate::farm_prefix::recipe_dep_key(recipe, meta)?;
+        let deps_dir = crate::farm_prefix::ensure_farm_deps_closure(
+            &self.tree,
+            &cache,
+            meta,
+            &dep_key,
+            || {
                 let deps = meta.deps.as_ref().ok_or_else(|| {
                     miette::miette!("internal: closure resolution for a package with no deps")
                 })?;
                 nau_chart::dep_fetch::resolve_closure_bytes(meta, deps, recipe.parent())
-            })?;
+            },
+        )?;
 
         let snap_name: Mutex<Option<String>> = Mutex::new(None);
         let graph = BTreeMap::from([(request.package.clone(), Vec::new())]);
