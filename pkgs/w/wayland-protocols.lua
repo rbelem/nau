@@ -7,7 +7,15 @@
 -- (wl-clipboard reads its pkgdatadir to locate the XML files).
 --
 -- Requires: nothing (XML + pkg-config metadata only)
--- build_deps: meson (pulls python transitively), ninja, pkg-config
+-- build_deps: meson (pulls python transitively), ninja, pkg-config,
+--             wayland (the scanner: meson generates the enum headers
+--             with wayland-scanner unconditionally, and the host's
+--             scanner is too old for the staging protocol XML —
+--             "XML failed validation against built-in DTD" killed the
+--             wl-clipboard farm drain, 2026-10-04. The old note that
+--             this package is consumed before wayland exists in the
+--             pool is obsolete: wayland 1.26.0 is packaged, so the
+--             bootstrap cycle it avoided is gone.)
 
 return {
     default = snap {
@@ -45,6 +53,6 @@ return {
 
         type = "source",
         requires = {},
-        build_deps = { "meson", "ninja", "pkg-config" },
+        build_deps = { "meson", "ninja", "pkg-config", "wayland" },
     },
 }
