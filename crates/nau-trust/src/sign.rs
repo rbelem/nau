@@ -965,6 +965,81 @@ mod tests {
         );
     }
 
+    // ── ssh-format anchors ──
+
+    /// Serialize `kp.public` as an `ssh-ed25519` public line — the wire
+    /// blob is u32be(11) ++ "ssh-ed25519" ++ u32be(32) ++ key (51 bytes).
+    fn ssh_pub_line(kp: &KeyPair) -> String {
+        use base64::Engine as _;
+        let mut blob = Vec::with_capacity(51);
+        blob.extend_from_slice(&11u32.to_be_bytes());
+        blob.extend_from_slice(b"ssh-ed25519");
+        blob.extend_from_slice(&32u32.to_be_bytes());
+        blob.extend_from_slice(&kp.public);
+        format!(
+            "ssh-ed25519 {} nau-test-anchor",
+            base64::engine::general_purpose::STANDARD.encode(blob)
+        )
+    }
+
+    #[test]
+    fn ssh_format_anchor_is_parsed_as_a_trust_anchor() {
+        let (_, kp) = temp_keypair();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("operator.pub"),
+            format!("{}\n", ssh_pub_line(&kp)),
+        )
+        .unwrap();
+        let chain = Keychain::load_dir(dir.path()).unwrap();
+        assert!(
+            chain.key_ids().contains(&kp.key_id()),
+            "ssh-format anchor lands under the same key id: {:?}",
+            chain.key_ids()
+        );
+        // The decoded 32 bytes are THE key: a manifest it signed verifies.
+        let mut manifest = minimal_manifest();
+        cosign(&mut manifest, &kp).unwrap();
+        let bytes = eval_manifest_canonical_bytes(&manifest).unwrap();
+        let verified = verify_keychain(&bytes, &manifest.signatures, &chain).unwrap();
+        assert_eq!(verified, kp.key_id());
+    }
+
+    #[test]
+    fn ssh_format_non_ed25519_refuses_naming_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("rsa.pub"),
+            "ssh-rsa AAAAB3NzaC1yc2E alice@host\n",
+        )
+        .unwrap();
+        let err = Keychain::load_dir(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("rsa.pub"), "names the file: {err}");
+        assert!(err.contains("ssh-rsa"), "names the key type: {err}");
+    }
+
+    #[test]
+    fn ssh_format_corrupt_body_refuses_naming_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("broken.pub"),
+            "ssh-ed25519 !!!not-base64!!! x@y\n",
+        )
+        .unwrap();
+        let err = Keychain::load_dir(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("broken.pub"), "names the file: {err}");
+    }
+
+    #[test]
+    fn legacy_single_anchor_accepts_ssh_format() {
+        let (_, kp) = temp_keypair();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("downloaded.pub");
+        std::fs::write(&path, format!("{}\n", ssh_pub_line(&kp))).unwrap();
+        let chain = Keychain::load_pub_file(&path).unwrap();
+        assert_eq!(chain.key_ids(), vec![kp.key_id()]);
+    }
+
     // ── Rotation promotion (ADR-0024 §4) ──
 
     #[test]
