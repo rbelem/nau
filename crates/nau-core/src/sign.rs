@@ -164,7 +164,8 @@ impl Keychain {
     /// Load every `*.pub` file in `dir` as a trust anchor. A missing
     /// directory is an empty chain (verify fails closed); a present but
     /// unparseable anchor is a named error — corrupt trust anchors are
-    /// never silently skipped.
+    /// never silently skipped. Both anchor formats load: the ceremony's
+    /// raw-hex two-line shape and `ssh-ed25519` public lines.
     pub fn load_dir(dir: &Path) -> miette::Result<Keychain> {
         let mut chain = Keychain::default();
         let Ok(read) = std::fs::read_dir(dir) else {
@@ -227,21 +228,71 @@ impl Keychain {
     }
 }
 
-/// Parse one public-key file (the two-line anchor format: an optional
-/// `untrusted comment:` line, then the 64-hex public key). The single
-/// parser behind [`Keychain::load_dir`] and [`Keychain::load_pub_file`].
+/// Parse one public-key file. Two anchor formats are accepted: the
+/// ceremony's two-line shape (an optional `untrusted comment:` line,
+/// then the 64-hex public key) and an `ssh-ed25519` public line
+/// (`ssh-ed25519 <base64> <comment>`), which operators drop in from
+/// the SSH side. Anything else is a named error whose TOP-level
+/// message carries the file path — corrupt trust anchors are never
+/// silently skipped, and the path is not buried in the cause chain.
+/// The single parser behind [`Keychain::load_dir`] and
+/// [`Keychain::load_pub_file`].
 fn parse_pub_file(path: &Path) -> miette::Result<(String, [u8; 32])> {
     let text = std::fs::read_to_string(path)
         .into_diagnostic()
         .wrap_err_with(|| format!("reading {}", path.display()))?;
-    let public_hex = text
+    let line = text
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty() && !l.starts_with("untrusted comment:"))
         .ok_or_else(|| {
             miette::miette!("public key file {} carries no key material", path.display())
         })?;
-    let public = from_hex32(public_hex).wrap_err_with(|| format!("parsing {}", path.display()))?;
+    if line.split_whitespace().count() > 1 {
+        return parse_ssh_pub_line(path, line);
+    }
+    let public = from_hex32(line).map_err(|e| {
+        miette::miette!(
+            "public key file {} is not a valid anchor: {e} — expected 64 hex chars \
+             or an `ssh-ed25519` public line",
+            path.display()
+        )
+    })?;
+    Ok((to_hex(&public)[..16].to_string(), public))
+}
+
+/// Decode an `ssh-ed25519` public line: the base64 wire blob is
+/// u32be(11) ++ "ssh-ed25519" ++ u32be(32) ++ key (51 bytes total).
+/// Other ssh key types cannot sign ed25519 manifests — a named
+/// refusal naming the file, never a skip.
+fn parse_ssh_pub_line(path: &Path, line: &str) -> miette::Result<(String, [u8; 32])> {
+    let mut fields = line.split_whitespace();
+    let key_type = fields.next().unwrap_or_default();
+    if key_type != "ssh-ed25519" {
+        return Err(miette::miette!(
+            "public key file {} carries ssh key type '{key_type}' — only ssh-ed25519 \
+             keys can anchor manifest verification",
+            path.display()
+        ));
+    }
+    let blob_b64 = fields.next().unwrap_or_default();
+    let blob = base64::engine::general_purpose::STANDARD
+        .decode(blob_b64)
+        .map_err(|e| {
+            miette::miette!(
+                "public key file {} carries a malformed ssh-ed25519 body: {e}",
+                path.display()
+            )
+        })?;
+    let mut public = [0u8; 32];
+    if blob.len() != 51 || blob[4..15] != *b"ssh-ed25519" || blob[15..19] != [0, 0, 0, 32] {
+        return Err(miette::miette!(
+            "public key file {} carries a malformed ssh-ed25519 body — expected the \
+             standard 51-byte wire blob",
+            path.display()
+        ));
+    }
+    public.copy_from_slice(&blob[19..51]);
     Ok((to_hex(&public)[..16].to_string(), public))
 }
 

@@ -29,3 +29,5 @@ serde_json = "1"
 tempfile = "3"
 # the golden-attestation and keypair fixtures derive SigningKeys.
 ed25519-dalek = "2"
+# ssh-format anchor fixtures build the ssh-ed25519 wire blob.
+base64 = "0.22"
