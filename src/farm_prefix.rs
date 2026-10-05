@@ -383,6 +383,12 @@ fn tree_payload<T: TreeSource>(
     manifest_bytes: &Option<Vec<u8>>,
 ) -> miette::Result<Option<String>> {
     let Some(bytes) = manifest_bytes else {
+        // #347: the fallthrough itself must be loud — an unreleased member
+        // (a gcc nobody asked for) is otherwise untraceable in the drain log.
+        crate::output::status(format!(
+            "no tree manifest for {name} {} — building it locally",
+            dep_meta.version,
+        ));
         return Ok(None);
     };
     let manifest: nau_core::pkg_manifest::PackageManifest =
@@ -1030,5 +1036,103 @@ mod tests {
             ensure_farm_dep_payload(&tree, cache.path(), "dep", &meta, "amd64", &mut building)
                 .expect_err("a pinned-but-missing blob is a broken tree");
         assert!(err.to_string().contains("missing"), "{err}");
+    }
+
+    // output::status writes to the process stderr, and the harness's
+    // capture hook intercepts eprintln! on every thread of this process —
+    // fd redirection cannot see the bytes. So these tests respawn THIS
+    // test binary filtered to themselves with --nocapture: the child
+    // takes the real stderr path (the same child-process shape the #344
+    // CLI tests use), and it also runs the behavior assertions, so a
+    // green child plus the expected line proves emission and content.
+    const CHILD_FLAG: &str = "NAU_TEST_FALLTHROUGH_CHILD";
+
+    fn respawn_child(self_name: &str) -> std::process::Output {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([self_name, "--exact", "--nocapture"])
+            .env(CHILD_FLAG, "1")
+            .output()
+            .expect("respawning the test binary must work")
+    }
+
+    #[test]
+    fn missing_tree_manifest_reports_the_local_build_fallthrough() {
+        if std::env::var(CHILD_FLAG).is_ok() {
+            let tree = FakeTree::new(); // no release(): the member is unreleased
+            let cache = tempfile::tempdir().unwrap();
+            let meta = bare_meta("dep", "1.0");
+            let served = tree_payload(
+                &tree,
+                cache.path(),
+                "dep",
+                &meta,
+                "amd64",
+                &tree.manifest("dep").unwrap(),
+            )
+            .unwrap();
+            assert_eq!(served, None, "a missing manifest is not a tree hit");
+            return;
+        }
+        let out = respawn_child(concat!(
+            "farm_prefix::tests::",
+            "missing_tree_manifest_reports_the_local_build_fallthrough"
+        ));
+        assert!(
+            out.status.success(),
+            "the child must pass its behavior assertions: {out:?}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("no tree manifest for dep 1.0"),
+            "the fallthrough must name the member and its version: {stderr}"
+        );
+        assert!(
+            stderr.contains("building it locally"),
+            "the fallthrough must say the member builds locally: {stderr}"
+        );
+    }
+
+    #[test]
+    fn tree_hit_emits_no_local_build_fallthrough_line() {
+        if std::env::var(CHILD_FLAG).is_ok() {
+            let mut tree = FakeTree::new();
+            tree.release("dep", "1.0", 1, b"tool v1 bytes");
+            let cache = tempfile::tempdir().unwrap();
+            let meta = bare_meta("dep", "1.0");
+            let served = tree_payload(
+                &tree,
+                cache.path(),
+                "dep",
+                &meta,
+                "amd64",
+                &tree.manifest("dep").unwrap(),
+            )
+            .unwrap();
+            assert_eq!(served.as_deref(), Some("1.0"));
+            return;
+        }
+        let out = respawn_child(concat!(
+            "farm_prefix::tests::",
+            "tree_hit_emits_no_local_build_fallthrough_line"
+        ));
+        assert!(
+            out.status.success(),
+            "the child must pass its behavior assertions: {out:?}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // The channel check: the materialize line DID reach this stderr,
+        // so its silence about the fallthrough is meaningful.
+        assert!(
+            stderr.contains("tree payload for dep 1.0 materialized"),
+            "the tree-hit status line must flow to stderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("no tree manifest"),
+            "a tree hit must not report a missing manifest: {stderr}"
+        );
+        assert!(
+            !stderr.contains("building it locally"),
+            "a tree hit must not report a local-build fallthrough: {stderr}"
+        );
     }
 }
