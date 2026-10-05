@@ -37,6 +37,7 @@
 
 pub mod aws;
 pub mod azure;
+pub mod funnel;
 pub mod gcp;
 pub mod hetzner;
 pub mod publish;
@@ -243,7 +244,19 @@ pub fn provision_verb(
     // publicly and a created server had to be torn down). Refuse before
     // any API call. A dry run makes no API call and installs nothing —
     // the probe is skipped there.
-    if !dry_run {
+    // The publish channel resolves FIRST (env + disk, no API): when it
+    // names this node's funnel, the funnel is stood up and PREFLIGHTED
+    // before the binary probe, so a dead channel dies here by name —
+    // never at the first guest publish after the servers are billing
+    // (ADR-0055 Decision 1, #350).
+    let publish = run_publish_channel(dry_run)?;
+    if let Some(channel) = &publish {
+        funnel::funnel_window_up(
+            &nau_infra::command::RealRunner,
+            &channel.url,
+            funnel::FUNNEL_PREFLIGHT_TRIES,
+            funnel::FUNNEL_PREFLIGHT_SLEEP,
+        )?;
         probe_binary_url(&nau_infra::command::RealRunner, &default_binary_url())?;
     }
     let req = ProvisionRequest {
@@ -260,7 +273,7 @@ pub fn provision_verb(
         config: PathBuf::from(file),
         ca_fingerprint: run_ca_fingerprint(dry_run)?,
     };
-    provision_main(provider, req, run_publish_channel(dry_run)?)
+    provision_main(provider, req, publish)
 }
 
 /// The worker-binary preflight: HEAD the URL cloud-init will install
@@ -302,11 +315,17 @@ fn probe_binary_url(
 }
 
 /// The `destroy` verb body, scalar entry: destroy one server by name and
-/// evict its config pin.
+/// evict its config pin. When that evict drains the managed block, the
+/// funnel goes with it (ADR-0055 Decision 1) — the last destroy closes
+/// the channel no guest needs anymore; a mid-window destroy leaves it
+/// up for the workers still pinned.
 pub fn destroy_verb(provider: &str, name: &str, file: &str) -> miette::Result<()> {
     let provisioner = provider_for(provider, None)?;
     let evicted = provisioner.destroy(name, Path::new(file))?;
     nau_infra::output::ok(destroy_summary(name, evicted));
+    if evicted {
+        funnel::funnel_down_if_drained(Path::new(file))?;
+    }
     Ok(())
 }
 
@@ -713,6 +732,17 @@ pub fn burst_main(
             ))
         }
     };
+    let publish_url = channel.as_ref().map(|c| c.url.clone()).unwrap_or_default();
+    // The burst IS a provision: its window fronts the same funnel, so
+    // it is stood up and preflighted before the first create (ADR-0055
+    // Decision 1, #350); the teardown below closes it when the block
+    // drains.
+    funnel::funnel_window_up(
+        &nau_infra::command::RealRunner,
+        &publish_url,
+        funnel::FUNNEL_PREFLIGHT_TRIES,
+        funnel::FUNNEL_PREFLIGHT_SLEEP,
+    )?;
     let provisioner = provider_for(provider, channel)?;
     let code = run_burst(
         provisioner.as_ref(),
@@ -800,6 +830,9 @@ pub fn run_burst(
             stuck = stuck.join(", ")
         ));
     }
+    // Window over and the block drained — the funnel goes with the
+    // workers it fronted (ADR-0055 Decision 1, #350).
+    funnel::funnel_down_if_drained(&req.config)?;
     Ok(code)
 }
 
@@ -927,6 +960,10 @@ pub fn run_down_all_managed(
             failed = failed.join(", ")
         ));
     }
+    // Full drain — the funnel goes with the last worker it fronted
+    // (ADR-0055 Decision 1, #350). Skipped on any failure: survivors
+    // still publish through it.
+    funnel::funnel_down_if_drained(config)?;
     nau_infra::output::ok(format!(
         "down: destroyed {} managed worker(s) — the block in {} is empty now",
         entries.len(),
