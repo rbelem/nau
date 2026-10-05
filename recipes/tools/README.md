@@ -13,6 +13,19 @@ manifest.
 | `build-tool.sh` | Downloads (sha256-verified) + builds one tool in the pinned Alpine container; gates: static (`file`+`ldd`), strip, exec smoke |
 | `gen-manifest.sh` | Generates `tools-manifest.toml` from built artifacts + pins |
 
+Cross-worker replication of the pinned bytes is scripted:
+`scripts/tools-verify.sh` (#353) prints a per-artifact verdict table —
+source tarballs sha256'd against `pins.conf`, built binaries sha256'd
+against a `gen-manifest.sh` manifest (or explicit `--expect-sha256`
+byte pins) plus the same version smoke `build-tool.sh` gates builds
+with — and `--rebuild` delegates to `build-tool.sh`'s gated path:
+
+```sh
+scripts/tools-verify.sh --downloads /tmp/dl                 # sources
+scripts/tools-verify.sh --rebuild --downloads /tmp/dl --out /tmp/out
+scripts/tools-verify.sh --out /tmp/out --manifest tools-manifest.toml
+```
+
 Builder choice: pinned-digest Alpine 3.20 container (runner Docker, musl
 `-static` packages), not nix `pkgsStatic` — see the header comment in
 `build-tool.sh`.
