@@ -33,16 +33,6 @@ return {
             url = "https://ftp.gnu.org/gnu/coreutils/coreutils-9.11.tar.xz",
         },
         build = "./configure --prefix=/usr --without-selinux && make && make install DESTDIR=$STAGE",
-        apps = {
-            -- Seam tools for the farm wrappers: every ld-wrapper locates
-            -- itself through these names first. They must stay uniquely
-            -- named: farm-first PATH would resolve bare `readlink` or
-            -- `dirname` to the farm itself, recursing forever. Hosts with
-            -- system coreutils never call them (bare names stay first
-            -- there via the wrapper fallback).
-            ["nau-readlink"] = app { command = "usr/bin/readlink" },
-            ["nau-dirname"] = app { command = "usr/bin/dirname" },
-        },
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22),
         -- the tree/tmux/htop/tig precedent: the nix gcc wrapper bakes
         -- RUNPATH=/nau-build-prefix/usr/lib64 into the binaries, and
