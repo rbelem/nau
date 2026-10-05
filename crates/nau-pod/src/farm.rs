@@ -687,6 +687,11 @@ fn reset_ld_wrappers(store: &StoreView, n: u64) -> miette::Result<()> {
 /// SET, never compose-prepend: the pod's libraries ride only this
 /// process, and whatever ambient `LD_LIBRARY_PATH` the caller carried
 /// stops at the wrapper (#110).
+/// Self-location prefers the seam tools `nau-readlink`/`nau-dirname`
+/// (claimed by coreutils) over bare `readlink`/`dirname`: with
+/// farm-first PATH, bare names would resolve to the farm itself on
+/// hosts without system coreutils, and unique names cannot do that.
+/// Hosts with system tools keep today's bare path as the fallback.
 fn write_ld_wrapper(
     store: &StoreView,
     n: u64,
@@ -711,7 +716,8 @@ fn write_ld_wrapper(
     // usr/usr/bin; without this the driver dies at posix_spawnp on a
     // caller whose PATH has no binutils. Inert for non-compiler apps.
     let body = format!(
-        "#!/bin/sh\nd=$(dirname \"$(readlink -f \"$0\")\")\n\
+        "#!/bin/sh\n\
+         if command -v nau-readlink >/dev/null 2>&1 && command -v nau-dirname >/dev/null 2>&1; then d=$(nau-dirname \"$(nau-readlink -f \"$0\")\"); else d=$(dirname \"$(readlink -f \"$0\")\"); fi\n\
          LD_LIBRARY_PATH=\"{lib_list}\"\n\
          LIBRARY_PATH=\"$LD_LIBRARY_PATH\"\n\
          CPATH=\n\
@@ -1703,6 +1709,18 @@ mod tests {
             "wrapper must exec the real store blob, anchored at its own dir: {wrapper}"
         );
         assert!(wrapper.starts_with("#!/bin/sh"));
+
+        // Self-location prefers the seam tools with the bare names as
+        // the fallback (non-FHS hosts carry the seam tools in the
+        // farm; FHS hosts resolve the bare names from the system).
+        assert!(
+            wrapper.contains("nau-readlink -f"),
+            "wrapper must prefer the seam tools: {wrapper}"
+        );
+        assert!(
+            wrapper.contains("else d=$(dirname"),
+            "wrapper must keep the bare names as the fallback: {wrapper}"
+        );
 
         // The statically-linked app is wrapped too — same rule, same
         // list, exactly like the old shellenv export.
