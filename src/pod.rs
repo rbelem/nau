@@ -1551,10 +1551,17 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
     } else {
         crate::farm::ClaimLayer::Own
     };
-    precheck_binary_collision(root, &decl, &spec.name, &meta, new_layer)?;
+    precheck_collision(root, &decl, &spec.name, &meta, new_layer, ClaimKind::Binary)?;
     // Service-name precheck (ADR-0032 Decision 3): same rules, same
     // zero-writes guarantee.
-    precheck_service_collision(root, &decl, &spec.name, &meta, new_layer)?;
+    precheck_collision(
+        root,
+        &decl,
+        &spec.name,
+        &meta,
+        new_layer,
+        ClaimKind::Service,
+    )?;
 
     let dir = pod_dir(root, pod_name);
     std::fs::create_dir_all(&dir)
@@ -2274,31 +2281,45 @@ fn precheck_payload_collisions(
     for service in payload.services.keys() {
         crate::farm::check_farm_link_name("service binary", service, name)?;
     }
-    let mut binary_claims: Vec<BinaryClaim> = payload
+    let mut binary_claims: Vec<Claim> = payload
         .apps
         .keys()
-        .map(|app| BinaryClaim {
-            binary: app.clone(),
-            pkg: name.to_string(),
+        .map(|app| Claim {
+            kind: ClaimKind::Binary,
+            key: app.clone(),
+            owner: name.to_string(),
             layer,
         })
         .collect();
-    push_declared_binary_claims(&mut binary_claims, decl, name, Some(pins))?;
-    push_loaded_binary_claims(&mut binary_claims, root, decl, name)?;
-    resolve_binary_claims(&binary_claims)?;
+    push_declared_claims(
+        &mut binary_claims,
+        decl,
+        name,
+        Some(pins),
+        ClaimKind::Binary,
+    )?;
+    push_loaded_claims(&mut binary_claims, root, decl, name, ClaimKind::Binary)?;
+    resolve_claims(&binary_claims)?;
 
-    let mut service_claims: Vec<ServiceClaim> = payload
+    let mut service_claims: Vec<Claim> = payload
         .services
         .keys()
-        .map(|service| ServiceClaim {
-            service: service.clone(),
-            pkg: name.to_string(),
+        .map(|service| Claim {
+            kind: ClaimKind::Service,
+            key: service.clone(),
+            owner: name.to_string(),
             layer,
         })
         .collect();
-    push_declared_service_claims(&mut service_claims, decl, name, Some(pins))?;
-    push_loaded_service_claims(&mut service_claims, root, decl, name)?;
-    resolve_service_claims(&service_claims)
+    push_declared_claims(
+        &mut service_claims,
+        decl,
+        name,
+        Some(pins),
+        ClaimKind::Service,
+    )?;
+    push_loaded_claims(&mut service_claims, root, decl, name, ClaimKind::Service)?;
+    resolve_claims(&service_claims)
 }
 
 /// Remove a package from a pod: drop it from the declaration and delete
@@ -2442,8 +2463,8 @@ fn declaration_names(decl: &PodDeclaration) -> std::collections::BTreeSet<String
 /// file. Loaded-pod contributions fold in at `Loaded`, same rule as
 /// `add_package`.
 fn precheck_declare_collisions(root: &Path, decl: &PodDeclaration) -> miette::Result<()> {
-    let mut bin_claims: Vec<BinaryClaim> = Vec::new();
-    let mut svc_claims: Vec<ServiceClaim> = Vec::new();
+    let mut bin_claims: Vec<Claim> = Vec::new();
+    let mut svc_claims: Vec<Claim> = Vec::new();
     for spec_str in &decl.packages {
         let spec = parse_pod_package(spec_str)?;
         let layer = if decl.overlay.contains_key(&spec.name) {
@@ -2457,18 +2478,18 @@ fn precheck_declare_collisions(root: &Path, decl: &PodDeclaration) -> miette::Re
             apply_overlay(&mut meta, patch)
                 .map_err(|e| miette::miette!("overlay of '{}' is invalid: {e}", spec.name))?;
         }
-        push_meta_binary_claims(&mut bin_claims, &meta, layer);
-        push_meta_service_claims(&mut svc_claims, &meta, layer);
+        push_meta_claims(&mut bin_claims, &meta, layer, ClaimKind::Binary);
+        push_meta_claims(&mut svc_claims, &meta, layer, ClaimKind::Service);
     }
     // No `pins`: the incoming file is collection-resolved whole (the
     // sideload path is the one that passes pins). No `new_name` to
     // exclude: every claim comes from the freshly resolved metas above,
     // so the loaded sweep must only skip names the declaration itself
     // carries — any non-name placeholder does that.
-    push_loaded_binary_claims(&mut bin_claims, root, decl, "")?;
-    push_loaded_service_claims(&mut svc_claims, root, decl, "")?;
-    resolve_binary_claims(&bin_claims)?;
-    resolve_service_claims(&svc_claims)
+    push_loaded_claims(&mut bin_claims, root, decl, "", ClaimKind::Binary)?;
+    push_loaded_claims(&mut svc_claims, root, decl, "", ClaimKind::Service)?;
+    resolve_claims(&bin_claims)?;
+    resolve_claims(&svc_claims)
 }
 
 /// Declare a pod from a checked-in `pod.lua` file (gate-pod gap 5):
@@ -3228,20 +3249,18 @@ enum OwnScope {
 /// layer the member occupies in the POST-STATE (own holds claim at
 /// `Own`, loaded holds at `Loaded`, ADR-0048).
 fn hold_style_skip_claims(
-    desktop_claims: &mut Vec<DesktopClaim>,
-    binary_claims: &mut Vec<BinaryClaim>,
-    service_claims: &mut Vec<ServiceClaim>,
+    claims: &mut Vec<Claim>,
     installed_pkg: &crate::runtime::InstalledPackage,
     meta: &crate::snap::SnapMeta,
     layer: crate::farm::ClaimLayer,
 ) {
-    push_desktop_claims(desktop_claims, installed_pkg, layer);
-    push_installed_binary_claims(binary_claims, installed_pkg, layer);
+    push_installed_claims(claims, installed_pkg, layer, ClaimKind::DesktopAppId);
+    push_installed_claims(claims, installed_pkg, layer, ClaimKind::Binary);
     // Services have no installed-record entry yet (the manifest record is
     // ticket #106), so a held pin claims them from the freshly resolved
     // meta — the pin's content only differs when the pin MOVES, and a
     // move rebuilds.
-    push_meta_service_claims(service_claims, meta, layer);
+    push_meta_claims(claims, meta, layer, ClaimKind::Service);
 }
 
 /// True when a freshly resolved own package would be HELD at its
@@ -3326,9 +3345,7 @@ fn hold_plain_sync(
     build.held.push(meta.name.clone());
     if let Some(installed_pkg) = ctx.active.and_then(|g| g.packages.get(&meta.name)) {
         hold_style_skip_claims(
-            &mut build.desktop_claims,
-            &mut build.binary_claims,
-            &mut build.service_claims,
+            &mut build.claims,
             installed_pkg,
             meta,
             crate::farm::ClaimLayer::Own,
@@ -3578,9 +3595,14 @@ fn hold_blob_pinned(
     build
         .requires_seeds
         .extend(installed_pkg.requires.iter().cloned());
-    push_desktop_claims(&mut build.desktop_claims, installed_pkg, layer);
-    push_installed_binary_claims(&mut build.binary_claims, installed_pkg, layer);
-    push_installed_service_claims(&mut build.service_claims, installed_pkg, layer);
+    push_installed_claims(
+        &mut build.claims,
+        installed_pkg,
+        layer,
+        ClaimKind::DesktopAppId,
+    );
+    push_installed_claims(&mut build.claims, installed_pkg, layer, ClaimKind::Binary);
+    push_installed_claims(&mut build.claims, installed_pkg, layer, ClaimKind::Service);
     Ok(())
 }
 
@@ -3807,9 +3829,7 @@ fn scope_own_package(
     if !selected {
         if let Some(installed_pkg) = ctx.active.and_then(|g| g.packages.get(&meta.name)) {
             hold_style_skip_claims(
-                &mut build.desktop_claims,
-                &mut build.binary_claims,
-                &mut build.service_claims,
+                &mut build.claims,
                 installed_pkg,
                 meta,
                 crate::farm::ClaimLayer::Own,
@@ -3882,9 +3902,7 @@ fn scope_own_package(
     if !build.refresh_members.is_empty() && !build.refresh_members.contains(&meta.name) {
         if let Some(installed_pkg) = ctx.active.and_then(|g| g.packages.get(&meta.name)) {
             hold_style_skip_claims(
-                &mut build.desktop_claims,
-                &mut build.binary_claims,
-                &mut build.service_claims,
+                &mut build.claims,
                 installed_pkg,
                 meta,
                 crate::farm::ClaimLayer::Own,
@@ -3931,9 +3949,7 @@ fn hold_baselined_drift(
     }
     let installed = ctx.active.and_then(|g| g.packages.get(&meta.name))?;
     hold_style_skip_claims(
-        &mut build.desktop_claims,
-        &mut build.binary_claims,
-        &mut build.service_claims,
+        &mut build.claims,
         installed,
         meta,
         crate::farm::ClaimLayer::Own,
@@ -4389,9 +4405,7 @@ fn install_pending(
     state: &mut ReconcileState,
     build: &mut ReconcileBuild,
 ) -> miette::Result<Vec<String>> {
-    resolve_desktop_claims(&build.desktop_claims)?;
-    resolve_binary_claims(&build.binary_claims)?;
-    resolve_service_claims(&build.service_claims)?;
+    resolve_claims(&build.claims)?;
     let mut installed = Vec::new();
     if !build.pending.is_empty() {
         let report = state.store.install_batch(
@@ -4431,18 +4445,13 @@ struct ReconcileBuild {
     held: Vec<String>,
     /// Package names of the post-state (own + loaded).
     declared_names: std::collections::BTreeSet<String>,
-    /// Desktop application-ID claims of the post-state package set
-    /// (issue #7): collected in declaration order, resolved for
-    /// collisions BEFORE any store write.
-    desktop_claims: Vec<DesktopClaim>,
-    /// Binary-name claims of the post-state package set (issue #8): the
-    /// shared collision classifier over loaded/own/overlay layers, run
-    /// BEFORE any store write so a same-precedence clash is a hard error
-    /// with zero writes.
-    binary_claims: Vec<BinaryClaim>,
-    /// Service-name claims of the post-state package set (ADR-0032,
-    /// issue #105): same classifier, same pre-write gate.
-    service_claims: Vec<ServiceClaim>,
+    /// Shared-name claims of the post-state package set — desktop
+    /// application IDs (issue #7), binaries (issue #8), services
+    /// (ADR-0032, issue #105) — collected in declaration order with the
+    /// kind tagging each family, resolved for collisions BEFORE any
+    /// store write so a same-precedence clash is a hard error with zero
+    /// writes.
+    claims: Vec<Claim>,
     /// Version pins the reconcile moved (overlay wins over the pin):
     /// recorded only after the build succeeded, applied only after the
     /// install succeeded — a failed reconcile leaves the pin in place.
@@ -4961,9 +4970,9 @@ fn build_own_package(
             return Ok(());
         }
     }
-    push_meta_desktop_claims(&mut build.desktop_claims, meta, layer);
-    push_meta_binary_claims(&mut build.binary_claims, meta, layer);
-    push_meta_service_claims(&mut build.service_claims, meta, layer);
+    push_meta_claims(&mut build.claims, meta, layer, ClaimKind::DesktopAppId);
+    push_meta_claims(&mut build.claims, meta, layer, ClaimKind::Binary);
+    push_meta_claims(&mut build.claims, meta, layer, ClaimKind::Service);
     // Dependency closure first (ADR-0017 Decision 7): fetch or verify
     // BEFORE the sandboxed offline build consumes it. `force_float`
     // floats the closure regardless of the meta's own float mode
@@ -5342,9 +5351,7 @@ fn hold_loaded_member(
     queue_held_loaded_deps_verify(ctx, source_pod, &meta.name, build)?;
     build.held.push(meta.name.clone());
     hold_style_skip_claims(
-        &mut build.desktop_claims,
-        &mut build.binary_claims,
-        &mut build.service_claims,
+        &mut build.claims,
         installed,
         meta,
         crate::farm::ClaimLayer::Loaded,
@@ -5394,20 +5401,23 @@ fn build_loaded_member(
         build.refresh_members.is_empty(),
     ) {
         Ok((pending, _)) => {
-            push_meta_desktop_claims(
-                &mut build.desktop_claims,
+            push_meta_claims(
+                &mut build.claims,
                 meta,
                 crate::farm::ClaimLayer::Loaded,
+                ClaimKind::DesktopAppId,
             );
-            push_meta_binary_claims(
-                &mut build.binary_claims,
+            push_meta_claims(
+                &mut build.claims,
                 meta,
                 crate::farm::ClaimLayer::Loaded,
+                ClaimKind::Binary,
             );
-            push_meta_service_claims(
-                &mut build.service_claims,
+            push_meta_claims(
+                &mut build.claims,
                 meta,
                 crate::farm::ClaimLayer::Loaded,
+                ClaimKind::Service,
             );
             build.pending.push(pending);
             Ok(())
@@ -5521,20 +5531,23 @@ fn install_requires_closure(
             // farm at the Loaded layer. Collected BEFORE the churn
             // check — a byte-identical refresh still materializes the
             // farm entry the member never had.
-            push_meta_desktop_claims(
-                &mut build.desktop_claims,
+            push_meta_claims(
+                &mut build.claims,
                 &dep_meta,
                 crate::farm::ClaimLayer::Loaded,
+                ClaimKind::DesktopAppId,
             );
-            push_meta_binary_claims(
-                &mut build.binary_claims,
+            push_meta_claims(
+                &mut build.claims,
                 &dep_meta,
                 crate::farm::ClaimLayer::Loaded,
+                ClaimKind::Binary,
             );
-            push_meta_service_claims(
-                &mut build.service_claims,
+            push_meta_claims(
+                &mut build.claims,
                 &dep_meta,
                 crate::farm::ClaimLayer::Loaded,
+                ClaimKind::Service,
             );
         }
         if drifted || refresh {
@@ -5776,84 +5789,122 @@ fn present_active(
     })
 }
 
-/// One claim on a desktop application ID (issue #7): which package
-/// claims the id, at which precedence layer.
-#[derive(Debug, Clone)]
-struct DesktopClaim {
-    app_id: String,
-    pkg: String,
-    layer: crate::farm::ClaimLayer,
+// ── Shared-name claims (issues #7/#8, ADR-0032 Decision 3) ──
+
+/// Which shared name a claim is on. The kind selects the collision key
+/// source (desktop apps carrying a `desktop` field / every exported app
+/// / every declared service), the installed-record surface, and the
+/// contract-tested message wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ClaimKind {
+    /// A desktop application ID (issue #7).
+    DesktopAppId,
+    /// A binary name (issue #8).
+    Binary,
+    /// A service name (ADR-0032 Decision 3, issue #105).
+    Service,
 }
 
-/// Collect the desktop application-ID claims of a freshly resolved meta
-/// (a package about to be built): every app carrying a `desktop` field.
-fn push_meta_desktop_claims(
-    claims: &mut Vec<DesktopClaim>,
-    meta: &crate::snap::SnapMeta,
-    layer: crate::farm::ClaimLayer,
-) {
-    for (app_id, app) in &meta.apps {
-        if app.desktop.is_some() {
-            claims.push(DesktopClaim {
-                app_id: app_id.clone(),
-                pkg: meta.name.clone(),
-                layer,
-            });
+impl ClaimKind {
+    /// The noun the family's warning lines open with ("application id
+    /// 'x'", "binary 'x'", "service 'x'").
+    fn label(self, key: &str) -> String {
+        match self {
+            ClaimKind::DesktopAppId => format!("application id '{key}'"),
+            ClaimKind::Binary => format!("binary '{key}'"),
+            ClaimKind::Service => format!("service '{key}'"),
+        }
+    }
+
+    /// The noun the collection-failure paths name ("cannot check 'x'
+    /// for a binary collision").
+    fn noun(self) -> &'static str {
+        match self {
+            ClaimKind::DesktopAppId => "desktop",
+            ClaimKind::Binary => "binary",
+            ClaimKind::Service => "service",
+        }
+    }
+
+    /// The same-precedence hard-error text. CONTRACT-TESTED WORDING:
+    /// the collision tests run through the sync tail and assert exact
+    /// fragments (`tests/pod_desktop.rs`, `tests/pod_loads.rs`,
+    /// `tests/pod_services.rs`) — do not reword.
+    fn same_precedence_error(self, key: &str, existing: &str, incoming: &str) -> String {
+        match self {
+            ClaimKind::DesktopAppId => format!(
+                "application id '{key}' is declared by both '{existing}' and '{incoming}' \
+                 at the same precedence — same-precedence desktop app-ID collision; rename \
+                 one of the apps or drop one of the packages"
+            ),
+            ClaimKind::Binary => format!(
+                "'{key}' is shipped by both '{existing}' and '{incoming}' at the \
+                 same-precedence layer (loaded/own/overlay layering) — rename one of the \
+                 packages or drop one of them"
+            ),
+            ClaimKind::Service => format!(
+                "service '{key}' is declared by both '{existing}' and '{incoming}' at the \
+                 same precedence — same-precedence service-name collision; rename one of \
+                 the services or drop one of the packages (ADR-0032 Decision 3)"
+            ),
         }
     }
 }
 
-/// Collect the desktop application-ID claims of an already-installed
-/// package (a held pin): the ids recorded in its manifest entry.
-fn push_desktop_claims(
-    claims: &mut Vec<DesktopClaim>,
-    pkg: &crate::runtime::InstalledPackage,
+/// One claim on a shared name — a desktop application ID (issue #7), a
+/// binary name (issue #8), or a service name (ADR-0032 Decision 3):
+/// which package claims the name, at which composition precedence
+/// layer. Generalized from the desktop-ID claim so the shared
+/// classifier ([`crate::farm::classify_collision`]) runs unchanged
+/// across the three families.
+#[derive(Debug, Clone)]
+struct Claim {
+    kind: ClaimKind,
+    /// The claimed name (the collision key, scoped to the kind).
+    key: String,
+    /// The package making the claim.
+    owner: String,
     layer: crate::farm::ClaimLayer,
-) {
-    for app_id in pkg.desktops.keys() {
-        claims.push(DesktopClaim {
-            app_id: app_id.clone(),
-            pkg: pkg.name.clone(),
-            layer,
-        });
-    }
 }
 
-/// Resolve desktop application-ID collisions across the post-state
-/// package set (issue #7). Same-precedence duplicates are a hard error
-/// (zero writes — this runs before the install); a higher layer
-/// overriding a lower one, or a lower one being shadowed, warns and the
-/// higher layer wins. Declaration order breaks ties: the later package
-/// is the incoming claim.
-fn resolve_desktop_claims(claims: &[DesktopClaim]) -> miette::Result<()> {
-    let mut incumbent: BTreeMap<String, DesktopClaim> = BTreeMap::new();
+/// Resolve shared-name collisions across a claim table (issues #7/#8,
+/// ADR-0032 Decision 3). Same-precedence duplicates are a hard error
+/// (the callers run BEFORE any store write, so a collision means zero
+/// writes); a higher layer overriding a lower one, or a lower one being
+/// shadowed, warns and the higher layer wins. Declaration order breaks
+/// ties: the later claim is the incoming one. Cross-kind keys never
+/// meet — the incumbent key is (kind, name) — so one table holds all
+/// three families.
+fn resolve_claims(claims: &[Claim]) -> miette::Result<()> {
+    let mut incumbent: BTreeMap<(ClaimKind, &str), &Claim> = BTreeMap::new();
     for claim in claims {
-        let Some(existing) = incumbent.get(&claim.app_id) else {
-            incumbent.insert(claim.app_id.clone(), claim.clone());
+        let key = (claim.kind, claim.key.as_str());
+        let Some(existing) = incumbent.get(&key) else {
+            incumbent.insert(key, claim);
             continue;
         };
         match crate::farm::classify_collision(existing.layer, claim.layer) {
-            crate::farm::CollisionVerdict::Error => {
-                miette::bail!(
-                    "application id '{}' is declared by both '{}' and '{}' at the same \
-                     precedence — same-precedence desktop app-ID collision; rename one of \
-                     the apps or drop one of the packages",
-                    claim.app_id,
-                    existing.pkg,
-                    claim.pkg
-                );
-            }
+            crate::farm::CollisionVerdict::Error => miette::bail!(
+                "{}",
+                claim
+                    .kind
+                    .same_precedence_error(&claim.key, &existing.owner, &claim.owner)
+            ),
             crate::farm::CollisionVerdict::Override => {
                 crate::output::warn(format!(
-                    "application id '{}' from '{}' overrides '{}' (higher layer wins)",
-                    claim.app_id, claim.pkg, existing.pkg
+                    "{} from '{}' overrides '{}' (higher layer wins)",
+                    claim.kind.label(&claim.key),
+                    claim.owner,
+                    existing.owner
                 ));
-                incumbent.insert(claim.app_id.clone(), claim.clone());
+                incumbent.insert(key, claim);
             }
             crate::farm::CollisionVerdict::Shadowed => {
                 crate::output::warn(format!(
-                    "application id '{}' from '{}' is shadowed by '{}' (lower layer loses)",
-                    claim.app_id, claim.pkg, existing.pkg
+                    "{} from '{}' is shadowed by '{}' (lower layer loses)",
+                    claim.kind.label(&claim.key),
+                    claim.owner,
+                    existing.owner
                 ));
             }
         }
@@ -5861,43 +5912,120 @@ fn resolve_desktop_claims(claims: &[DesktopClaim]) -> miette::Result<()> {
     Ok(())
 }
 
-// ── Binary-name claims (issue #8) ──
+/// Collect one family of a freshly resolved meta's claims (a package
+/// about to be built): desktop application IDs from every app carrying
+/// a `desktop` field (issue #7), binary names from every app the
+/// package exports (issue #8), or service names from every declared
+/// service (ADR-0032).
+fn push_meta_claims(
+    claims: &mut Vec<Claim>,
+    meta: &crate::snap::SnapMeta,
+    layer: crate::farm::ClaimLayer,
+    kind: ClaimKind,
+) {
+    match kind {
+        ClaimKind::DesktopAppId => {
+            for (app_id, app) in &meta.apps {
+                if app.desktop.is_some() {
+                    claims.push(Claim {
+                        kind,
+                        key: app_id.clone(),
+                        owner: meta.name.clone(),
+                        layer,
+                    });
+                }
+            }
+        }
+        ClaimKind::Binary => {
+            for app in meta.apps.keys() {
+                claims.push(Claim {
+                    kind,
+                    key: app.clone(),
+                    owner: meta.name.clone(),
+                    layer,
+                });
+            }
+        }
+        ClaimKind::Service => {
+            for service in meta.services.keys() {
+                claims.push(Claim {
+                    kind,
+                    key: service.clone(),
+                    owner: meta.name.clone(),
+                    layer,
+                });
+            }
+        }
+    }
+}
 
-/// Pre-write binary-collision check for `add_package` (issue #8): the
-/// same-precedence clash must fail BEFORE the declaration or lockfile is
-/// written. Collects the binary claims of the post-state package set —
-/// the package being added (already overlaid) plus every existing
-/// declared package — and resolves them. A same-precedence collision
-/// bails (caller writes nothing); a cross-layer override is allowed here
-/// (reconcile warns at activation). Loaded-pod contributions are folded
-/// in at `Loaded` so an add never silently shadows a loaded binary either.
-fn precheck_binary_collision(
+/// Collect one family of an already-installed package's claims (a held
+/// pin): the ids/apps/services recorded in its manifest entry — desktop
+/// application IDs from `desktops` (issue #7), binaries from `apps`
+/// (issue #8), services from `services` (recorded at install time,
+/// issue #106; the blob-pin hold, issue #116, has no fresh meta to read
+/// them from).
+fn push_installed_claims(
+    claims: &mut Vec<Claim>,
+    pkg: &crate::runtime::InstalledPackage,
+    layer: crate::farm::ClaimLayer,
+    kind: ClaimKind,
+) {
+    let keys: Box<dyn Iterator<Item = &String>> = match kind {
+        ClaimKind::DesktopAppId => Box::new(pkg.desktops.keys()),
+        ClaimKind::Binary => Box::new(pkg.apps.keys()),
+        ClaimKind::Service => Box::new(pkg.services.keys()),
+    };
+    for key in keys {
+        claims.push(Claim {
+            kind,
+            key: key.clone(),
+            owner: pkg.name.clone(),
+            layer,
+        });
+    }
+}
+
+/// Pre-write collision check for `add_package` (issues #8, ADR-0032
+/// Decision 3): the same-precedence clash of the incoming package's
+/// `kind` claims with the pod's post-state package set must fail BEFORE
+/// the declaration or lockfile is written. Collects the claims of the
+/// post-state package set — the package being added (already overlaid)
+/// plus every existing declared package — and resolves them. A
+/// same-precedence collision bails (caller writes nothing); a
+/// cross-layer override is allowed here (reconcile warns at
+/// activation). Loaded-pod contributions are folded in at `Loaded` so
+/// an add never silently shadows a loaded claim either.
+fn precheck_collision(
     root: &Path,
     decl: &PodDeclaration,
     new_name: &str,
     new_meta: &crate::snap::SnapMeta,
     new_layer: crate::farm::ClaimLayer,
+    kind: ClaimKind,
 ) -> miette::Result<()> {
-    let mut claims: Vec<BinaryClaim> = Vec::new();
-    push_meta_binary_claims(&mut claims, new_meta, new_layer);
+    let mut claims: Vec<Claim> = Vec::new();
+    push_meta_claims(&mut claims, new_meta, new_layer, kind);
     // No `pins`: `add_package` resolves the incoming package from the
     // collection, so its declared siblings stay collection-resolved
     // (the sideload path passes the pod's own pins first, issue #147).
-    push_declared_binary_claims(&mut claims, decl, new_name, None)?;
-    push_loaded_binary_claims(&mut claims, root, decl, new_name)?;
-    resolve_binary_claims(&claims)
+    push_declared_claims(&mut claims, decl, new_name, None, kind)?;
+    push_loaded_claims(&mut claims, root, decl, new_name, kind)?;
+    resolve_claims(&claims)
 }
 
-/// Collect the binary claims of every declared package except the one
-/// being added, at its layer (own, or overlay when the pod patches it).
-/// With `pins` (the sideload path, issue #147) a sibling the pod pins
-/// and carries resolves from its installed record first — the pod's
-/// own pins/blobs — and only falls back to the collection otherwise.
-fn push_declared_binary_claims(
-    claims: &mut Vec<BinaryClaim>,
+/// Collect one family of every declared package's claims except the
+/// package being added, at its layer (own, or overlay when the pod
+/// patches it). With `pins` (the sideload path, issue #147) a sibling
+/// the pod pins and carries resolves from its installed record first —
+/// the pod's own pins/blobs — and only falls back to the collection
+/// otherwise.
+fn push_declared_claims(
+    claims: &mut Vec<Claim>,
     decl: &PodDeclaration,
     new_name: &str,
     pins: Option<&PodPins<'_>>,
+    kind: ClaimKind,
 ) -> miette::Result<()> {
     for spec_str in &decl.packages {
         let spec = parse_pod_package(spec_str)?;
@@ -5910,226 +6038,35 @@ fn push_declared_binary_claims(
             crate::farm::ClaimLayer::Own
         };
         if let Some(pkg) = pins.and_then(|p| p.carried(&spec.name)) {
-            push_installed_binary_claims(claims, pkg, layer);
+            push_installed_claims(claims, pkg, layer, kind);
             continue;
         }
         let mut meta = load_spec_meta(&spec).map_err(|e| {
-            miette::miette!("cannot check '{}' for a binary collision: {e}", spec.name)
+            miette::miette!(
+                "cannot check '{}' for a {} collision: {e}",
+                spec.name,
+                kind.noun()
+            )
         })?;
         if let Some(patch) = decl.overlay.get(&spec.name) {
             apply_overlay(&mut meta, patch)
                 .map_err(|e| miette::miette!("overlay of '{}' is invalid: {e}", spec.name))?;
         }
-        push_meta_binary_claims(claims, &meta, layer);
+        push_meta_claims(claims, &meta, layer, kind);
     }
     Ok(())
 }
 
-/// Collect the binary claims of loaded-pod-provided packages, folded in
-/// at `Loaded` (the composition floor). A name the pod itself declares is
-/// already claimed at a higher layer, so it is skipped here.
-fn push_loaded_binary_claims(
-    claims: &mut Vec<BinaryClaim>,
+/// Collect one family of loaded-pod-provided packages' claims, folded
+/// in at `Loaded` (the composition floor). A name the pod itself
+/// declares is already claimed at a higher layer, so it is skipped
+/// here.
+fn push_loaded_claims(
+    claims: &mut Vec<Claim>,
     root: &Path,
     decl: &PodDeclaration,
     new_name: &str,
-) -> miette::Result<()> {
-    for (name, constraint) in loaded_package_specs(root, decl)? {
-        let declared = decl.packages.iter().any(|s| {
-            parse_pod_package(s)
-                .map(|p| p.name == name)
-                .unwrap_or(false)
-        });
-        if declared || name == new_name {
-            continue;
-        }
-        let meta = load_meta_memoized(&name, constraint.as_deref()).map_err(|e| {
-            miette::miette!("cannot check loaded '{}' for a binary collision: {e}", name)
-        })?;
-        push_meta_binary_claims(claims, &meta, crate::farm::ClaimLayer::Loaded);
-    }
-    Ok(())
-}
-
-/// One claim on a shared binary name (issue #8): which package exports
-/// the binary, at which composition precedence layer. Generalized from
-/// the desktop-ID claim so the shared classifier runs unchanged.
-#[derive(Debug, Clone)]
-struct BinaryClaim {
-    binary: String,
-    pkg: String,
-    layer: crate::farm::ClaimLayer,
-}
-
-/// Collect the binary-name claims of a freshly resolved meta (a package
-/// about to be built): the name of every app the package exports.
-fn push_meta_binary_claims(
-    claims: &mut Vec<BinaryClaim>,
-    meta: &crate::snap::SnapMeta,
-    layer: crate::farm::ClaimLayer,
-) {
-    for app in meta.apps.keys() {
-        claims.push(BinaryClaim {
-            binary: app.clone(),
-            pkg: meta.name.clone(),
-            layer,
-        });
-    }
-}
-
-/// Collect the binary-name claims of an already-installed package (a
-/// held pin): the apps recorded in its manifest entry.
-fn push_installed_binary_claims(
-    claims: &mut Vec<BinaryClaim>,
-    pkg: &crate::runtime::InstalledPackage,
-    layer: crate::farm::ClaimLayer,
-) {
-    for app in pkg.apps.keys() {
-        claims.push(BinaryClaim {
-            binary: app.clone(),
-            pkg: pkg.name.clone(),
-            layer,
-        });
-    }
-}
-
-/// Collect the service-name claims of an already-installed package: the
-/// service declarations recorded in its manifest entry at install time
-/// (issue #106) — the blob-pin hold (issue #116) has no freshly resolved
-/// meta to read them from.
-fn push_installed_service_claims(
-    claims: &mut Vec<ServiceClaim>,
-    pkg: &crate::runtime::InstalledPackage,
-    layer: crate::farm::ClaimLayer,
-) {
-    for service in pkg.services.keys() {
-        claims.push(ServiceClaim {
-            service: service.clone(),
-            pkg: pkg.name.clone(),
-            layer,
-        });
-    }
-}
-
-/// Resolve binary-name collisions across the post-state package set
-/// (issue #8). Same-precedence duplicates are a hard error (zero writes
-/// — this runs before the install); a higher layer overriding a lower
-/// one warns naming winner and loser; a lower layer being shadowed
-/// warns, the higher layer stays. Declaration order breaks ties: the
-/// later claim is the incoming one.
-fn resolve_binary_claims(claims: &[BinaryClaim]) -> miette::Result<()> {
-    let mut incumbent: BTreeMap<String, BinaryClaim> = BTreeMap::new();
-    for claim in claims {
-        let Some(existing) = incumbent.get(&claim.binary) else {
-            incumbent.insert(claim.binary.clone(), claim.clone());
-            continue;
-        };
-        match crate::farm::classify_collision(existing.layer, claim.layer) {
-            crate::farm::CollisionVerdict::Error => {
-                miette::bail!(
-                    "'{}' is shipped by both '{}' and '{}' at the same-precedence \
-                     layer (loaded/own/overlay layering) — rename one of the packages or \
-                     drop one of them",
-                    claim.binary,
-                    existing.pkg,
-                    claim.pkg
-                );
-            }
-            crate::farm::CollisionVerdict::Override => {
-                crate::output::warn(format!(
-                    "binary '{}' from '{}' overrides '{}' (higher layer wins)",
-                    claim.binary, claim.pkg, existing.pkg
-                ));
-                incumbent.insert(claim.binary.clone(), claim.clone());
-            }
-            crate::farm::CollisionVerdict::Shadowed => {
-                crate::output::warn(format!(
-                    "binary '{}' from '{}' is shadowed by '{}' (lower layer loses)",
-                    claim.binary, claim.pkg, existing.pkg
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-// ── Service-name claims (ADR-0032 Decision 3, issue #105) ──
-
-/// One claim on a service name (ADR-0032): which package declares the
-/// service, at which composition precedence layer. Mirrors the binary
-/// claim so the shared classifier runs unchanged. Package-level pod{}
-/// `services` entries are NOT claims — they configure an existing
-/// service; only a package's declared `services` claims the name.
-#[derive(Debug, Clone)]
-struct ServiceClaim {
-    service: String,
-    pkg: String,
-    layer: crate::farm::ClaimLayer,
-}
-
-/// Pre-write service-collision check for `add_package` (ADR-0032
-/// Decision 3): a same-precedence service-name clash with the pod's
-/// post-state package set must fail BEFORE any write. Mirrors
-/// [`precheck_binary_collision`].
-fn precheck_service_collision(
-    root: &Path,
-    decl: &PodDeclaration,
-    new_name: &str,
-    new_meta: &crate::snap::SnapMeta,
-    new_layer: crate::farm::ClaimLayer,
-) -> miette::Result<()> {
-    let mut claims: Vec<ServiceClaim> = Vec::new();
-    push_meta_service_claims(&mut claims, new_meta, new_layer);
-    push_declared_service_claims(&mut claims, decl, new_name, None)?;
-    push_loaded_service_claims(&mut claims, root, decl, new_name)?;
-    resolve_service_claims(&claims)
-}
-
-/// Collect the service claims of every declared package except the one
-/// being added, at its layer (own, or overlay when the pod patches it).
-/// With `pins` (the sideload path, issue #147) a sibling the pod pins
-/// and carries resolves from its installed record first — the pod's
-/// own pins/blobs — and only falls back to the collection otherwise.
-fn push_declared_service_claims(
-    claims: &mut Vec<ServiceClaim>,
-    decl: &PodDeclaration,
-    new_name: &str,
-    pins: Option<&PodPins<'_>>,
-) -> miette::Result<()> {
-    for spec_str in &decl.packages {
-        let spec = parse_pod_package(spec_str)?;
-        if spec.name == new_name {
-            continue; // the incoming package's claims are already added
-        }
-        let layer = if decl.overlay.contains_key(&spec.name) {
-            crate::farm::ClaimLayer::Overlay
-        } else {
-            crate::farm::ClaimLayer::Own
-        };
-        if let Some(pkg) = pins.and_then(|p| p.carried(&spec.name)) {
-            push_installed_service_claims(claims, pkg, layer);
-            continue;
-        }
-        let mut meta = load_spec_meta(&spec).map_err(|e| {
-            miette::miette!("cannot check '{}' for a service collision: {e}", spec.name)
-        })?;
-        if let Some(patch) = decl.overlay.get(&spec.name) {
-            apply_overlay(&mut meta, patch)
-                .map_err(|e| miette::miette!("overlay of '{}' is invalid: {e}", spec.name))?;
-        }
-        push_meta_service_claims(claims, &meta, layer);
-    }
-    Ok(())
-}
-
-/// Collect the service claims of loaded-pod-provided packages, folded in
-/// at `Loaded` (the composition floor). A package the pod itself declares
-/// is already claimed at a higher layer, so it is skipped here.
-fn push_loaded_service_claims(
-    claims: &mut Vec<ServiceClaim>,
-    root: &Path,
-    decl: &PodDeclaration,
-    new_name: &str,
+    kind: ClaimKind,
 ) -> miette::Result<()> {
     for (name, constraint) in loaded_package_specs(root, decl)? {
         let declared = decl.packages.iter().any(|s| {
@@ -6142,68 +6079,12 @@ fn push_loaded_service_claims(
         }
         let meta = load_meta_memoized(&name, constraint.as_deref()).map_err(|e| {
             miette::miette!(
-                "cannot check loaded '{}' for a service collision: {e}",
-                name
+                "cannot check loaded '{}' for a {} collision: {e}",
+                name,
+                kind.noun()
             )
         })?;
-        push_meta_service_claims(claims, &meta, crate::farm::ClaimLayer::Loaded);
-    }
-    Ok(())
-}
-
-/// Collect the service claims of a freshly resolved meta: the name of
-/// every service the package declares.
-fn push_meta_service_claims(
-    claims: &mut Vec<ServiceClaim>,
-    meta: &crate::snap::SnapMeta,
-    layer: crate::farm::ClaimLayer,
-) {
-    for service in meta.services.keys() {
-        claims.push(ServiceClaim {
-            service: service.clone(),
-            pkg: meta.name.clone(),
-            layer,
-        });
-    }
-}
-
-/// Resolve service-name collisions across the post-state package set
-/// (ADR-0032 Decision 3): same-precedence duplicate service names are a
-/// hard error (zero writes); a higher layer overrides with a warning
-/// naming winner and loser; a lower layer is shadowed with a warning.
-/// Declaration order breaks ties: the later claim is the incoming one.
-fn resolve_service_claims(claims: &[ServiceClaim]) -> miette::Result<()> {
-    let mut incumbent: BTreeMap<String, ServiceClaim> = BTreeMap::new();
-    for claim in claims {
-        let Some(existing) = incumbent.get(&claim.service) else {
-            incumbent.insert(claim.service.clone(), claim.clone());
-            continue;
-        };
-        match crate::farm::classify_collision(existing.layer, claim.layer) {
-            crate::farm::CollisionVerdict::Error => {
-                miette::bail!(
-                    "service '{}' is declared by both '{}' and '{}' at the same \
-                     precedence — same-precedence service-name collision; rename one of \
-                     the services or drop one of the packages (ADR-0032 Decision 3)",
-                    claim.service,
-                    existing.pkg,
-                    claim.pkg
-                );
-            }
-            crate::farm::CollisionVerdict::Override => {
-                crate::output::warn(format!(
-                    "service '{}' from '{}' overrides '{}' (higher layer wins)",
-                    claim.service, claim.pkg, existing.pkg
-                ));
-                incumbent.insert(claim.service.clone(), claim.clone());
-            }
-            crate::farm::CollisionVerdict::Shadowed => {
-                crate::output::warn(format!(
-                    "service '{}' from '{}' is shadowed by '{}' (lower layer loses)",
-                    claim.service, claim.pkg, existing.pkg
-                ));
-            }
-        }
+        push_meta_claims(claims, &meta, crate::farm::ClaimLayer::Loaded, kind);
     }
     Ok(())
 }
@@ -8449,18 +8330,23 @@ pod {
             build.pending
         );
         assert!(
-            build.desktop_claims.iter().any(|c| c.app_id == "tooldesk"
-                && c.pkg == "tool"
-                && c.layer == crate::farm::ClaimLayer::Loaded),
+            build
+                .claims
+                .iter()
+                .any(|c| c.kind == ClaimKind::DesktopAppId
+                    && c.key == "tooldesk"
+                    && c.owner == "tool"
+                    && c.layer == crate::farm::ClaimLayer::Loaded),
             "desktop claims must come from the installed record at the Loaded layer: {:?}",
-            build.desktop_claims
+            build.claims
         );
         assert!(
-            build.binary_claims.iter().any(|c| c.binary == "toolbin"
-                && c.pkg == "tool"
+            build.claims.iter().any(|c| c.kind == ClaimKind::Binary
+                && c.key == "toolbin"
+                && c.owner == "tool"
                 && c.layer == crate::farm::ClaimLayer::Loaded),
             "binary claims must come from the installed record at the Loaded layer: {:?}",
-            build.binary_claims
+            build.claims
         );
     }
 
@@ -8833,11 +8719,15 @@ pod {
             build.pending
         );
         assert!(
-            build.desktop_claims.iter().any(|c| c.app_id == "tooldesk"
-                && c.pkg == "tool"
-                && c.layer == crate::farm::ClaimLayer::Own),
+            build
+                .claims
+                .iter()
+                .any(|c| c.kind == ClaimKind::DesktopAppId
+                    && c.key == "tooldesk"
+                    && c.owner == "tool"
+                    && c.layer == crate::farm::ClaimLayer::Own),
             "claims must come from the installed record at the Own layer: {:?}",
-            build.desktop_claims
+            build.claims
         );
     }
 
