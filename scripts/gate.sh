@@ -48,7 +48,16 @@ if [[ "${NAU_GATE_OUTER:-1}" == "1" ]]; then
             exit 2
             ;;
     esac
+    # The gated tools ride the same nix shell as the compilers — but
+    # `devbox run` REPLACES PATH with the devbox profile, which carries
+    # cryptsetup yet not gnupg, so a PATH-inherited gpg vanishes inside
+    # the inner shell (devbox 0.0.5, 2026-10-05). Resolve gnupg's bin
+    # dir here and have the inner prepend it; if unresolvable, the
+    # inner preflight still fails closed (#291).
+    GPG_BIN="$(nix shell nixpkgs#gnupg -c bash -c 'command -v gpg' 2>/dev/null | tail -1)"
+    GPG_BIN="${GPG_BIN%/*}"
     NAU_GATE_OUTER=0 NAU_GATE_CC="$CC14" NAU_GATE_CXX="$CXX14" \
+        NAU_GATE_TOOLBIN="$GPG_BIN" \
         exec nix shell nixpkgs#gcc14 nixpkgs#gnupg nixpkgs#cryptsetup -c env \
         -u LD_LIBRARY_PATH -u COMPILER_PATH -u LIBRARY_PATH -u CPATH \
         devbox run -- bash "$0"
@@ -56,6 +65,8 @@ fi
 
 export CC="${NAU_GATE_CC:?gate: outer invocation must resolve CC}"
 export CXX="${NAU_GATE_CXX:?gate: outer invocation must resolve CXX}"
+[[ -n "${NAU_GATE_TOOLBIN:-}" && -d "$NAU_GATE_TOOLBIN" ]] && \
+    export PATH="$NAU_GATE_TOOLBIN:$PATH"
 echo "gate: CC=$CC"
 echo "gate: CXX=$CXX"
 "$CC" --version | head -1
@@ -66,6 +77,24 @@ echo "gate: CXX=$CXX"
 # test/clippy/fmt verdict, not a warm incremental rebuild; recompiles
 # get somewhat slower and target/ stays small.
 export CARGO_INCREMENTAL=0
+
+# ── target/ claim (#349): the gate is the heaviest target/ consumer in
+# this checkout — serialize gates against each other and refuse to run
+# under a foreign consumer (a dev-loop sync spawning children from
+# target/debug; a clean mid-flight). The flock is the truth (a dead
+# holder releases it); the advert line is the readable holder name.
+mkdir -p target
+exec 9>>target/.claim
+if ! flock -n 9; then
+    echo "gate: FAIL — target/ is held by:" >&2
+    echo "  $(cat target/.claim 2>/dev/null || echo '(no advert file)')" >&2
+    echo "  wait for the holder; only clear target/.claim if it is" \
+         "provably stale (#349)." >&2
+    exit 2
+fi
+printf '%s gate %s\n' "$$" "$(date -Is)" >target/.claim
+trap 'flock -u 9; : > target/.claim' EXIT
+echo "gate: claim axis: target/ claimed (pid $$)"
 
 # ── Gated-suite tool preflight (#291): a tool absent in the gate is a
 # FAIL, not a silent skip. The gated tests check NAU_GATE=1 too, so
