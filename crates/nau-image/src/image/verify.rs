@@ -1649,6 +1649,41 @@ mod tests {
         assert_eq!(key_id, kp.key_id(), "--key anchors the downloaded trust");
     }
 
+    /// Serialize `kp.public` as an `ssh-ed25519` public line — the wire
+    /// blob is u32be(11) ++ "ssh-ed25519" ++ u32be(32) ++ key (51 bytes).
+    fn ssh_pub_line(kp: &nau_core::sign::KeyPair) -> String {
+        use base64::Engine as _;
+        let mut blob = Vec::with_capacity(51);
+        blob.extend_from_slice(&11u32.to_be_bytes());
+        blob.extend_from_slice(b"ssh-ed25519");
+        blob.extend_from_slice(&32u32.to_be_bytes());
+        blob.extend_from_slice(&kp.public);
+        format!(
+            "ssh-ed25519 {} nau-test-anchor",
+            base64::engine::general_purpose::STANDARD.encode(blob)
+        )
+    }
+
+    #[test]
+    fn ssh_format_anchor_in_the_keys_dir_verifies() {
+        // The operator keychain may carry ssh-format ed25519 anchors
+        // (`ssh-ed25519 AAAA... comment`) — well-formed anchor material
+        // in a different envelope. They must load as anchors like any
+        // other, not brick every verification in the directory.
+        let dir = tempfile::tempdir().unwrap();
+        let kp = test_kp(11);
+        let m = signed(manifest(Some(ROOTHASH), None), &kp);
+        let keys = dir.path().join("keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::write(
+            keys.join("operator.pub"),
+            format!("{}\n", ssh_pub_line(&kp)),
+        )
+        .unwrap();
+        let key_id = verify_manifest_signature_at(&m, None, &keys).unwrap();
+        assert_eq!(key_id, kp.key_id());
+    }
+
     #[test]
     fn unset_home_refuses_instead_of_falling_back_to_cwd_anchors() {
         // A CWD-relative `./.config/nau/keys` would silently join the
