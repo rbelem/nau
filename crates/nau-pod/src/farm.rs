@@ -687,6 +687,10 @@ fn reset_ld_wrappers(store: &StoreView, n: u64) -> miette::Result<()> {
 /// SET, never compose-prepend: the pod's libraries ride only this
 /// process, and whatever ambient `LD_LIBRARY_PATH` the caller carried
 /// stops at the wrapper (#110).
+/// Self-location uses shell builtins only (`${0%/*}` plus a symlink
+/// test): farm entries are links into `ld-wrappers`, so no `readlink`
+/// or `dirname` binary is needed. That keeps wrappers working on hosts
+/// without system coreutils, and unique PATH names are unnecessary.
 fn write_ld_wrapper(
     store: &StoreView,
     n: u64,
@@ -711,7 +715,9 @@ fn write_ld_wrapper(
     // usr/usr/bin; without this the driver dies at posix_spawnp on a
     // caller whose PATH has no binutils. Inert for non-compiler apps.
     let body = format!(
-        "#!/bin/sh\nd=$(dirname \"$(readlink -f \"$0\")\")\n\
+        "#!/bin/sh\n\
+         d=${{0%/*}}\n\
+         [ -L \"$0\" ] && d=$d/../ld-wrappers\n\
          LD_LIBRARY_PATH=\"{lib_list}\"\n\
          LIBRARY_PATH=\"$LD_LIBRARY_PATH\"\n\
          CPATH=\n\
@@ -1703,6 +1709,22 @@ mod tests {
             "wrapper must exec the real store blob, anchored at its own dir: {wrapper}"
         );
         assert!(wrapper.starts_with("#!/bin/sh"));
+
+        // Self-location uses shell builtins only: no resolver binary
+        // may appear, since farm-first PATH would resolve bare names
+        // back into the farm on hosts without system coreutils.
+        assert!(
+            wrapper.contains("d=${0%/*}"),
+            "wrapper must locate itself without external tools: {wrapper}"
+        );
+        assert!(
+            wrapper.contains("[ -L \"$0\" ]"),
+            "wrapper must follow the farm link into ld-wrappers: {wrapper}"
+        );
+        assert!(
+            !wrapper.contains("readlink") && !wrapper.contains("dirname"),
+            "wrapper must name no external resolver: {wrapper}"
+        );
 
         // The statically-linked app is wrapped too — same rule, same
         // list, exactly like the old shellenv export.
