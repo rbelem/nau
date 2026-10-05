@@ -868,14 +868,14 @@ fn sign_eval_manifest(
     offline: bool,
 ) {
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
-    match crate::sign::load_secret_key(&home) {
+    match nau_core::sign::load_secret_key(&home) {
         Ok(Some(kp)) => {
             let version = env!("CARGO_PKG_VERSION");
-            match crate::sign::attest_eval(manifest, &kp, version, arch, channel, offline) {
+            match nau_trust::sign::attest_eval(manifest, &kp, version, arch, channel, offline) {
                 Ok(()) => eprintln!(
                     "  ✓ manifest signed with provenance (key id {}, builder {})",
                     kp.key_id(),
-                    crate::sign::builder_id(version)
+                    nau_trust::sign::builder_id(version)
                 ),
                 Err(e) => eprintln!("  ⚠ signing skipped: {e:#}"),
             }
@@ -884,7 +884,7 @@ fn sign_eval_manifest(
             eprintln!(
                 "  ℹ no signing key at {} — signatures left empty (opt-in until \
                  ceremony)",
-                crate::sign::secret_key_path(&home).display()
+                nau_core::sign::secret_key_path(&home).display()
             );
         }
         Err(e) => eprintln!("  ⚠ signing skipped: {e:#}"),
@@ -1056,20 +1056,20 @@ pub fn cmd_key(sub: KeyCommand) -> miette::Result<()> {
 /// Never prints the seed. The creation date is recorded in the ceremony
 /// ledger (issue #51) — the audit trail starts here.
 fn key_keygen(home: PathBuf) -> miette::Result<()> {
-    let kp = crate::sign::create_secret_key(&home)?;
-    let anchor = crate::sign::install_public_key(&kp, &crate::sign::keys_dir(&home))?;
-    let mut ledger = crate::sign::CeremonyLedger::load(&crate::sign::keys_dir(&home))?;
-    ledger.record_created(&kp, &crate::sign::now_rfc3339());
-    ledger.save(&crate::sign::keys_dir(&home))?;
+    let kp = nau_core::sign::create_secret_key(&home)?;
+    let anchor = nau_core::sign::install_public_key(&kp, &nau_core::sign::keys_dir(&home))?;
+    let mut ledger = nau_core::sign::CeremonyLedger::load(&nau_core::sign::keys_dir(&home))?;
+    ledger.record_created(&kp, &nau_core::sign::now_rfc3339());
+    ledger.save(&nau_core::sign::keys_dir(&home))?;
     crate::output::ok(format!(
         "signing key created: {} (key id {})",
-        crate::sign::secret_key_path(&home).display(),
+        nau_core::sign::secret_key_path(&home).display(),
         kp.key_id()
     ));
     crate::output::info(format!("trust anchor installed: {}", anchor.display()));
     print_report(&serde_json::json!({
         "key_id": kp.key_id(),
-        "secret_key": crate::sign::secret_key_path(&home).display().to_string(),
+        "secret_key": nau_core::sign::secret_key_path(&home).display().to_string(),
         "anchor": anchor.display().to_string(),
     }));
     Ok(())
@@ -1081,11 +1081,11 @@ fn key_keygen(home: PathBuf) -> miette::Result<()> {
 /// signature entry is kept, and an attested entry's provenance is
 /// re-attached under the new signature (same claims, new key; issue #51).
 fn key_rotate(home: PathBuf, manifest: Option<String>, window_days: u32) -> miette::Result<()> {
-    let successor = crate::sign::mint_rotation_key(&home)?;
-    let old = crate::sign::load_secret_key(&home)?.expect("rotation key requires an active key");
-    let keys_dir = crate::sign::keys_dir(&home);
-    let mut ledger = crate::sign::CeremonyLedger::load(&keys_dir)?;
-    ledger.record_rotation(&old, &successor, &crate::sign::now_rfc3339(), window_days);
+    let successor = nau_trust::sign::mint_rotation_key(&home)?;
+    let old = nau_core::sign::load_secret_key(&home)?.expect("rotation key requires an active key");
+    let keys_dir = nau_core::sign::keys_dir(&home);
+    let mut ledger = nau_core::sign::CeremonyLedger::load(&keys_dir)?;
+    ledger.record_rotation(&old, &successor, &nau_core::sign::now_rfc3339(), window_days);
     ledger.save(&keys_dir)?;
 
     if let Some(path) = &manifest {
@@ -1094,7 +1094,7 @@ fn key_rotate(home: PathBuf, manifest: Option<String>, window_days: u32) -> miet
 
     crate::output::ok(format!(
         "rotation key minted: {} (key id {}) — not trusted until promoted",
-        crate::sign::rotation_key_path(&home).display(),
+        nau_core::sign::rotation_key_path(&home).display(),
         successor.key_id()
     ));
     crate::output::info(format!(
@@ -1110,9 +1110,9 @@ fn key_rotate(home: PathBuf, manifest: Option<String>, window_days: u32) -> miet
 /// The `--manifest` half of `nau key rotate`: dual-sign the manifest
 /// file under the successor (old entries kept, provenance re-attached)
 /// and write it back atomically.
-fn rotate_dual_sign_manifest(path: &str, successor: &crate::sign::KeyPair) -> miette::Result<()> {
+fn rotate_dual_sign_manifest(path: &str, successor: &nau_core::sign::KeyPair) -> miette::Result<()> {
     let mut parsed = read_manifest(path)?;
-    crate::sign::cosign_reattaching_provenance(&mut parsed, successor)?;
+    nau_trust::sign::cosign_reattaching_provenance(&mut parsed, successor)?;
     parsed.write_atomic(std::path::Path::new(path))?;
     crate::output::ok(format!(
         "manifest dual-signed: {path} (key id {} beside the existing entries)",
@@ -1125,14 +1125,14 @@ fn rotate_dual_sign_manifest(path: &str, successor: &crate::sign::KeyPair) -> mi
 /// dual-signed.
 fn print_rotate_report(
     home: &Path,
-    old: &crate::sign::KeyPair,
-    successor: &crate::sign::KeyPair,
+    old: &nau_core::sign::KeyPair,
+    successor: &nau_core::sign::KeyPair,
     window_days: u32,
     manifest: Option<&str>,
 ) {
     let mut report = serde_json::json!({
         "key_id": successor.key_id(),
-        "rotation_key": crate::sign::rotation_key_path(home).display().to_string(),
+        "rotation_key": nau_core::sign::rotation_key_path(home).display().to_string(),
         "trusted": false,
         "replaces": old.key_id(),
         "window_days": window_days,
@@ -1145,14 +1145,14 @@ fn print_rotate_report(
 
 /// `nau key promote`: move the successor into place and trust it.
 fn key_promote(home: PathBuf) -> miette::Result<()> {
-    let kp = crate::sign::promote_rotation_key(&home, &crate::sign::keys_dir(&home))?;
+    let kp = nau_trust::sign::promote_rotation_key(&home, &nau_core::sign::keys_dir(&home))?;
     crate::output::ok(format!(
         "rotation promoted: key id {} is now the signing key",
         kp.key_id()
     ));
     print_report(&serde_json::json!({
         "key_id": kp.key_id(),
-        "secret_key": crate::sign::secret_key_path(&home).display().to_string(),
+        "secret_key": nau_core::sign::secret_key_path(&home).display().to_string(),
         "trusted": true,
     }));
     Ok(())
@@ -1161,10 +1161,10 @@ fn key_promote(home: PathBuf) -> miette::Result<()> {
 /// `nau key revoke`: drop the local anchor, record the revocation in
 /// `keys/revoked-keys`, and date it in the ceremony ledger.
 fn key_revoke(home: PathBuf, key_id: &str) -> miette::Result<()> {
-    crate::sign::revoke_local(&crate::sign::keys_dir(&home), key_id)?;
-    let keys_dir = crate::sign::keys_dir(&home);
-    let mut ledger = crate::sign::CeremonyLedger::load(&keys_dir)?;
-    let revoked_at = crate::sign::now_rfc3339();
+    nau_core::sign::revoke_local(&nau_core::sign::keys_dir(&home), key_id)?;
+    let keys_dir = nau_core::sign::keys_dir(&home);
+    let mut ledger = nau_core::sign::CeremonyLedger::load(&keys_dir)?;
+    let revoked_at = nau_core::sign::now_rfc3339();
     ledger.record_revocation(key_id, &revoked_at);
     ledger.save(&keys_dir)?;
     crate::output::ok(format!("key {key_id} revoked (recorded {revoked_at})"));
@@ -1179,11 +1179,11 @@ fn key_revoke(home: PathBuf, key_id: &str) -> miette::Result<()> {
 /// `nau key list`: print the ceremony ledger — the auditable trail of
 /// every key the ceremony touched (issue #51).
 fn key_list(home: PathBuf) -> miette::Result<()> {
-    let ledger = crate::sign::CeremonyLedger::load(&crate::sign::keys_dir(&home))?;
+    let ledger = nau_core::sign::CeremonyLedger::load(&nau_core::sign::keys_dir(&home))?;
     if ledger.keys.is_empty() {
         crate::output::info(format!(
             "no ceremony ledger yet at {} (run `nau key keygen`)",
-            crate::sign::ceremony_ledger_path(&crate::sign::keys_dir(&home)).display()
+            nau_core::sign::ceremony_ledger_path(&nau_core::sign::keys_dir(&home)).display()
         ));
         return Ok(());
     }
@@ -1195,7 +1195,7 @@ fn key_list(home: PathBuf) -> miette::Result<()> {
                 "  rotated→{succ} {at} (window {}d)",
                 entry
                     .window_days
-                    .unwrap_or(crate::sign::DEFAULT_WINDOW_DAYS)
+                    .unwrap_or(nau_core::sign::DEFAULT_WINDOW_DAYS)
             ));
         }
         if let Some(at) = &entry.revoked_at {
@@ -1243,16 +1243,16 @@ fn read_manifest(path: &str) -> miette::Result<crate::manifest::ImageManifest> {
 fn verify_manifest_with_ceremony(
     home: &Path,
     parsed: &crate::manifest::ImageManifest,
-) -> miette::Result<crate::sign::LedgerVerification> {
-    let keys_dir = crate::sign::keys_dir(home);
-    let body = crate::sign::eval_manifest_canonical_bytes(parsed)?;
-    let chain = crate::sign::Keychain::load_dir(&keys_dir)?;
-    let ledger = crate::sign::CeremonyLedger::load(&keys_dir)?;
-    let revoked = crate::sign::read_revoked_keys(&keys_dir)?;
+) -> miette::Result<nau_trust::sign::LedgerVerification> {
+    let keys_dir = nau_core::sign::keys_dir(home);
+    let body = nau_core::manifest_ir::eval_manifest_canonical_bytes(parsed)?;
+    let chain = nau_core::sign::Keychain::load_dir(&keys_dir)?;
+    let ledger = nau_core::sign::CeremonyLedger::load(&keys_dir)?;
+    let revoked = nau_core::sign::read_revoked_keys(&keys_dir)?;
     let outcome =
-        crate::sign::verify_with_ledger_now(&body, &parsed.signatures, &chain, &ledger, &revoked)?;
+        nau_trust::sign::verify_with_ledger_now(&body, &parsed.signatures, &chain, &ledger, &revoked)?;
     if let Some(entry) = parsed.signatures.get(&outcome.key_id) {
-        crate::sign::check_provenance(entry, &parsed.inputs)?;
+        nau_trust::sign::check_provenance(entry, &parsed.inputs)?;
     }
     Ok(outcome)
 }

@@ -22,7 +22,6 @@ pub mod provision;
 pub mod pull_peer;
 pub mod secrets;
 pub mod services;
-pub mod sign;
 // The build domain (issue #326 PR 2): snap/cache/build_prefix/
 // source_cache moved to nau-build (the snap shim FILE is gone — callers
 // use `nau_build::snap` / `nau_core::snap_types` / `nau_chart::snap_lua`
@@ -59,9 +58,12 @@ pub use nau_pod::{confine, desktop, farm, fonts};
 // test cluster moved to tests/sign_attestation.rs).
 pub use nau_runtime::slot_recovery;
 // The trust domain (issue #326 PR 8): the signing ceremony policy, the
-// device verify cluster, and the SSH host-CA ceremony. sign.rs's
-// eval-coupled test clusters moved to tests/sign_attestation.rs;
-// ca is a pure re-export.
+// device verify cluster, and the SSH host-CA ceremony. The sign shim
+// FILE is gone — callers use `nau_core::sign` (keychain core),
+// `nau_trust::sign` (ceremony policy), `nau_core::manifest_ir`
+// (canonical eval bytes), and `nau_image::sysupdate` (the sysupdate
+// pgp layer) directly; the ceremony unit cluster moved to
+// tests/sign_attestation.rs.
 pub use nau_trust::ca;
 // The pool domain (issue #326 PR 9): the SSH worker transport and the
 // farm build scheduler moved whole; worker.rs stays a real shim FILE

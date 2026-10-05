@@ -56,10 +56,10 @@ fn key_ceremony_lifecycle_through_the_cli() {
     // ── gen ──
     let (code, _, stderr) = run_in(dir.path(), &["trust", "keygen", &home]);
     assert_eq!(code, Some(0), "keygen: {stderr}");
-    let ledger: nau::sign::CeremonyLedger =
+    let ledger: nau_core::sign::CeremonyLedger =
         serde_json::from_str(&std::fs::read_to_string(keys.join("ceremony.json")).unwrap())
             .unwrap();
-    let id_a = nau::sign::load_secret_key(dir.path())
+    let id_a = nau_core::sign::load_secret_key(dir.path())
         .unwrap()
         .unwrap()
         .key_id();
@@ -70,9 +70,9 @@ fn key_ceremony_lifecycle_through_the_cli() {
 
     // ── sign ── (the release path signs at eval; here the old key signs
     // directly so the rotation has a prior signature to keep)
-    let old = nau::sign::load_secret_key(dir.path()).unwrap().unwrap();
+    let old = nau_core::sign::load_secret_key(dir.path()).unwrap().unwrap();
     let mut manifest = read_manifest(&dir, "m.json");
-    nau::sign::cosign(&mut manifest, &old).unwrap();
+    nau_trust::sign::cosign(&mut manifest, &old).unwrap();
     std::fs::write(dir.path().join("m.json"), manifest.to_json().unwrap()).unwrap();
 
     // ── rotate ── dual-signs the manifest under the successor and
@@ -163,7 +163,7 @@ fn key_ceremony_lifecycle_through_the_cli() {
     // ── list ── the audit trail shows the chain and the revocation.
     let (code, stdout, stderr) = run_in(dir.path(), &["trust", "list", &home, "--json"]);
     assert_eq!(code, Some(0), "list: {stderr}");
-    let ledger: nau::sign::CeremonyLedger =
+    let ledger: nau_core::sign::CeremonyLedger =
         serde_json::from_value(report_json(&stdout)).expect("ledger json");
     let chain_a = &ledger.keys[&id_a];
     assert_eq!(chain_a.replaced_by.as_deref(), Some(id_b.as_str()));

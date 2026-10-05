@@ -64,10 +64,10 @@ const HASH_SIZE: u64 = 4096;
 const SECTOR: u64 = 512;
 const ESP_UUID: &str = "aabbccdd-0011-2233-4455-667788990011";
 
-fn test_kp(seed_byte: u8) -> nau::sign::KeyPair {
+fn test_kp(seed_byte: u8) -> nau_core::sign::KeyPair {
     let seed = [seed_byte; 32];
     let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-    nau::sign::KeyPair {
+    nau_core::sign::KeyPair {
         seed,
         public: sk.verifying_key().to_bytes(),
     }
@@ -246,7 +246,7 @@ fn build_fixture() -> Fixture {
     );
     write_release_signed_manifest(&manifest, &roothash, &uki_digest);
     let key = dir.path().join("downloaded.pub");
-    std::fs::write(&key, nau::sign::public_key_file(&test_kp(7))).unwrap();
+    std::fs::write(&key, nau_core::sign::public_key_file(&test_kp(7))).unwrap();
 
     Fixture {
         dir,
@@ -372,7 +372,7 @@ gated_test!(revoked_release_key_refuses, {
     let kp = test_kp(7);
     std::fs::write(
         keys_dir.join(format!("{}.pub", kp.key_id())),
-        nau::sign::public_key_file(&kp),
+        nau_core::sign::public_key_file(&kp),
     )
     .unwrap();
     std::fs::write(keys_dir.join("revoked-keys"), format!("{}\n", kp.key_id())).unwrap();

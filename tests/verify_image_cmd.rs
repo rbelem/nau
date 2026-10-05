@@ -65,10 +65,10 @@ const HASH_SIZE: u64 = 4096;
 const SECTOR: u64 = 512;
 const ESP_UUID: &str = "aabbccdd-0011-2233-4455-667788990011";
 
-fn test_kp(seed_byte: u8) -> nau::sign::KeyPair {
+fn test_kp(seed_byte: u8) -> nau_core::sign::KeyPair {
     let seed = [seed_byte; 32];
     let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-    nau::sign::KeyPair {
+    nau_core::sign::KeyPair {
         seed,
         public: sk.verifying_key().to_bytes(),
     }
@@ -273,7 +273,7 @@ fn build_fixture() -> Fixture {
     let manifest = dir.path().join("nau-demo-1.0.0-amd64.manifest.json");
     write_signed_manifest(&manifest, &roothash, Some(&uki_digest));
     let key = dir.path().join("downloaded.pub");
-    std::fs::write(&key, nau::sign::public_key_file(&test_kp(7))).unwrap();
+    std::fs::write(&key, nau_core::sign::public_key_file(&test_kp(7))).unwrap();
 
     Fixture {
         dir,
@@ -319,7 +319,7 @@ fn write_signed_manifest(path: &std::path::Path, roothash: &str, uki_sha3_384: O
     };
     let canonical = serde_json::to_vec(&manifest).unwrap();
     let kp = test_kp(7);
-    let sig = nau::sign::sign_bytes(&canonical, &kp);
+    let sig = nau_core::sign::sign_bytes(&canonical, &kp);
     let mut v = serde_json::to_value(&manifest).unwrap();
     v["signatures"] = serde_json::json!({ (kp.key_id()): sig });
     std::fs::write(path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
@@ -621,7 +621,7 @@ gated_test!(verify_image_refuses_a_manifest_predating_esp_coverage, {
         serde_json::from_value(v).expect("the old field set still parses");
     reduced.signatures.clear();
     let canonical = serde_json::to_vec(&reduced).unwrap();
-    let sig = nau::sign::sign_bytes(&canonical, &kp);
+    let sig = nau_core::sign::sign_bytes(&canonical, &kp);
     reduced
         .signatures
         .insert(kp.key_id(), serde_json::Value::String(sig));

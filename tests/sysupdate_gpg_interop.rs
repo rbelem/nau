@@ -9,8 +9,8 @@
 //! shape) and asking it to verify a detached binary signature over the
 //! downloaded `SHA256SUMS` bytes. This test produces the trust anchor
 //! and a signed manifest through the landed producers
-//! ([`nau::sign::import_pubring_pgp`],
-//! [`nau::sign::sign_sysupdate_manifest`]) and hands BOTH to the
+//! ([`nau_image::sysupdate::import_pubring_pgp`],
+//! [`nau_image::sysupdate::sign_sysupdate_manifest`]) and hands BOTH to the
 //! real gpg. If gpg rejects the EdDSALegacy(22)+SHA256 framing, every
 //! fielded device refuses every update — that verdict must come from
 //! gpg, not from the crate grading its own homework.
@@ -68,10 +68,10 @@ fn skip_or_gate_fail() {
 
 // ── Fixture ──
 
-fn test_kp(seed_byte: u8) -> nau::sign::KeyPair {
+fn test_kp(seed_byte: u8) -> nau_core::sign::KeyPair {
     let seed = [seed_byte; 32];
     let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-    nau::sign::KeyPair {
+    nau_core::sign::KeyPair {
         seed,
         public: sk.verifying_key().to_bytes(),
     }
@@ -92,7 +92,7 @@ fn produce_artifacts() -> SysupdateArtifacts {
     let kp = test_kp(7);
 
     let pubring = dir.path().join("import-pubring.pgp");
-    std::fs::write(&pubring, nau::sign::import_pubring_pgp(&kp).unwrap()).unwrap();
+    std::fs::write(&pubring, nau_image::sysupdate::import_pubring_pgp(&kp).unwrap()).unwrap();
 
     // The coreutils-format manifest the release layer publishes: one
     // `<sha256>␠␠<name>` line per media file, over real bytes.
@@ -104,7 +104,7 @@ fn produce_artifacts() -> SysupdateArtifacts {
         ),
     ];
     use sha2::Digest;
-    let sums = dir.path().join(nau::sign::SYSUPDATE_MANIFEST_NAME);
+    let sums = dir.path().join(nau_image::sysupdate::SYSUPDATE_MANIFEST_NAME);
     let mut body = String::new();
     for (name, bytes) in &media {
         let digest = sha2::Sha256::digest(bytes);
@@ -115,10 +115,10 @@ fn produce_artifacts() -> SysupdateArtifacts {
 
     let sig = dir
         .path()
-        .join(nau::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME);
+        .join(nau_image::sysupdate::SYSUPDATE_MANIFEST_SIGNATURE_NAME);
     std::fs::write(
         &sig,
-        nau::sign::sign_sysupdate_manifest(&kp, body.as_bytes()).unwrap(),
+        nau_image::sysupdate::sign_sysupdate_manifest(&kp, body.as_bytes()).unwrap(),
     )
     .unwrap();
 
@@ -231,16 +231,16 @@ fn gpg_accepts_signatures_from_either_key_in_the_overlap_pubring() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let old = nau::sign::create_secret_key(dir.path()).unwrap();
-    let keys_dir = nau::sign::keys_dir(dir.path());
-    nau::sign::install_public_key(&old, &keys_dir).unwrap();
-    let successor = nau::sign::mint_rotation_key(dir.path()).unwrap();
+    let old = nau_core::sign::create_secret_key(dir.path()).unwrap();
+    let keys_dir = nau_core::sign::keys_dir(dir.path());
+    nau_core::sign::install_public_key(&old, &keys_dir).unwrap();
+    let successor = nau_trust::sign::mint_rotation_key(dir.path()).unwrap();
 
     // The pre-promotion trust set: {current, designated successor}.
     let pubring = dir.path().join("import-pubring.pgp");
     std::fs::write(
         &pubring,
-        nau::sign::sysupdate_pubring_pgp(&old, dir.path()).unwrap(),
+        nau_image::sysupdate::sysupdate_pubring_pgp(&old, dir.path()).unwrap(),
     )
     .unwrap();
 
@@ -253,16 +253,16 @@ fn gpg_accepts_signatures_from_either_key_in_the_overlap_pubring() {
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         body.push_str(&format!("{hex}  {name}\n"));
     }
-    let sums = dir.path().join(nau::sign::SYSUPDATE_MANIFEST_NAME);
+    let sums = dir.path().join(nau_image::sysupdate::SYSUPDATE_MANIFEST_NAME);
     std::fs::write(&sums, &body).unwrap();
 
     for (role, signer) in [("current", &old), ("designated-successor", &successor)] {
         let sig = dir
             .path()
-            .join(nau::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME);
+            .join(nau_image::sysupdate::SYSUPDATE_MANIFEST_SIGNATURE_NAME);
         std::fs::write(
             &sig,
-            nau::sign::sign_sysupdate_manifest(signer, body.as_bytes()).unwrap(),
+            nau_image::sysupdate::sign_sysupdate_manifest(signer, body.as_bytes()).unwrap(),
         )
         .unwrap();
         let gpg_home = tempfile::tempdir().unwrap();

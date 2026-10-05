@@ -15,7 +15,7 @@ use crate::pod;
 use crate::pull_ref::PullRef;
 
 /// The operator's keychain dir (`~/.config/nau/keys`, HOME resolved —
-/// `.` when unreadable, matching `crate::sign::keys_dir`).
+/// `.` when unreadable, matching `nau_core::sign::keys_dir`).
 fn operator_keys_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     nau_core::sign::keys_dir(&PathBuf::from(home))
@@ -96,9 +96,9 @@ mod tests {
     use std::path::PathBuf;
 
     /// Deterministic keypair from a single seed byte (test-only).
-    fn test_kp(seed_byte: u8) -> crate::sign::KeyPair {
+    fn test_kp(seed_byte: u8) -> nau_core::sign::KeyPair {
         let sk = ed25519_dalek::SigningKey::from_bytes(&[seed_byte; 32]);
-        crate::sign::KeyPair {
+        nau_core::sign::KeyPair {
             seed: sk.to_bytes(),
             public: sk.verifying_key().to_bytes(),
         }
@@ -112,7 +112,7 @@ mod tests {
         sha256_hex(blob_bytes())
     }
 
-    fn signed_manifest(kp: &crate::sign::KeyPair) -> PackageManifest {
+    fn signed_manifest(kp: &nau_core::sign::KeyPair) -> PackageManifest {
         let mut pkg = PackageManifest {
             name: "hello".to_string(),
             version: "2.10".to_string(),
@@ -180,11 +180,11 @@ mod tests {
     }
 
     impl Fixture {
-        fn with_trust(kp: &crate::sign::KeyPair) -> Fixture {
+        fn with_trust(kp: &nau_core::sign::KeyPair) -> Fixture {
             let store_dir = tempfile::tempdir().unwrap();
             let keys_dir = tempfile::tempdir().unwrap();
             let anchor_dir = tempfile::tempdir().unwrap();
-            crate::sign::install_public_key(kp, keys_dir.path()).unwrap();
+            nau_core::sign::install_public_key(kp, keys_dir.path()).unwrap();
             let store = RuntimeStore::new(store_dir.path().to_path_buf());
             let keys = keys_dir.path().to_path_buf();
             let anchor = anchor_dir.path().join("update-key.pub");
@@ -201,8 +201,8 @@ mod tests {
 
         /// Bake `kp` into the DEVICE image trust set (the trusted-keys
         /// directory beside the anchor).
-        fn install_device_anchor(&self, kp: &crate::sign::KeyPair) {
-            crate::sign::install_public_key(kp, &self.anchor_dir.join("trusted-keys")).unwrap();
+        fn install_device_anchor(&self, kp: &nau_core::sign::KeyPair) {
+            nau_core::sign::install_public_key(kp, &self.anchor_dir.join("trusted-keys")).unwrap();
         }
 
         /// List a key id in the DEVICE image revocation list.

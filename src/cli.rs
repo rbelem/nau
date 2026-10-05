@@ -967,7 +967,7 @@ pub struct TrustRotateArgs {
     /// the rotated-out key's signatures stay first-class while the
     /// successor rolls out. Expired windows downgrade to a verify
     /// warning.
-    #[arg(long, default_value_t = crate::sign::DEFAULT_WINDOW_DAYS)]
+    #[arg(long, default_value_t = nau_core::sign::DEFAULT_WINDOW_DAYS)]
     pub window_days: u32,
 
     /// Output structured JSON instead of human-friendly output.
@@ -2327,7 +2327,7 @@ pub enum KeyCommand {
         /// the rotated-out key's signatures stay first-class while the
         /// successor rolls out. Expired windows downgrade to a verify
         /// warning.
-        #[arg(long, default_value_t = crate::sign::DEFAULT_WINDOW_DAYS)]
+        #[arg(long, default_value_t = nau_core::sign::DEFAULT_WINDOW_DAYS)]
         window_days: u32,
 
         /// Output structured JSON instead of human-friendly output.
@@ -3625,7 +3625,7 @@ mod tests {
                 assert!(manifest.is_none(), "no manifest to dual-sign by default");
                 assert_eq!(
                     window_days,
-                    crate::sign::DEFAULT_WINDOW_DAYS,
+                    nau_core::sign::DEFAULT_WINDOW_DAYS,
                     "default overlap window"
                 );
             }
