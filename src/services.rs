@@ -245,7 +245,7 @@ pub fn record_in(
     let ctx = ResolveCtx {
         pod,
         home: &std::env::var("HOME").unwrap_or_else(|_| ".".into()),
-        extensions: current.join("extensions").to_string_lossy().into_owned(),
+        extensions: current.join("../extensions").to_string_lossy().into_owned(),
         gen_env: read_generation_env(&crate::farm::env_path(&store.store_view(), gen.n))?,
         loader_libs: crate::farm::loader_lib_dirs(&store.store_view(), gen),
         current: current.to_string_lossy().into_owned(),
@@ -326,8 +326,9 @@ struct ResolveCtx<'a> {
     pod: &'a str,
     /// `$HOME` (the `%h` expansion; the pod.rs fallback applies).
     home: &'a str,
-    /// The absolute extensions dir through `current` (the one built-in
-    /// `${extensions}` reference).
+    /// The absolute extensions dir through `current/../` (`current`
+    /// points at the farm, while extensions live beside it in the
+    /// generation dir, the built-in `${extensions}` reference).
     extensions: String,
     /// The generation's recorded env (ADR-0030), composed into the unit.
     gen_env: BTreeMap<String, String>,
@@ -1669,7 +1670,7 @@ fn pod_endpoint_claims(pod_dir: &std::path::Path) -> miette::Result<Vec<Endpoint
     let ctx = ResolveCtx {
         pod: &pod,
         home: &home,
-        extensions: current.join("extensions").to_string_lossy().into_owned(),
+        extensions: current.join("../extensions").to_string_lossy().into_owned(),
         gen_env: BTreeMap::new(), // expansion-only: env/loader-libs are render-time inputs
         loader_libs: Vec::new(),
         current: current.to_string_lossy().into_owned(),
@@ -1961,7 +1962,7 @@ mod tests {
         assert!(text.contains("Description=nau pod 'pilot' service 'valkey'\n"));
         assert!(text.contains("Type=simple\n"));
         assert!(text.contains(&format!(
-            "ExecStart='{current}/valkey' '--port' '7002' '--dir' '{}/data/pilot' '--loadmodule' '{current}/extensions/valkey-search.so'\n",
+            "ExecStart='{current}/valkey' '--port' '7002' '--dir' '{}/data/pilot' '--loadmodule' '{current}/../extensions/valkey-search.so'\n",
             home()
         )));
         assert!(text.contains("Environment=\"QUIET=yes\"\n"));
