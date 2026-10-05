@@ -125,6 +125,26 @@ fi
 echo "gate: dep-direction (ADR-0051 R1): checking workspace edges"
 bash scripts/dep-direction.sh
 
+# ── luau dup-dep tripwire (luau-dedupe lane, 2026-10-03): the vendored
+# analyzer build resolves Ast/Config/VM against mlua's luau0-src objects
+# (40476e0), so the crate graph must carry exactly ONE luau/mlua source —
+# a second copy reintroduces the duplicate-strong-symbol link failure the
+# removed --allow-multiple-definition flag used to paper over. The strict
+# link (binutils 2.46) stays the backstop; this check fails the gate in
+# seconds with a readable cause instead. luau0-src reaches mlua-sys as a
+# build-dependency, so the scan must include the build edge — default
+# `cargo tree -d` cannot see it. Unrelated crate dupes (bzip2, getrandom,
+# syn, …) are Rust-namespaced and cannot collide at the native-symbol
+# level; `cargo tree -d` reports them and this check ignores them.
+luau_dupes="$(cargo tree -d -e normal,build 2>/dev/null | grep -E '^(luau|mlua)' || true)"
+if [[ -n "$luau_dupes" ]]; then
+    echo "gate: FAIL — duplicated luau/mlua crate in the graph; the " \
+         "analyzer dedupe assumes exactly one copy:" >&2
+    printf '%s\n' "$luau_dupes" >&2
+    exit 2
+fi
+echo "gate: luau dup-dep axis: exactly one luau/mlua source in the graph"
+
 NAU_SYSTEMD=off cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 # cargo-fmt spells whole-workspace coverage `--all` (--workspace is a
