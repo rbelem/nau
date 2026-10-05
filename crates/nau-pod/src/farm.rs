@@ -687,11 +687,10 @@ fn reset_ld_wrappers(store: &StoreView, n: u64) -> miette::Result<()> {
 /// SET, never compose-prepend: the pod's libraries ride only this
 /// process, and whatever ambient `LD_LIBRARY_PATH` the caller carried
 /// stops at the wrapper (#110).
-/// Self-location prefers the seam tools `nau-readlink`/`nau-dirname`
-/// (claimed by coreutils) over bare `readlink`/`dirname`: with
-/// farm-first PATH, bare names would resolve to the farm itself on
-/// hosts without system coreutils, and unique names cannot do that.
-/// Hosts with system tools keep today's bare path as the fallback.
+/// Self-location uses shell builtins only (`${0%/*}` plus a symlink
+/// test): farm entries are links into `ld-wrappers`, so no `readlink`
+/// or `dirname` binary is needed. That keeps wrappers working on hosts
+/// without system coreutils, and unique PATH names are unnecessary.
 fn write_ld_wrapper(
     store: &StoreView,
     n: u64,
@@ -717,7 +716,8 @@ fn write_ld_wrapper(
     // caller whose PATH has no binutils. Inert for non-compiler apps.
     let body = format!(
         "#!/bin/sh\n\
-         if command -v nau-readlink >/dev/null 2>&1 && command -v nau-dirname >/dev/null 2>&1; then d=$(nau-dirname \"$(nau-readlink -f \"$0\")\"); else d=$(dirname \"$(readlink -f \"$0\")\"); fi\n\
+         d=${{0%/*}}\n\
+         [ -L \"$0\" ] && d=$d/../ld-wrappers\n\
          LD_LIBRARY_PATH=\"{lib_list}\"\n\
          LIBRARY_PATH=\"$LD_LIBRARY_PATH\"\n\
          CPATH=\n\
@@ -1710,16 +1710,20 @@ mod tests {
         );
         assert!(wrapper.starts_with("#!/bin/sh"));
 
-        // Self-location prefers the seam tools with the bare names as
-        // the fallback (non-FHS hosts carry the seam tools in the
-        // farm; FHS hosts resolve the bare names from the system).
+        // Self-location uses shell builtins only: no resolver binary
+        // may appear, since farm-first PATH would resolve bare names
+        // back into the farm on hosts without system coreutils.
         assert!(
-            wrapper.contains("nau-readlink -f"),
-            "wrapper must prefer the seam tools: {wrapper}"
+            wrapper.contains("d=${0%/*}"),
+            "wrapper must locate itself without external tools: {wrapper}"
         );
         assert!(
-            wrapper.contains("else d=$(dirname"),
-            "wrapper must keep the bare names as the fallback: {wrapper}"
+            wrapper.contains("[ -L \"$0\" ]"),
+            "wrapper must follow the farm link into ld-wrappers: {wrapper}"
+        );
+        assert!(
+            !wrapper.contains("readlink") && !wrapper.contains("dirname"),
+            "wrapper must name no external resolver: {wrapper}"
         );
 
         // The statically-linked app is wrapped too — same rule, same
