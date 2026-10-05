@@ -31,6 +31,17 @@ reruns — see Build & test); the
 test axis stays devbox until the gate pod also carries the build-host tools
 the suite spawns — see [Build & test](docs/agents/build-and-test.md).
 
+**Heavy compiles are pool-only.** Never spin heavy compile jobs on this
+workstation: workspace gates, `--workspace` builds, multi-crate check/test
+loops, or any parallel compile lanes. The host carries 15 GB RAM and finite
+/home — six parallel cargo lanes OOM'd it into a restart storm, and one gate
+run per lane (~35 GB of `target/` each) filled /home to 100%. Submit heavy
+jobs to pool workers instead (`nau build-request submit`/`drain` per
+nau-farm-ops; `nau run --pod gate` for the clippy/fmt axes). Local cargo is
+rationed to ONE foreground scoped job at a time — single crate (`-p`), no
+other cargo/devbox process alive — and run `scripts/target-clean.sh` when a
+lane's work is done so `target/` doesn't accumulate across lanes.
+
 ## Detail docs
 
 - [Build & test](docs/agents/build-and-test.md) — commands, test layout, gates
