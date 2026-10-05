@@ -21,7 +21,7 @@ use nau::command::{CommandRunner, RunnerOutput};
 use nau::coordinator::{farm_build_result, preflight_farm_workers, FarmSource, NodeJobPlan};
 use nau::lock::LockFile;
 use nau::lua::WorkerConfig;
-use nau::snap::{SnapMeta, SourceSpec};
+use nau_core::snap_types::{SnapMeta, SourceSpec};
 use nau::ssh_exec::{DispatchOutcome, SshExecutor};
 use nau::worker::{Artifact, CapabilityDoc, JobManifest, JobResult, WORKER_PROTOCOL_VERSION};
 use sha2::{Digest, Sha256};
@@ -999,7 +999,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn host_arch() -> String {
-    nau::snap::host_arch().to_string()
+    nau_core::snap_types::host_arch().to_string()
 }
 
 /// The scripted worker side of the SSH channel: real file moves for

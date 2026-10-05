@@ -406,7 +406,7 @@ impl Releaser for ShipReleaser {
 /// ready-set scheduler (`nau_pool::build_sched` — PR 9's public build
 /// API, budget from the `workers` conventions) with the single-node
 /// graph the request names; the job runs the normal snap build path
-/// (`crate::snap::build_snap`) over the constraint-resolved meta.
+/// (`nau_build::snap::build_snap`) over the constraint-resolved meta.
 /// Production build step: one farm-side build through the pool's
 /// scheduler, the request's bd closure staged against the released tree
 /// first (rbelem/nau#338 — `farm_prefix::farm_build_prefix`).
@@ -472,7 +472,7 @@ impl BuildStep for PoolBuild {
         let budget =
             nau_pool::build_sched::pool_budget(&nau_core::worker_types::WorkersConfig::default());
         let job = |_name: &str| -> Result<(), String> {
-            match crate::snap::build_snap(
+            match nau_build::snap::build_snap(
                 meta,
                 stage.path(),
                 output_dir,

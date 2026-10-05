@@ -129,7 +129,7 @@ pub(crate) struct ClosurePin {
 /// recipe edits but not upstream lock drift — filed follow-up).
 pub(crate) fn recipe_dep_key(
     recipe: &Path,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
 ) -> miette::Result<String> {
     let mut material = std::fs::read(recipe)
         .map_err(|e| miette::miette!("reading the recipe {}: {e}", recipe.display()))?;
@@ -186,7 +186,7 @@ pub(crate) fn recipe_dep_key(
 pub(crate) fn ensure_farm_deps_closure<T: TreeSource, R>(
     tree: &T,
     cache: &Path,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     dep_key: &str,
     resolve: R,
 ) -> miette::Result<Option<PathBuf>>
@@ -351,7 +351,7 @@ fn ensure_farm_dep_payload<T: TreeSource>(
     tree: &T,
     cache: &Path,
     name: &str,
-    dep_meta: &crate::snap::SnapMeta,
+    dep_meta: &nau_core::snap_types::SnapMeta,
     arch: &str,
     building: &mut Vec<String>,
 ) -> miette::Result<crate::build_prefix::Payload> {
@@ -378,7 +378,7 @@ fn tree_payload<T: TreeSource>(
     tree: &T,
     cache: &Path,
     name: &str,
-    dep_meta: &crate::snap::SnapMeta,
+    dep_meta: &nau_core::snap_types::SnapMeta,
     arch: &str,
     manifest_bytes: &Option<Vec<u8>>,
 ) -> miette::Result<Option<String>> {
@@ -496,7 +496,7 @@ fn build_farm_dep_payload<T: TreeSource>(
     tree: &T,
     cache: &Path,
     name: &str,
-    dep_meta: &crate::snap::SnapMeta,
+    dep_meta: &nau_core::snap_types::SnapMeta,
     arch: &str,
     building: &mut Vec<String>,
 ) -> miette::Result<crate::build_prefix::Payload> {
@@ -515,12 +515,12 @@ fn build_farm_dep_payload<T: TreeSource>(
     };
     let stage =
         tempfile::tempdir().map_err(|e| miette::miette!("farm dep stage dir for {name}: {e}"))?;
-    let result = match crate::snap::build_snap(
+    let result = match nau_build::snap::build_snap(
         dep_meta,
         stage.path(),
         cache,
         arch,
-        crate::snap::StagePolicy::Default,
+        nau_build::snap::StagePolicy::Default,
         // No pod store on the farm: no ELF repair, no build wrappers.
         None,
         // Ecosystem-deps closures stay pod-only (#338 follow-up).
@@ -553,7 +553,7 @@ fn build_farm_dep_payload<T: TreeSource>(
 pub(crate) fn farm_build_prefix<T: TreeSource>(
     tree: &T,
     cache: &Path,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     arch: &str,
     building: &mut Vec<String>,
 ) -> miette::Result<Option<crate::build_prefix::MergedPrefix>> {
@@ -700,7 +700,7 @@ mod tests {
 
     /// A meta that declares (empty) deps — enough to reach the closure
     /// lane without any resolver.
-    fn deps_meta(name: &str, version: &str) -> crate::snap::SnapMeta {
+    fn deps_meta(name: &str, version: &str) -> nau_core::snap_types::SnapMeta {
         let mut meta = bare_meta(name, version);
         meta.deps = Some(nau_core::snap_types::PackageDeps {
             npm: None,
@@ -892,8 +892,8 @@ mod tests {
         assert!(format!("{err:#}").contains("hash mismatch"), "{err:#}");
     }
 
-    fn bare_meta(name: &str, version: &str) -> crate::snap::SnapMeta {
-        crate::snap::SnapMeta {
+    fn bare_meta(name: &str, version: &str) -> nau_core::snap_types::SnapMeta {
+        nau_core::snap_types::SnapMeta {
             name: name.into(),
             version: version.into(),
             summary: None,

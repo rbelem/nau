@@ -49,8 +49,8 @@ fn go_sandbox_visible() -> bool {
         None => return false,
     };
     let entries: Vec<PathBuf> = std::env::split_paths(&path).collect();
-    let visible = nau::snap::sandbox_visible_entries(&entries);
-    nau::snap::resolve_in_path("go", &visible).is_some()
+    let visible = nau_build::snap::sandbox_visible_entries(&entries);
+    nau_build::snap::resolve_in_path("go", &visible).is_some()
 }
 
 macro_rules! gated_test {

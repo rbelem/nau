@@ -25,16 +25,16 @@ pub mod secrets;
 pub mod services;
 pub mod sign;
 // The build domain (issue #326 PR 2): snap/cache/build_prefix/
-// source_cache moved to nau-build; the plain re-export keeps every
-// `crate::<module>::` path resolving. snap and leak_scan stay root shim
-// FILES instead (they also carry chart-side re-exports, respectively the
-// root-only `listings_for_build`) — see src/snap.rs, src/leak_scan.rs.
+// source_cache moved to nau-build (the snap shim FILE is gone — callers
+// use `nau_build::snap` / `nau_core::snap_types` / `nau_chart::snap_lua`
+// directly; leak_scan stays a root shim FILE carrying the root-only
+// `listings_for_build`) — see src/leak_scan.rs.
 pub use nau_build::{build_prefix, cache, source_cache};
 pub use nau_core::manifest_ir;
 pub use nau_core::snap_types;
 // The image domain (issue #326 PR 3): image/uc/boot_test/esp/emit moved
-// to nau-image; units stays a root shim FILE (it carries the unit
-// vocabulary re-export; the emission half lives in nau-image::units).
+// to nau-image (the units vocabulary shim FILE is gone — callers use
+// `nau_core::units` directly; the emission half lives in nau_image::units).
 pub use nau_image::{boot_test, emit, esp, image, uc};
 // The ship domain (issue #326 PR 4): oci stays a root shim FILE (it
 // carries the root-side `pending_from_blob` — the pull --install
@@ -69,8 +69,6 @@ pub use nau_trust::ca;
 // DIR (the clap-typed dispatch + burst-count glue stay root).
 pub use nau_pool::{build_sched, ssh_exec};
 pub mod oci;
-pub mod snap;
 #[cfg(test)]
 pub(crate) mod test_env;
-pub mod units;
 pub mod worker;

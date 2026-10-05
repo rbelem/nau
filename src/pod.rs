@@ -83,7 +83,7 @@ use miette::{IntoDiagnostic, WrapErr};
 use serde::Serialize;
 
 use crate::lock::{LockFile, PodPackageLockEntry};
-use crate::snap::SnapMetaDigest;
+use nau_build::snap::SnapMetaDigest;
 
 // The pod path vocabulary (`DEFAULT_POD`, `pod_dir`, `validate_pod_name`,
 // `resolve_pod_dir_under`) moved DOWN into `nau_core::paths` (issue #326
@@ -504,7 +504,7 @@ fn expect_service_overrides(
                 lua_type_name(other)
             ),
         };
-        crate::snap::validate_service_name(&name)
+        nau_chart::snap_lua::validate_service_name(&name)
             .map_err(|e| miette::miette!("'services': {e}"))?;
         let options = match &item {
             mlua::Value::Table(_) => crate::isolate::lua_to_json(&item).map_err(|e| {
@@ -862,7 +862,7 @@ const OVERLAY_FIELDS: &[&str] = &["version", "build", "confinement", "floating"]
 /// value must be a plain-data grants table replacing them. Unknown fields
 /// and non-string values fail naming `overlay.<pkg>.<field>`.
 fn apply_overlay(
-    meta: &mut crate::snap::SnapMeta,
+    meta: &mut nau_core::snap_types::SnapMeta,
     patch: &serde_json::Value,
 ) -> miette::Result<()> {
     let Some(obj) = patch.as_object() else {
@@ -901,7 +901,7 @@ fn apply_overlay(
 /// Apply one overlay `confinement` value: the escape-hatch string
 /// "unconfined" lifts confinement for this pod, a grants table replaces it.
 fn apply_confinement_overlay(
-    meta: &mut crate::snap::SnapMeta,
+    meta: &mut nau_core::snap_types::SnapMeta,
     value: &serde_json::Value,
 ) -> miette::Result<()> {
     if value.as_str() == Some("unconfined") {
@@ -917,11 +917,11 @@ fn apply_confinement_overlay(
 }
 
 /// Convert a plain-data overlay `confinement` value (already JSON) into a
-/// [`crate::snap::Confinement`]. The overlay path is JSON data (the pod
+/// [`nau_core::snap_types::Confinement`]. The overlay path is JSON data (the pod
 /// table was serialized at parse time), so we round-trip through the
 /// grant field parsers by rebuilding a Lua table — that reuses the single
 /// Rust conversion boundary.
-fn confinement_from_overlay(value: &serde_json::Value) -> miette::Result<crate::snap::Confinement> {
+fn confinement_from_overlay(value: &serde_json::Value) -> miette::Result<nau_core::snap_types::Confinement> {
     if value.as_str() == Some("unconfined") {
         miette::bail!("expected a confinement grants table, got the string \"unconfined\"");
     }
@@ -936,7 +936,7 @@ fn confinement_from_overlay(value: &serde_json::Value) -> miette::Result<crate::
             .set(k.as_str(), value)
             .map_err(|e| miette::miette!("{e}"))?;
     }
-    crate::snap::confinement_from_lua(&table)
+    nau_chart::snap_lua::confinement_from_lua(&table)
 }
 
 /// Convert a JSON value into a Lua value (for re-parsing overlay data).
@@ -1169,7 +1169,7 @@ mod eval_memo {
     #[derive(Default)]
     pub(super) struct EvalMemo {
         decls: HashMap<(std::path::PathBuf, String), PodDeclaration>,
-        metas: HashMap<(String, Option<String>), crate::snap::SnapMeta>,
+        metas: HashMap<(String, Option<String>), nau_core::snap_types::SnapMeta>,
         /// Calls served from the memo (the "second call did not
         /// re-eval" proof seam for tests).
         pub(super) hits: u64,
@@ -1217,7 +1217,7 @@ mod eval_memo {
         });
     }
 
-    pub(super) fn meta_hit(name: &str, constraint: Option<&str>) -> Option<crate::snap::SnapMeta> {
+    pub(super) fn meta_hit(name: &str, constraint: Option<&str>) -> Option<nau_core::snap_types::SnapMeta> {
         MEMO.with(|m| {
             let mut slot = m.borrow_mut();
             let memo = slot.as_mut()?;
@@ -1229,7 +1229,7 @@ mod eval_memo {
         })
     }
 
-    pub(super) fn meta_put(name: &str, constraint: Option<&str>, meta: crate::snap::SnapMeta) {
+    pub(super) fn meta_put(name: &str, constraint: Option<&str>, meta: nau_core::snap_types::SnapMeta) {
         MEMO.with(|m| {
             if let Some(memo) = m.borrow_mut().as_mut() {
                 memo.evals += 1;
@@ -1806,14 +1806,14 @@ pub fn add_snap_pod(
     // is deferred below the pre-flights (issue #150 — same ordering
     // rule as the conversion warning: a refusal emits no reassurance).
     let mut store_records_only = false;
-    match crate::units::classify(meta.snap_type.as_deref()) {
-        crate::units::RuntimeClass::Infrastructure => miette::bail!(
+    match nau_core::units::classify(meta.snap_type.as_deref()) {
+        nau_core::units::RuntimeClass::Infrastructure => miette::bail!(
             "snap '{name}' is snapd infrastructure (type={:?}) — refusing to \
              sideload via the package axis",
             meta.snap_type
         ),
-        crate::units::RuntimeClass::Store => store_records_only = true,
-        crate::units::RuntimeClass::ShootBuilt => {}
+        nau_core::units::RuntimeClass::Store => store_records_only = true,
+        nau_core::units::RuntimeClass::ShootBuilt => {}
     }
 
     // Re-add bookkeeping: identical content is a no-op (checked above
@@ -2022,7 +2022,7 @@ pub fn add_snap_pod(
 /// unresolvable member bails naming the fix; a refusal here leaves
 /// zero state to roll back.
 fn preflight_requires_closure(
-    meta: &crate::units::PayloadSnap,
+    meta: &nau_core::units::PayloadSnap,
     name: &str,
     version: &str,
 ) -> miette::Result<()> {
@@ -2167,7 +2167,7 @@ fn payload_layer(decl: &PodDeclaration, name: &str) -> crate::farm::ClaimLayer {
 fn unpack_payload_identity(
     payload: &Path,
     unsquashfs: &Path,
-) -> miette::Result<(crate::units::PayloadSnap, Option<String>)> {
+) -> miette::Result<(nau_core::units::PayloadSnap, Option<String>)> {
     let work = tempfile::tempdir().map_err(|e| miette::miette!("tempdir: {e}"))?;
     let extract = work.path().join("extract");
     let status = std::process::Command::new(unsquashfs)
@@ -2195,7 +2195,7 @@ fn unpack_payload_identity(
                 yaml_path.display()
             )
         })?;
-    let meta: crate::units::PayloadSnap = serde_yaml::from_str(&yaml_text)
+    let meta: nau_core::units::PayloadSnap = serde_yaml::from_str(&yaml_text)
         .map_err(|e| miette::miette!("meta/snap.yaml parse for '{}': {e}", payload.display()))?;
     let identity: PayloadIdentity = serde_yaml::from_str(&yaml_text)
         .map_err(|e| miette::miette!("meta/snap.yaml version parse: {e}"))?;
@@ -2234,7 +2234,7 @@ impl PodPins<'_> {
 /// identical-content re-add fast path.
 fn refuse_foreign_arch(payload: &Path, arch: Option<&str>) -> miette::Result<()> {
     if let Some(arch) = arch {
-        let host = crate::snap::host_arch();
+        let host = nau_core::snap_types::host_arch();
         if arch != host && arch != "all" {
             miette::bail!(
                 "{}: filename says arch {arch} but this host is {host} — \
@@ -2259,7 +2259,7 @@ fn precheck_payload_collisions(
     root: &Path,
     decl: &PodDeclaration,
     name: &str,
-    payload: &crate::units::PayloadSnap,
+    payload: &nau_core::units::PayloadSnap,
     layer: crate::farm::ClaimLayer,
     pins: &PodPins<'_>,
 ) -> miette::Result<()> {
@@ -3232,7 +3232,7 @@ fn hold_style_skip_claims(
     binary_claims: &mut Vec<BinaryClaim>,
     service_claims: &mut Vec<ServiceClaim>,
     installed_pkg: &crate::runtime::InstalledPackage,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     layer: crate::farm::ClaimLayer,
 ) {
     push_desktop_claims(desktop_claims, installed_pkg, layer);
@@ -3279,7 +3279,7 @@ fn held_at_pin(
 /// recorded one, with the drift observation never skipped.
 fn held_at_content(
     active: Option<&crate::runtime::Generation>,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
 ) -> bool {
     if meta.floating {
         return false;
@@ -3320,7 +3320,7 @@ fn held_at_undigested_pin(
 /// presents the package's desktop IDs and binaries.
 fn hold_plain_sync(
     ctx: &ReconcileCtx<'_>,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     build: &mut ReconcileBuild,
 ) -> OwnScope {
     build.held.push(meta.name.clone());
@@ -3626,7 +3626,7 @@ const RECIPE_DIGEST_SCHEME: u32 = 2;
 fn detect_recipe_drift(
     ctx: &ReconcileCtx<'_>,
     spec: &PodPackageSpec,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     build: &mut ReconcileBuild,
 ) -> miette::Result<()> {
     let members = crate::deps::resolve_dep_names(&meta.requires, true)?;
@@ -3801,7 +3801,7 @@ fn scope_own_package(
     selected: bool,
     scoped: bool,
     overlay: bool,
-    meta: &mut crate::snap::SnapMeta,
+    meta: &mut nau_core::snap_types::SnapMeta,
     build: &mut ReconcileBuild,
 ) -> miette::Result<OwnScope> {
     if !selected {
@@ -3923,7 +3923,7 @@ fn scope_own_package(
 /// contain everything declared.
 fn hold_baselined_drift(
     ctx: &ReconcileCtx<'_>,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     build: &mut ReconcileBuild,
 ) -> Option<OwnScope> {
     if !build.recipe_baselined.contains(&meta.name) {
@@ -3972,7 +3972,7 @@ fn record_pin_movement(
     deps_pins: &mut Vec<(String, crate::lock::PackageDepsLock)>,
     lock: &LockFile,
     spec: &PodPackageSpec,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     deps_pin: Option<&crate::lock::PackageDepsLock>,
     recipe_sha256: Option<&str>,
 ) {
@@ -4554,7 +4554,7 @@ fn loaded_contributions(
 fn load_meta_memoized(
     name: &str,
     constraint: Option<&str>,
-) -> miette::Result<crate::snap::SnapMeta> {
+) -> miette::Result<nau_core::snap_types::SnapMeta> {
     if let Some(hit) = eval_memo::meta_hit(name, constraint) {
         return Ok(hit);
     }
@@ -4568,7 +4568,7 @@ fn load_meta_memoized(
 /// with `constraint = "22"` so the recipe selects the declared line.
 /// `node` (no constraint) evaluates unconstrained — the recipe's own
 /// default line.
-fn load_spec_meta(spec: &PodPackageSpec) -> miette::Result<crate::snap::SnapMeta> {
+fn load_spec_meta(spec: &PodPackageSpec) -> miette::Result<nau_core::snap_types::SnapMeta> {
     load_meta_memoized(&spec.name, spec.constraint.as_deref())
 }
 
@@ -4580,7 +4580,7 @@ fn resolve_own_meta(
     spec: &PodPackageSpec,
     overlay: &BTreeMap<String, serde_json::Value>,
     lock: &LockFile,
-) -> miette::Result<crate::snap::SnapMeta> {
+) -> miette::Result<nau_core::snap_types::SnapMeta> {
     let mut meta = load_spec_meta(spec).map_err(|e| {
         miette::miette!(
             "cannot build declared package '{}': {e} (declaration at {})",
@@ -4634,11 +4634,11 @@ fn resolve_own_meta(
 /// Decision 4a) compares OBSERVED hashes against the lock's records and
 /// never reads the rebased digest — a moved asset under a stale tag
 /// cannot hold through it.
-fn rebase_floating_source_pin(meta: &mut crate::snap::SnapMeta, lock: &LockFile) {
+fn rebase_floating_source_pin(meta: &mut nau_core::snap_types::SnapMeta, lock: &LockFile) {
     if !meta.floating {
         return;
     }
-    let Some(crate::snap::SourceSpec::Pinned { url, sha256 }) = meta.source.as_mut() else {
+    let Some(nau_core::snap_types::SourceSpec::Pinned { url, sha256 }) = meta.source.as_mut() else {
         return;
     };
     if let Some(recorded) = lock.lookup_source(url) {
@@ -4778,7 +4778,7 @@ fn commit_pending_recipe_stamp(
 /// from paying a probe download it would never compare.
 fn float_hold_guards_open(
     ctx: &ReconcileCtx<'_>,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     build: &ReconcileBuild,
     scoped: bool,
     overlay: bool,
@@ -4805,7 +4805,7 @@ fn float_hold_guards_open(
 /// identity: no source member comparison fails open, toward rebuilding.
 fn float_source_member_holds(
     lock: &LockFile,
-    source: Option<&crate::snap::SourceSpec>,
+    source: Option<&nau_core::snap_types::SourceSpec>,
     observed: Option<&str>,
 ) -> bool {
     match (source, observed) {
@@ -4859,7 +4859,7 @@ fn float_deps_member_holds(
 /// then holds from then on (the migration bridge).
 fn held_float_at_observed_inputs(
     ctx: &ReconcileCtx<'_>,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     fresh_deps: Option<&crate::lock::PackageDepsLock>,
     observed_source: Option<&str>,
     build: &ReconcileBuild,
@@ -4899,7 +4899,7 @@ fn held_float_at_observed_inputs(
 fn build_own_package(
     ctx: &ReconcileCtx<'_>,
     spec: &PodPackageSpec,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     layer: crate::farm::ClaimLayer,
     force_float: bool,
     scoped: bool,
@@ -4920,7 +4920,7 @@ fn build_own_package(
     if hold_possible {
         let observed_source = match observed_from_deps.as_ref() {
             Some(obs) => Some(obs.sha256.clone()),
-            None => crate::snap::observe_source(meta)?,
+            None => nau_build::snap::observe_source(meta)?,
         };
         if held_float_at_observed_inputs(
             ctx,
@@ -5040,7 +5040,7 @@ fn resolve_loaded_meta(
     pod_name: &str,
     loaded_patch: Option<&serde_json::Value>,
     own_patch: Option<&serde_json::Value>,
-) -> miette::Result<crate::snap::SnapMeta> {
+) -> miette::Result<nau_core::snap_types::SnapMeta> {
     let mut meta = load_meta_memoized(name, constraint).map_err(|e| {
         miette::miette!("loaded package '{name}' from pod '{pod_name}' cannot be resolved: {e}")
     })?;
@@ -5122,7 +5122,7 @@ fn collect_loaded_packages(
 
 /// Pin the loaded package at the executing version (a loaded pod's
 /// active generation version wins over collection drift).
-fn pin_loaded_version(meta: &mut crate::snap::SnapMeta, contributed: &ContributedPkg) {
+fn pin_loaded_version(meta: &mut nau_core::snap_types::SnapMeta, contributed: &ContributedPkg) {
     if let Some(version) = &contributed.version {
         if !version.is_empty() {
             meta.version = version.clone();
@@ -5155,7 +5155,7 @@ fn loaded_hold_record<'a>(
     ctx: &ReconcileCtx<'a>,
     source_pod: Option<&str>,
     own_overlay: bool,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     build: &ReconcileBuild,
 ) -> miette::Result<Option<&'a crate::runtime::InstalledPackage>> {
     if build.refresh_members.contains(&meta.name) || build.recipe_drift_members.contains(&meta.name)
@@ -5210,7 +5210,7 @@ fn loaded_hold_record<'a>(
 ///    equals the declaring pod's lock entry version AND the installed
 ///    version.
 /// 2. **Source** — the OBSERVED sha256 under the floating ref (a real
-///    download via [`crate::snap::observe_source`]; never skipped —
+///    download via [`nau_build::snap::observe_source`]; never skipped —
 ///    float still means re-resolve) equals the declaring pod's
 ///    restamped `sources` record. A source the lock never restamped
 ///    cannot prove identity.
@@ -5237,7 +5237,7 @@ fn loaded_float_hold_record<'a>(
     ctx: &ReconcileCtx<'a>,
     source_pod: Option<&str>,
     own_overlay: bool,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
 ) -> miette::Result<Option<&'a crate::runtime::InstalledPackage>> {
     if own_overlay {
         return Ok(None);
@@ -5261,7 +5261,7 @@ fn loaded_float_hold_record<'a>(
     };
     // The source drift probe — NEVER skipped (Decision 4): observe the
     // floating ref, compare against the declaring pod's restamped record.
-    let observed = crate::snap::observe_source(meta)?;
+    let observed = nau_build::snap::observe_source(meta)?;
     if !float_lock_tuple_holds(&lock, meta, observed.as_deref()) {
         return Ok(None);
     }
@@ -5282,7 +5282,7 @@ fn loaded_float_hold_record<'a>(
 /// the OBSERVED sha256 under the floating ref.
 fn float_lock_tuple_holds(
     lock: &LockFile,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     observed: Option<&str>,
 ) -> bool {
     let Some(entry) = lock.packages.get(&meta.name) else {
@@ -5336,7 +5336,7 @@ fn hold_loaded_member(
     ctx: &ReconcileCtx<'_>,
     source_pod: Option<&str>,
     installed: &crate::runtime::InstalledPackage,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     build: &mut ReconcileBuild,
 ) -> miette::Result<()> {
     queue_held_loaded_deps_verify(ctx, source_pod, &meta.name, build)?;
@@ -5371,7 +5371,7 @@ fn hold_loaded_member(
 /// collision classifier would see a phantom Loaded claim).
 fn build_loaded_member(
     ctx: &ReconcileCtx<'_>,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     contributed: &ContributedPkg,
     build: &mut ReconcileBuild,
 ) -> miette::Result<()> {
@@ -5423,7 +5423,7 @@ fn build_loaded_member(
 /// the pod keeps whatever content it carries for the member (it stays
 /// in `declared_names`, so remove_undeclared never wipes it).
 fn contain_loaded_build_failure(
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     err: miette::Error,
 ) -> miette::Result<()> {
     if meta.deps.is_some() {
@@ -5789,7 +5789,7 @@ struct DesktopClaim {
 /// (a package about to be built): every app carrying a `desktop` field.
 fn push_meta_desktop_claims(
     claims: &mut Vec<DesktopClaim>,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     layer: crate::farm::ClaimLayer,
 ) {
     for (app_id, app) in &meta.apps {
@@ -5875,7 +5875,7 @@ fn precheck_binary_collision(
     root: &Path,
     decl: &PodDeclaration,
     new_name: &str,
-    new_meta: &crate::snap::SnapMeta,
+    new_meta: &nau_core::snap_types::SnapMeta,
     new_layer: crate::farm::ClaimLayer,
 ) -> miette::Result<()> {
     let mut claims: Vec<BinaryClaim> = Vec::new();
@@ -5965,7 +5965,7 @@ struct BinaryClaim {
 /// about to be built): the name of every app the package exports.
 fn push_meta_binary_claims(
     claims: &mut Vec<BinaryClaim>,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     layer: crate::farm::ClaimLayer,
 ) {
     for app in meta.apps.keys() {
@@ -6075,7 +6075,7 @@ fn precheck_service_collision(
     root: &Path,
     decl: &PodDeclaration,
     new_name: &str,
-    new_meta: &crate::snap::SnapMeta,
+    new_meta: &nau_core::snap_types::SnapMeta,
     new_layer: crate::farm::ClaimLayer,
 ) -> miette::Result<()> {
     let mut claims: Vec<ServiceClaim> = Vec::new();
@@ -6155,7 +6155,7 @@ fn push_loaded_service_claims(
 /// every service the package declares.
 fn push_meta_service_claims(
     claims: &mut Vec<ServiceClaim>,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     layer: crate::farm::ClaimLayer,
 ) {
     for service in meta.services.keys() {
@@ -6249,7 +6249,7 @@ pub(crate) fn resolve_service_options(
     // naming the key.
     for (key, value) in &options {
         if let Some(s) = value.as_str() {
-            crate::snap::validate_exec_text(service, &format!("options.{key}"), s)?;
+            nau_chart::snap_lua::validate_exec_text(service, &format!("options.{key}"), s)?;
         }
     }
     // `enabled` drives activation (ADR-0032 Decision 7) — a quoted
@@ -6431,7 +6431,7 @@ fn walk_post_state_services(
 /// Record one package's service claims in the declared-service map.
 fn record_declared_services(
     declared: &mut BTreeMap<String, Vec<String>>,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
 ) {
     for service in meta.services.keys() {
         declared
@@ -6447,7 +6447,7 @@ fn record_declared_services(
 /// are dropped until the emitter lands (ticket #106).
 fn resolve_service_overrides_against_meta(
     overrides: &BTreeMap<String, BTreeMap<String, serde_json::Value>>,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     pod_name: &str,
 ) -> miette::Result<()> {
     for (service, decl) in &meta.services {
@@ -6520,13 +6520,13 @@ fn set_pod_build_epoch() {
 /// carry no build-only references.
 fn build_pending_snap(
     store: &crate::runtime::RuntimeStore,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     layer: crate::farm::ClaimLayer,
     deps_pin: Option<&crate::lock::PackageDepsLock>,
     source_pod: Option<&str>,
     bypass_source_cache: bool,
     content_check: bool,
-) -> miette::Result<(crate::runtime::PendingSnap, Vec<crate::snap::SourceInfo>)> {
+) -> miette::Result<(crate::runtime::PendingSnap, Vec<nau_build::snap::SourceInfo>)> {
     set_pod_build_epoch();
     let deps_dir = resolve_build_deps_dir(store, meta, deps_pin, source_pod)?;
     // Merged build prefix (ADR-0018, issue #35): `requires` ∪ `build_deps`
@@ -6547,12 +6547,12 @@ fn build_pending_snap(
     // build path takes the crate-agnostic `nau_core::blob_store` seam
     // handle (issue #326 PR 2), not the runtime store itself.
     let blob_store = store.blob_store();
-    let result = crate::snap::build_snap(
+    let result = nau_build::snap::build_snap(
         meta,
         stage.path(),
         &downloads,
-        crate::snap::host_arch(),
-        crate::snap::StagePolicy::Default,
+        nau_core::snap_types::host_arch(),
+        nau_build::snap::StagePolicy::Default,
         Some(&blob_store),
         deps_dir.as_ref().map(|d| d.path()),
         build_prefix.as_ref().map(|p| p.path()),
@@ -6623,7 +6623,7 @@ fn deps_gate_error(name: &str, source_pod: Option<&str>) -> miette::Error {
 /// it alive for as long as the build runs.
 fn pod_build_prefix(
     store: &crate::runtime::RuntimeStore,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     building: &mut Vec<String>,
     content_check: bool,
 ) -> miette::Result<Option<crate::build_prefix::MergedPrefix>> {
@@ -6717,7 +6717,7 @@ enum PodContentCheck {
 fn ensure_pod_dep_payload(
     store: &crate::runtime::RuntimeStore,
     name: &str,
-    dep_meta: &crate::snap::SnapMeta,
+    dep_meta: &nau_core::snap_types::SnapMeta,
     building: &mut Vec<String>,
     force_build: bool,
     check: PodContentCheck,
@@ -6730,7 +6730,7 @@ fn ensure_pod_dep_payload(
         "{}_{}_{}.snap",
         name,
         dep_meta.version,
-        crate::snap::host_arch()
+        nau_core::snap_types::host_arch()
     ));
     if existing.exists() && !force_build {
         verify_cached_dep_payload(&existing, name)?;
@@ -6773,12 +6773,12 @@ fn ensure_pod_dep_payload(
     // build path takes the `nau_core::blob_store` seam handle (issue
     // // #326 PR 2), not the runtime store itself.
     let blob_store = store.blob_store();
-    let result = match crate::snap::build_snap(
+    let result = match nau_build::snap::build_snap(
         dep_meta,
         stage.path(),
         &downloads,
-        crate::snap::host_arch(),
-        crate::snap::StagePolicy::Default,
+        nau_core::snap_types::host_arch(),
+        nau_build::snap::StagePolicy::Default,
         Some(&blob_store),
         None,
         dep_prefix.as_ref().map(|p| p.path()),
@@ -6813,7 +6813,7 @@ fn ensure_pod_dep_payload(
 fn dep_content_reuse_ok(
     existing: &Path,
     name: &str,
-    dep_meta: &crate::snap::SnapMeta,
+    dep_meta: &nau_core::snap_types::SnapMeta,
     check: PodContentCheck,
 ) -> miette::Result<bool> {
     match check {
@@ -6839,7 +6839,7 @@ fn dep_content_reuse_ok(
 fn report_stale_dep_payload(
     existing: &Path,
     name: &str,
-    dep_meta: &crate::snap::SnapMeta,
+    dep_meta: &nau_core::snap_types::SnapMeta,
 ) -> miette::Result<()> {
     let key = dep_content_key(name, dep_meta)?;
     if let Some(recorded) = read_dep_content_key(existing) {
@@ -6866,7 +6866,7 @@ fn report_stale_dep_payload(
 fn cached_dep_content_ok(
     existing: &Path,
     name: &str,
-    dep_meta: &crate::snap::SnapMeta,
+    dep_meta: &nau_core::snap_types::SnapMeta,
 ) -> miette::Result<bool> {
     let key = dep_content_key(name, dep_meta)?;
     match read_dep_content_key(existing) {
@@ -6898,7 +6898,7 @@ fn cached_dep_content_ok(
 fn record_built_payload_provenance(
     payload: &Path,
     name: &str,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
 ) -> miette::Result<String> {
     nau_core::blob_memo::invalidate(payload);
     let sha3_384 = sha3_384_file_memoized(payload)?;
@@ -6912,7 +6912,7 @@ fn record_built_payload_provenance(
 /// the named refusal.
 fn resolve_build_deps_dir(
     store: &crate::runtime::RuntimeStore,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     deps_pin: Option<&crate::lock::PackageDepsLock>,
     source_pod: Option<&str>,
 ) -> miette::Result<Option<tempfile::TempDir>> {
@@ -6951,7 +6951,7 @@ fn dep_content_key_path(payload: &Path) -> PathBuf {
 /// drift scheme — one canonicalization, not two) over the dep's own
 /// recipe bytes followed by its `build_deps` members'. Same recipes →
 /// same key; any content edit → a different key.
-fn dep_content_key(name: &str, dep_meta: &crate::snap::SnapMeta) -> miette::Result<String> {
+fn dep_content_key(name: &str, dep_meta: &nau_core::snap_types::SnapMeta) -> miette::Result<String> {
     let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
     entries.push((name.to_string(), own_recipe_bytes(name)?));
     let seeds = crate::deps::build_dep_seeds(dep_meta);
@@ -7080,7 +7080,7 @@ fn record_dep_payload_digest(payload: &Path, sha3_384: &str) -> miette::Result<(
 fn ensure_own_deps(
     store: &crate::runtime::RuntimeStore,
     lock: &LockFile,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     pkg_name: &str,
     force_float: bool,
 ) -> miette::Result<(
@@ -7148,7 +7148,7 @@ impl ProbeSkip {
 /// usable validator logs `full fetch (<reason>)`.
 fn float_source_validators(
     lock: &LockFile,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
 ) -> Option<nau_core::lock::SourceValidators> {
     if !meta.floating {
         // Fixed pin: no drift probe, no telemetry, no behavior change.
@@ -7182,7 +7182,7 @@ fn float_source_validators(
 
 /// The `drift probe` telemetry line for a probed float that falls back
 /// to a plain full GET (nau_infra::output; suppressed in JSON mode).
-fn probe_full_fetch_line(meta: &crate::snap::SnapMeta, reason: ProbeSkip) {
+fn probe_full_fetch_line(meta: &nau_core::snap_types::SnapMeta, reason: ProbeSkip) {
     nau_infra::output::info(format!(
         "drift probe '{}': full fetch ({})",
         meta.name,
@@ -7202,7 +7202,7 @@ fn probe_full_fetch_line(meta: &crate::snap::SnapMeta, reason: ProbeSkip) {
 /// `prepare_snap` skips the redundant re-hash. Every non-build origin
 /// keeps `Fetched` and the full fail-closed verify (issue #116).
 fn build_pending_snap_at(
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     payload_path: &Path,
     sha3_384: String,
     layer: crate::farm::ClaimLayer,
@@ -7899,8 +7899,8 @@ pod {
 
     /// Bare SnapMeta with every optional field empty (mirrors the test
     /// helper in manifest.rs).
-    fn bare_meta(name: &str, version: &str) -> crate::snap::SnapMeta {
-        crate::snap::SnapMeta {
+    fn bare_meta(name: &str, version: &str) -> nau_core::snap_types::SnapMeta {
+        nau_core::snap_types::SnapMeta {
             name: name.into(),
             version: version.into(),
             summary: None,
@@ -8755,7 +8755,7 @@ pod {
     /// A floating bare meta with no source and no deps: every tuple
     /// member but the version compares trivially, so the unit tests run
     /// fully offline (no download, no closure fetch).
-    fn floating_meta(version: &str) -> crate::snap::SnapMeta {
+    fn floating_meta(version: &str) -> nau_core::snap_types::SnapMeta {
         let mut meta = bare_meta("tool", version);
         meta.floating = true;
         meta
@@ -8847,7 +8847,7 @@ pod {
     fn test_float_predicate_holds_on_a_matching_tuple() {
         let url = "https://example.invalid/tool.tar.gz";
         let mut meta = floating_meta("1.0");
-        meta.source = Some(crate::snap::SourceSpec::Pinned {
+        meta.source = Some(nau_core::snap_types::SourceSpec::Pinned {
             url: url.to_string(),
             sha256: "seed".to_string(),
         });
@@ -8885,7 +8885,7 @@ pod {
     fn test_float_rebuilds_when_the_source_hash_moved() {
         let url = "https://example.invalid/tool.tar.gz";
         let mut meta = floating_meta("1.0");
-        meta.source = Some(crate::snap::SourceSpec::Pinned {
+        meta.source = Some(nau_core::snap_types::SourceSpec::Pinned {
             url: url.to_string(),
             sha256: "seed".to_string(),
         });
@@ -8911,7 +8911,7 @@ pod {
         assert!(!held, "a moved source must rebuild");
         // A url the lock never restamped cannot prove identity either.
         let mut meta_unseen = floating_meta("1.0");
-        meta_unseen.source = Some(crate::snap::SourceSpec::Pinned {
+        meta_unseen.source = Some(nau_core::snap_types::SourceSpec::Pinned {
             url: "https://example.invalid/unseen.tar.gz".to_string(),
             sha256: "seed".to_string(),
         });
@@ -9484,7 +9484,7 @@ pod {
             .collect();
 
         let mut meta = bare_meta("codegraph", "1.0");
-        meta.deps = Some(crate::snap::PackageDeps {
+        meta.deps = Some(nau_core::snap_types::PackageDeps {
             npm: None,
             pip: None,
             cargo: None,
@@ -9552,7 +9552,7 @@ pod {
     #[test]
     fn test_loaded_member_without_a_declaring_pod_pin_still_refuses_at_the_gate() {
         let mut meta = bare_meta("codegraph", "1.0");
-        meta.deps = Some(crate::snap::PackageDeps {
+        meta.deps = Some(nau_core::snap_types::PackageDeps {
             npm: None,
             pip: None,
             cargo: None,
@@ -9607,7 +9607,7 @@ pod {
         contain_loaded_build_failure(&meta, miette::miette!("build exploded"))
             .expect("a deps-less member's failure must be contained");
 
-        meta.deps = Some(crate::snap::PackageDeps {
+        meta.deps = Some(nau_core::snap_types::PackageDeps {
             npm: None,
             pip: None,
             cargo: None,
@@ -9626,7 +9626,7 @@ pod {
     #[test]
     fn test_deps_gate_error_names_the_declaring_pod() {
         let mut meta = bare_meta("codegraph", "1.0");
-        meta.deps = Some(crate::snap::PackageDeps {
+        meta.deps = Some(nau_core::snap_types::PackageDeps {
             npm: None,
             pip: None,
             cargo: None,
@@ -10854,7 +10854,7 @@ pod {
     fn float_source_validators_gate() {
         let url = "https://example.invalid/tool.tar.gz";
         let mut meta = floating_meta("1.0");
-        meta.source = Some(crate::snap::SourceSpec::Pinned {
+        meta.source = Some(nau_core::snap_types::SourceSpec::Pinned {
             url: url.to_string(),
             sha256: "seed".to_string(),
         });

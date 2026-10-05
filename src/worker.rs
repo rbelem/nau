@@ -55,7 +55,7 @@ pub fn capability_document() -> CapabilityDoc {
     });
     CapabilityDoc {
         protocol: WORKER_PROTOCOL_VERSION,
-        arch: crate::snap::host_arch().to_string(),
+        arch: nau_core::snap_types::host_arch().to_string(),
         nproc: std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1),
@@ -287,7 +287,7 @@ impl Drop for JobStateGuard {
         std::env::set_current_dir(&self.cwd).ok();
         restore_var("SOURCE_DATE_EPOCH", self.epoch.as_deref());
         restore_var("NAU_TOOL_CURL", self.curl.as_deref());
-        crate::snap::set_buffer_child_stderr(false);
+        nau_build::snap::set_buffer_child_stderr(false);
     }
 }
 
@@ -350,12 +350,12 @@ fn extract_stage_blob(blob: &Path, stage: &Path) -> miette::Result<()> {
 /// The build half of `run_job`, after meta is loaded and checked.
 fn finish_job(
     manifest: &JobManifest,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     payloads: &PayloadSet,
     out_dir: &Path,
 ) -> miette::Result<JobResult> {
     refuse_unshipped_sources(manifest, meta, payloads)?;
-    crate::snap::check_cross_build(&manifest.target, meta.target.as_deref())?;
+    nau_build::snap::check_cross_build(&manifest.target, meta.target.as_deref())?;
 
     // Dep payloads merge into the ordinary build prefix (ADR-0018); the
     // prefix tempdir must outlive the build.
@@ -380,16 +380,16 @@ fn finish_job(
     // Machine verb: buffer the child stderr so it rides into the result
     // document instead of interleaving into the worker's own stderr
     // (issue #55 precedent).
-    crate::snap::set_buffer_child_stderr(true);
+    nau_build::snap::set_buffer_child_stderr(true);
     // The build child's own wall — the number the coordinator cannot
     // observe across the channel and the summary's `build` phase (#302).
     let build_started = std::time::Instant::now();
-    let build = crate::snap::build_snap(
+    let build = nau_build::snap::build_snap(
         meta,
         stage.path(),
         out_dir,
         &manifest.target,
-        crate::snap::StagePolicy::Default,
+        nau_build::snap::StagePolicy::Default,
         // No pod store, no interpreted-deps closure on a Worker job.
         None,
         None,
@@ -410,7 +410,7 @@ fn finish_job(
 fn job_result(
     manifest: &JobManifest,
     out_dir: &Path,
-    build: miette::Result<crate::snap::BuildResult>,
+    build: miette::Result<nau_build::snap::BuildResult>,
     build_ms: Option<u64>,
 ) -> JobResult {
     let mut result = JobResult {
@@ -663,13 +663,13 @@ fn refuse_shell_meta_url(url: &str) -> miette::Result<()> {
 /// by name instead of building either bytes).
 fn refuse_unshipped_sources(
     manifest: &JobManifest,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     payloads: &PayloadSet,
 ) -> miette::Result<()> {
-    let check = |spec: &crate::snap::SourceSpec, label: &str| -> miette::Result<()> {
+    let check = |spec: &nau_core::snap_types::SourceSpec, label: &str| -> miette::Result<()> {
         let (url, expected) = match spec {
-            crate::snap::SourceSpec::Pinned { url, sha256 } => (url, sha256),
-            crate::snap::SourceSpec::Unverified(url) => {
+            nau_core::snap_types::SourceSpec::Pinned { url, sha256 } => (url, sha256),
+            nau_core::snap_types::SourceSpec::Unverified(url) => {
                 return Err(miette::miette!(
                     "worker-job: {label} source {url} is not sha256-pinned — \
                      workers never fetch upstream; the coordinator must ship a pinned source"

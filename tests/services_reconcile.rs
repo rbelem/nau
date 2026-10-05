@@ -25,7 +25,7 @@ use std::process::Command;
 use nau::farm::ClaimLayer;
 use nau::runtime::{Generation, InstalledPackage};
 use nau::services::ServiceUnit;
-use nau::snap::ServiceDaemon;
+use nau_core::snap_types::ServiceDaemon;
 
 // ── Fake systemd tools (pod_deps.rs pattern) ──
 

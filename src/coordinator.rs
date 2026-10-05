@@ -16,7 +16,7 @@ use std::os::unix::fs::PermissionsExt;
 use crate::build_sched::ManifestSource;
 use crate::command::{exit_code, CommandRunner};
 use crate::lock::LockFile;
-use crate::snap::{SnapMeta, SourceSpec};
+use nau_core::snap_types::{SnapMeta, SourceSpec};
 use crate::ssh_exec::{PreflightChecks, SshExecutor, PREFLIGHT_MIN_FREE_DISK_BYTES};
 
 /// Stage-only recipe: no `build`, no `parts` — exactly the shape
@@ -663,7 +663,7 @@ pub fn precompute_farm_plans(
     let mut caps: HashMap<String, crate::build_sched::JobCaps> = HashMap::new();
 
     for (name, meta) in metas {
-        let archs = crate::snap::resolve_archs(meta, cli_archs);
+        let archs = nau_core::snap_types::resolve_archs(meta, cli_archs);
         // A job building several archs mixes per-arch build prefixes
         // into one manifest — a shape the v1 manifest does not carry;
         // it stays local before anything else is even attempted. Same

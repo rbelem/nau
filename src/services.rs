@@ -70,7 +70,7 @@ pub struct ServiceUnit {
     pub layer: crate::farm::ClaimLayer,
     /// The daemon kind (`simple`/`notify`/`forking`) — the systemd
     /// `Type=` on this backend.
-    pub daemon: crate::snap::ServiceDaemon,
+    pub daemon: nau_core::snap_types::ServiceDaemon,
     /// The resolved enablement (pod override > package default > false).
     pub enabled: bool,
     /// The absolute farm path of the service binary:
@@ -350,7 +350,7 @@ fn build_unit(
     ctx: &ResolveCtx,
     svc: &str,
     pkg: &crate::runtime::InstalledPackage,
-    decl: &crate::snap::ServiceDecl,
+    decl: &nau_core::snap_types::ServiceDecl,
     resolved: &crate::pod::ResolvedServiceOptions,
     nau_services: &BTreeSet<String>,
 ) -> miette::Result<ServiceUnit> {
@@ -411,7 +411,7 @@ fn expand_all_args(
 fn render_unit(
     ctx: &ResolveCtx,
     svc: &str,
-    decl: &crate::snap::ServiceDecl,
+    decl: &nau_core::snap_types::ServiceDecl,
     args: &[String],
     environment: &BTreeMap<String, String>,
     ld_library_path: Option<String>,
@@ -504,7 +504,7 @@ fn render_after_lines(
 fn render_backend_passthrough(
     out: &mut String,
     svc: &str,
-    decl: &crate::snap::ServiceDecl,
+    decl: &nau_core::snap_types::ServiceDecl,
 ) -> miette::Result<()> {
     let Some(systemd) = decl.backend_options.get("systemd") else {
         return Ok(());
@@ -528,11 +528,11 @@ fn render_backend_passthrough(
 }
 
 /// The systemd `Type=` for a declared daemon kind.
-fn daemon_type(daemon: crate::snap::ServiceDaemon) -> &'static str {
+fn daemon_type(daemon: nau_core::snap_types::ServiceDaemon) -> &'static str {
     match daemon {
-        crate::snap::ServiceDaemon::Simple => "simple",
-        crate::snap::ServiceDaemon::Notify => "notify",
-        crate::snap::ServiceDaemon::Forking => "forking",
+        nau_core::snap_types::ServiceDaemon::Simple => "simple",
+        nau_core::snap_types::ServiceDaemon::Notify => "notify",
+        nau_core::snap_types::ServiceDaemon::Forking => "forking",
     }
 }
 
@@ -1807,7 +1807,7 @@ mod tests {
     use super::*;
     use crate::farm::ClaimLayer;
     use crate::runtime::InstalledPackage;
-    use crate::snap::{ServiceDaemon, ServiceDecl};
+    use nau_core::snap_types::{ServiceDaemon, ServiceDecl};
 
     fn store_fixture(dir: &std::path::Path) -> RuntimeStore {
         // The documented pod layout `<data-home>/nau/pods/<pod>`:

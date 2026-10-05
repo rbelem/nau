@@ -10,7 +10,7 @@ use std::sync::Mutex;
 
 use crate::cache::PackageCache;
 use crate::lock::{LockFile, SourceLockEntry};
-use crate::snap::{PackageInput, SourceSpec};
+use nau_core::snap_types::{PackageInput, SourceSpec};
 
 // ── Injected multi-source fetcher (ADR-0053 composition) ──
 // nau-build is network-free by charter; the root wires the retrying
@@ -163,10 +163,10 @@ fn prepare_inputs(
 fn dep_fully_cached(
     cache: &crate::cache::PackageCache,
     closure: &crate::cache::BuildClosure,
-    dep_meta: &crate::snap::SnapMeta,
+    dep_meta: &nau_core::snap_types::SnapMeta,
     cli_archs: &[String],
 ) -> bool {
-    crate::snap::resolve_archs(dep_meta, cli_archs)
+    nau_core::snap_types::resolve_archs(dep_meta, cli_archs)
         .iter()
         .all(|a| cache.lookup(dep_meta, a, closure).is_some())
 }
@@ -193,7 +193,7 @@ fn names_default_stage(given: &Path) -> bool {
 /// explicit-stage precondition: a user-chosen directory that already has
 /// contents is refused up front — never wiped. The default `./stage/` is
 /// additionally pinned by a cross-process advisory lock
-/// ([`crate::snap::StageLock`], gate-pod gap 6): two concurrent builds
+/// ([`nau_build::snap::StageLock`], gate-pod gap 6): two concurrent builds
 /// must not silently share it, so the second build refuses loudly and is
 /// pointed at `--stage`. The lock is returned to the caller, which holds
 /// it for the whole build; an explicit `--stage` is user-owned and never
@@ -202,8 +202,8 @@ fn resolve_stage(
     stage: Option<String>,
 ) -> miette::Result<(
     std::path::PathBuf,
-    crate::snap::StagePolicy,
-    Option<crate::snap::StageLock>,
+    nau_build::snap::StagePolicy,
+    Option<nau_build::snap::StageLock>,
 )> {
     match stage {
         Some(path) => {
@@ -219,14 +219,14 @@ fn resolve_stage(
                      pass a different directory as --stage"
                 );
             }
-            let policy = crate::snap::StagePolicy::Explicit;
-            crate::snap::check_explicit_stage(Path::new(&path))?;
+            let policy = nau_build::snap::StagePolicy::Explicit;
+            nau_build::snap::check_explicit_stage(Path::new(&path))?;
             Ok((std::path::PathBuf::from(path), policy, None))
         }
         None => {
             let stage = std::path::PathBuf::from("./stage/");
-            let lock = crate::snap::StageLock::acquire(&stage)?;
-            Ok((stage, crate::snap::StagePolicy::Default, Some(lock)))
+            let lock = nau_build::snap::StageLock::acquire(&stage)?;
+            Ok((stage, nau_build::snap::StagePolicy::Default, Some(lock)))
         }
     }
 }
@@ -361,8 +361,8 @@ pub(crate) fn select_outputs<'a>(
     file: &str,
     target: Option<&String>,
     json: bool,
-) -> miette::Result<Vec<(&'a String, crate::snap::SnapMeta)>> {
-    let iter: Vec<(&String, crate::snap::SnapMeta)> = match output_name {
+) -> miette::Result<Vec<(&'a String, nau_core::snap_types::SnapMeta)>> {
+    let iter: Vec<(&String, nau_core::snap_types::SnapMeta)> = match output_name {
         Some(name) => {
             let mut meta = all_outputs
                 .get(name)
@@ -377,7 +377,7 @@ pub(crate) fn select_outputs<'a>(
             vec![(name, meta)]
         }
         None => {
-            let mut vec: Vec<(&String, crate::snap::SnapMeta)> = Vec::new();
+            let mut vec: Vec<(&String, nau_core::snap_types::SnapMeta)> = Vec::new();
             for (name, meta_ref) in all_outputs {
                 let mut meta = meta_ref.clone();
                 if let Some(t) = target {
@@ -403,7 +403,7 @@ pub(crate) fn select_outputs<'a>(
 /// first-seen order. Seeds are the build-time dependency union
 /// (`requires` ∪ `build_deps`) — both kinds get built (ADR-0018).
 pub(crate) fn collect_dep_graph(
-    iter: &[(&String, crate::snap::SnapMeta)],
+    iter: &[(&String, nau_core::snap_types::SnapMeta)],
 ) -> Vec<crate::deps::DepNode> {
     let mut nodes: Vec<crate::deps::DepNode> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -436,7 +436,7 @@ pub(crate) fn collect_dep_graph(
 /// the scheduler prints attributable lines instead).
 #[allow(clippy::too_many_arguments)]
 fn ensure_build_prefix(
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     arch: &str,
     output_dir: &Path,
     pkg_cache: Option<&PackageCache>,
@@ -445,7 +445,7 @@ fn ensure_build_prefix(
     quiet: bool,
     building: &mut Vec<String>,
     run_stage: &Path,
-    run_stage_policy: crate::snap::StagePolicy,
+    run_stage_policy: nau_build::snap::StagePolicy,
 ) -> miette::Result<Option<crate::build_prefix::MergedPrefix>> {
     // Only source builds consume a build prefix — meta/store snaps and
     // fetch-only declarations never run a build command.
@@ -502,7 +502,7 @@ fn ensure_build_prefix(
 #[allow(clippy::too_many_arguments)]
 fn ensure_dep_payload(
     name: &str,
-    dep_meta: &crate::snap::SnapMeta,
+    dep_meta: &nau_core::snap_types::SnapMeta,
     arch: &str,
     output_dir: &Path,
     pkg_cache: Option<&PackageCache>,
@@ -511,7 +511,7 @@ fn ensure_dep_payload(
     quiet: bool,
     building: &mut Vec<String>,
     run_stage: &Path,
-    run_stage_policy: crate::snap::StagePolicy,
+    run_stage_policy: nau_build::snap::StagePolicy,
 ) -> miette::Result<PathBuf> {
     let filename = format!("{}_{}_{}.snap", name, dep_meta.version, arch);
     let in_output = output_dir.join(&filename);
@@ -549,7 +549,7 @@ fn ensure_dep_payload(
         run_stage_policy,
     )?;
 
-    crate::snap::check_cross_build(arch, dep_meta.target.as_deref())?;
+    nau_build::snap::check_cross_build(arch, dep_meta.target.as_deref())?;
     if !json && !quiet {
         crate::output::status(format!("building dependency {name} ({arch})..."));
     }
@@ -561,7 +561,7 @@ fn ensure_dep_payload(
         None => crate::leak_scan::PayloadListings::default(),
     };
 
-    let result = crate::snap::build_snap(
+    let result = nau_build::snap::build_snap(
         dep_meta,
         stage.path(),
         output_dir,
@@ -594,7 +594,7 @@ fn ensure_dep_payload(
 /// ready-node build borrows from the orchestrator. Fields are read-only
 /// for the whole phase; the scheduler runs one `run` per node.
 struct DepJobCtx<'a> {
-    metas: &'a BTreeMap<String, crate::snap::SnapMeta>,
+    metas: &'a BTreeMap<String, nau_core::snap_types::SnapMeta>,
     closures: &'a HashMap<String, Option<crate::cache::BuildClosure>>,
     cli_archs: &'a [String],
     output_dir: &'a Path,
@@ -607,7 +607,7 @@ struct DepJobCtx<'a> {
     /// farm plan carries it so remote stage-only dispatches ship the
     /// content.
     run_stage: &'a Path,
-    run_stage_policy: crate::snap::StagePolicy,
+    run_stage_policy: nau_build::snap::StagePolicy,
     /// Executor name stamped into the scheduler prefixes (ADR-0040
     /// Decision 4): `local` until the SSH executor integrates.
     executor: &'a str,
@@ -618,7 +618,7 @@ impl DepJobCtx<'_> {
     /// quiet build inside, error prefixed per line for the final report.
     fn run(&self, name: &str) -> Result<(), String> {
         let meta = self.metas.get(name).expect("scheduled node was loaded");
-        let archs = crate::snap::resolve_archs(meta, self.cli_archs);
+        let archs = nau_core::snap_types::resolve_archs(meta, self.cli_archs);
         let dep_closure = self.closures[name].as_ref();
         let slot = self.dispatch.fetch_add(1, Ordering::SeqCst) + 1;
         if !self.json {
@@ -659,7 +659,7 @@ impl DepJobCtx<'_> {
 fn load_dep_metas(
     dep_nodes: &[crate::deps::DepNode],
     effective_target: Option<&String>,
-) -> BTreeMap<String, crate::snap::SnapMeta> {
+) -> BTreeMap<String, nau_core::snap_types::SnapMeta> {
     let mut metas = BTreeMap::new();
     for node in dep_nodes {
         match crate::deps::load_meta(&node.name) {
@@ -683,7 +683,7 @@ fn load_dep_metas(
 /// re-resolves the dep closure through the isolate worker, and evals stay
 /// sequential. Both the cache checks and the per-dep cache store use it.
 fn precompute_dep_closures(
-    metas: &BTreeMap<String, crate::snap::SnapMeta>,
+    metas: &BTreeMap<String, nau_core::snap_types::SnapMeta>,
     pkg_cache: Option<&crate::cache::PackageCache>,
     lockfile: &LockFile,
 ) -> HashMap<String, Option<crate::cache::BuildClosure>> {
@@ -706,7 +706,7 @@ fn precompute_dep_closures(
 /// (#304) must not emit build progress; the build passes its `json` flag,
 /// which is exactly this switch.
 fn cached_dep_names(
-    metas: &BTreeMap<String, crate::snap::SnapMeta>,
+    metas: &BTreeMap<String, nau_core::snap_types::SnapMeta>,
     closures: &HashMap<String, Option<crate::cache::BuildClosure>>,
     pkg_cache: Option<&crate::cache::PackageCache>,
     cli_archs: &[String],
@@ -729,7 +729,7 @@ fn cached_dep_names(
 /// The [`dep_pending`] result: metas by name, their precomputed closure
 /// keys, and the fully-cached names.
 type DepPending = (
-    BTreeMap<String, crate::snap::SnapMeta>,
+    BTreeMap<String, nau_core::snap_types::SnapMeta>,
     HashMap<String, Option<crate::cache::BuildClosure>>,
     HashSet<String>,
 );
@@ -783,7 +783,7 @@ fn build_all_deps(
     json: bool,
     workers: &crate::lua::WorkersConfig,
     run_stage: &Path,
-    run_stage_policy: crate::snap::StagePolicy,
+    run_stage_policy: nau_build::snap::StagePolicy,
 ) -> miette::Result<()> {
     if dep_nodes.is_empty() {
         return Ok(());
@@ -836,7 +836,7 @@ fn build_all_deps(
     // flags are set once around the whole phase — the orchestrator thread
     // blocks inside `run_ready_set` — and restored before returning.
     crate::output::set_quiet_build(true);
-    crate::snap::set_buffer_child_stderr(true);
+    nau_build::snap::set_buffer_child_stderr(true);
     let dispatch = AtomicUsize::new(0);
 
     // The build invocation IS the coordinator (ADR-0040 Decision 4):
@@ -886,7 +886,7 @@ fn build_all_deps(
         run_farm(&ctx, &graph, &pre_done, workers)
             .unwrap_or_else(|e| refused_run(&graph, &format!("{e:#}")))
     };
-    crate::snap::set_buffer_child_stderr(false);
+    nau_build::snap::set_buffer_child_stderr(false);
     crate::output::set_quiet_build(false);
 
     match scheduled.result {
@@ -1116,7 +1116,7 @@ static CACHE_STORE_LOCK: Mutex<()> = Mutex::new(());
 #[allow(clippy::too_many_arguments)]
 fn build_dep_archs(
     dep_name: &str,
-    dep_meta: &crate::snap::SnapMeta,
+    dep_meta: &nau_core::snap_types::SnapMeta,
     dep_archs: &[String],
     output_dir: &Path,
     pkg_cache: Option<&crate::cache::PackageCache>,
@@ -1125,10 +1125,10 @@ fn build_dep_archs(
     json: bool,
     quiet: bool,
     run_stage: &Path,
-    run_stage_policy: crate::snap::StagePolicy,
+    run_stage_policy: nau_build::snap::StagePolicy,
 ) -> miette::Result<()> {
     for a in dep_archs {
-        crate::snap::check_cross_build(a, dep_meta.target.as_deref())?;
+        nau_build::snap::check_cross_build(a, dep_meta.target.as_deref())?;
         if !json && !quiet {
             crate::output::status(format!("building {} ({})...", dep_name, a));
         }
@@ -1155,7 +1155,7 @@ fn build_dep_archs(
             None => crate::leak_scan::PayloadListings::default(),
         };
 
-        match crate::snap::build_snap(
+        match nau_build::snap::build_snap(
             dep_meta,
             dep_stage.path(),
             output_dir,
@@ -1210,10 +1210,10 @@ impl DepStage<'_> {
 
     /// The shared stage rides the run's own policy (the same resolution
     /// the parent build uses); a private stage is nau-owned scratch.
-    fn policy(&self, run_policy: crate::snap::StagePolicy) -> crate::snap::StagePolicy {
+    fn policy(&self, run_policy: nau_build::snap::StagePolicy) -> nau_build::snap::StagePolicy {
         match self {
             DepStage::Shared(_) => run_policy,
-            DepStage::Private(_) => crate::snap::StagePolicy::Default,
+            DepStage::Private(_) => nau_build::snap::StagePolicy::Default,
         }
     }
 }
@@ -1223,7 +1223,7 @@ impl DepStage<'_> {
 /// otherwise (the shape every dep build had before #310 — the tempdir
 /// guards the user's staged content and the parallel phase).
 fn resolve_dep_stage<'a>(
-    dep_meta: &crate::snap::SnapMeta,
+    dep_meta: &nau_core::snap_types::SnapMeta,
     run_stage: &'a Path,
 ) -> miette::Result<DepStage<'a>> {
     if crate::coordinator::is_stage_only(dep_meta) {
@@ -1239,19 +1239,19 @@ fn resolve_dep_stage<'a>(
 /// source infos recorded during the builds (for lockfile pinning).
 #[allow(clippy::too_many_arguments)]
 fn build_outputs(
-    iter: &[(&String, crate::snap::SnapMeta)],
+    iter: &[(&String, nau_core::snap_types::SnapMeta)],
     cli_archs: &[String],
     stage_dir: &Path,
-    stage_policy: crate::snap::StagePolicy,
+    stage_policy: nau_build::snap::StagePolicy,
     output_dir: &Path,
     pkg_cache: Option<&PackageCache>,
     lockfile: &LockFile,
     json: bool,
-) -> miette::Result<Vec<crate::snap::SourceInfo>> {
-    let mut all_source_info: Vec<crate::snap::SourceInfo> = Vec::new();
+) -> miette::Result<Vec<nau_build::snap::SourceInfo>> {
+    let mut all_source_info: Vec<nau_build::snap::SourceInfo> = Vec::new();
 
     for (name, meta) in iter {
-        let archs = crate::snap::resolve_archs(meta, cli_archs);
+        let archs = nau_core::snap_types::resolve_archs(meta, cli_archs);
         if !json {
             // adopt-info snaps show their adopted-at-build identity here,
             // never the "0" placeholder.
@@ -1284,16 +1284,16 @@ fn build_outputs(
 #[allow(clippy::too_many_arguments)]
 fn build_one_arch(
     name: &str,
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     arch: &str,
     stage_dir: &Path,
-    stage_policy: crate::snap::StagePolicy,
+    stage_policy: nau_build::snap::StagePolicy,
     output_dir: &Path,
     pkg_cache: Option<&PackageCache>,
     lockfile: &LockFile,
     json: bool,
-) -> miette::Result<Vec<crate::snap::SourceInfo>> {
-    crate::snap::check_cross_build(arch, meta.target.as_deref())?;
+) -> miette::Result<Vec<nau_build::snap::SourceInfo>> {
+    nau_build::snap::check_cross_build(arch, meta.target.as_deref())?;
     if !json {
         crate::output::status(format!("{}/{}:", name, arch));
     }
@@ -1331,7 +1331,7 @@ fn build_one_arch(
         None => crate::leak_scan::PayloadListings::default(),
     };
 
-    let result = crate::snap::build_snap(
+    let result = nau_build::snap::build_snap(
         meta,
         stage_dir,
         output_dir,
@@ -1381,7 +1381,7 @@ fn build_one_arch(
 fn persist_new_sources(
     lockfile: &mut LockFile,
     lock_path: &Path,
-    source_info: &[crate::snap::SourceInfo],
+    source_info: &[nau_build::snap::SourceInfo],
     lockfile_path: &str,
     json: bool,
 ) -> miette::Result<()> {
@@ -1431,7 +1431,7 @@ fn persist_new_sources(
 fn persist_build_deps_pins(
     lockfile: &mut LockFile,
     lock_path: &Path,
-    iter: &[(&String, crate::snap::SnapMeta)],
+    iter: &[(&String, nau_core::snap_types::SnapMeta)],
     lockfile_path: &str,
 ) -> miette::Result<()> {
     let mut changed = false;
@@ -1500,7 +1500,7 @@ mod tests {
         let (path, policy, lock) =
             resolve_stage(Some(other.to_string_lossy().into_owned())).unwrap();
         assert_eq!(path, other);
-        assert_eq!(policy, crate::snap::StagePolicy::Explicit);
+        assert_eq!(policy, nau_build::snap::StagePolicy::Explicit);
         assert!(lock.is_none(), "an explicit stage is never locked");
     }
 
@@ -1512,7 +1512,7 @@ mod tests {
 
         let (path, policy, lock) =
             resolve_stage(Some(stage.to_string_lossy().into_owned())).unwrap();
-        assert_eq!(policy, crate::snap::StagePolicy::Explicit);
+        assert_eq!(policy, nau_build::snap::StagePolicy::Explicit);
         assert_eq!(path, stage);
         // An explicit --stage is user-owned: no cross-process lock, and no
         // lock file appears next to it.
@@ -1525,7 +1525,7 @@ mod tests {
         // Runs against the repo's ./stage/ (the real default): the lock
         // file it creates is gitignored. Only this test touches it.
         let (path, policy, lock) = resolve_stage(None).unwrap();
-        assert_eq!(policy, crate::snap::StagePolicy::Default);
+        assert_eq!(policy, nau_build::snap::StagePolicy::Default);
         assert_eq!(path, std::path::Path::new("./stage/"));
         assert!(lock.is_some(), "default stage must be pinned by a lock");
 
@@ -1568,8 +1568,8 @@ mod tests {
 
     // ── #310: stage-only deps pack the run's resolved stage ──
 
-    fn dep_fixture_meta(name: &str) -> crate::snap::SnapMeta {
-        crate::snap::SnapMeta {
+    fn dep_fixture_meta(name: &str) -> nau_core::snap_types::SnapMeta {
+        nau_core::snap_types::SnapMeta {
             name: name.into(),
             version: "1.0".into(),
             summary: None,
@@ -1668,7 +1668,7 @@ mod tests {
             false,
             true,
             run_stage.path(),
-            crate::snap::StagePolicy::Default,
+            nau_build::snap::StagePolicy::Default,
         )
         .expect("the stage-only dep builds");
 

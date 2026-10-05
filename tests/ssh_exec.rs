@@ -39,7 +39,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn host_arch() -> String {
-    nau::snap::host_arch().to_string()
+    nau_core::snap_types::host_arch().to_string()
 }
 
 /// Serializes the env-mutating identity tests (process-global state).

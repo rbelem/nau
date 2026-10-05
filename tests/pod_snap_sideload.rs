@@ -1719,7 +1719,7 @@ gated_test!(repair_partial_state_by_readd, {
 
 // ── Issue #133 / #135: sideload hardening ──
 
-/// The snap-arch vocabulary of the build host (the `crate::snap::host_arch`
+/// The snap-arch vocabulary of the build host (the `nau_core::snap_types::host_arch`
 /// mapping, mirrored here so fixtures name the arch the gate accepts).
 fn host_arch() -> &'static str {
     match std::env::consts::ARCH {

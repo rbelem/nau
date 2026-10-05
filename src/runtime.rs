@@ -40,7 +40,7 @@ mod tests {
         // A manifest with one pinned github input.
         let declared = std::collections::HashMap::from([(
             "pkgs".to_string(),
-            crate::snap::PackageInput {
+            nau_core::snap_types::PackageInput {
                 url: "github:owner/repo/main".into(),
                 submodules: None,
             },

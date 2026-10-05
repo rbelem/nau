@@ -39,7 +39,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn host_arch() -> &'static str {
-    nau::snap::host_arch()
+    nau_core::snap_types::host_arch()
 }
 
 /// The directory a job's artifacts are written to. It must live outside

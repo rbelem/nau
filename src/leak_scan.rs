@@ -19,7 +19,7 @@ pub use nau_build::leak_scan::*;
 /// `requires`) vs build-only. A DT_NEEDED soname must resolve into a
 /// runtime payload or the package's own stage — never a build-only one.
 pub fn listings_for_build(
-    meta: &crate::snap::SnapMeta,
+    meta: &nau_core::snap_types::SnapMeta,
     prefix: &crate::build_prefix::MergedPrefix,
 ) -> miette::Result<PayloadListings> {
     let mut listings = PayloadListings::default();

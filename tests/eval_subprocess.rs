@@ -346,7 +346,7 @@ fn composed_config_via_evaluate_file() {
 fn phase15_fields_survive_subprocess_round_trip() {
     // The full Phase 15 surface must survive the real worker subprocess:
     // Lua eval → lua_to_json → json_to_lua → SnapMeta.
-    use nau::snap::{LayoutEntry, SnapPlug, TmpfsSpec};
+    use nau_core::snap_types::{LayoutEntry, SnapPlug, TmpfsSpec};
 
     let outputs = evaluate_string(
         "phase15-round-trip",
@@ -538,7 +538,7 @@ fn real_node_recipe_selects_the_22_line_under_the_constraint() {
     assert_eq!(meta.name, "node", "one package, two lines — no rename");
     assert_eq!(meta.version, "22.23.3");
     match &meta.source {
-        Some(nau::snap::SourceSpec::Pinned { url, sha256 }) => {
+        Some(nau_core::snap_types::SourceSpec::Pinned { url, sha256 }) => {
             assert_eq!(
                 url,
                 "https://nodejs.org/dist/v22.23.3/node-v22.23.3-linux-x64.tar.xz"

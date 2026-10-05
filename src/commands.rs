@@ -14,7 +14,7 @@ use crate::image::ImageDeclaration;
 use crate::index::{IndexEntry, PackageIndex, StoreRef};
 use crate::lock::LockFile;
 use crate::runtime::{changed_pins, PendingSnap, RuntimeStore, RuntimeTools, SignatureEnvelope};
-use crate::snap::{PackageInput, SnapRef};
+use nau_core::snap_types::{PackageInput, SnapRef};
 use miette::{IntoDiagnostic, WrapErr};
 
 use crate::build_orch::{
@@ -145,7 +145,7 @@ fn cmd_order(file: &str, output_name: &Option<String>, json: bool) -> miette::Re
     let file = resolve_file(file)?;
     let all_outputs = evaluate_file_or_embedded(&file)?;
 
-    let iter: Vec<&crate::snap::SnapMeta> = match output_name {
+    let iter: Vec<&nau_core::snap_types::SnapMeta> = match output_name {
         Some(name) => {
             let meta = all_outputs
                 .get(name)
@@ -155,7 +155,7 @@ fn cmd_order(file: &str, output_name: &Option<String>, json: bool) -> miette::Re
         None => {
             // `Outputs` is a HashMap: sort for deterministic multi-output
             // report order run to run.
-            let mut metas: Vec<(&String, &crate::snap::SnapMeta)> = all_outputs.iter().collect();
+            let mut metas: Vec<(&String, &nau_core::snap_types::SnapMeta)> = all_outputs.iter().collect();
             metas.sort_by_key(|(name, _)| *name);
             metas.into_iter().map(|(_, meta)| meta).collect()
         }
@@ -174,7 +174,7 @@ fn cmd_order(file: &str, output_name: &Option<String>, json: bool) -> miette::Re
 
 /// JSON-mode order report for one output. Seeds resolution with the
 /// build-time dependency union (`requires` ∪ `build_deps`).
-fn report_order_json(meta: &crate::snap::SnapMeta) {
+fn report_order_json(meta: &nau_core::snap_types::SnapMeta) {
     let seeds = crate::deps::build_dep_seeds(meta);
     if seeds.is_empty() {
         return;
@@ -196,7 +196,7 @@ fn report_order_json(meta: &crate::snap::SnapMeta) {
 }
 
 /// Text-mode order report for one output.
-fn report_order_human(meta: &crate::snap::SnapMeta) {
+fn report_order_human(meta: &nau_core::snap_types::SnapMeta) {
     eprintln!("Package: {} {}", meta.name, meta.version);
 
     if meta.requires.is_empty() && meta.build_deps.is_empty() {
@@ -2673,7 +2673,7 @@ fn install_pulled(
 /// fail-closed snap-revision assertion path is reused, never
 /// reimplemented) into the state root's downloads dir.
 fn runtime_fetch(name: &str, channel: &str, downloads: &Path) -> miette::Result<PendingSnap> {
-    let arch = crate::snap::host_arch();
+    let arch = nau_core::snap_types::host_arch();
     let pin = SnapRef {
         name: name.to_string(),
         revision: None,
@@ -2802,7 +2802,7 @@ fn resolve_targets(
     targets: &[String],
     channel: &str,
 ) -> miette::Result<Vec<(String, u32, String)>> {
-    let arch = crate::snap::host_arch();
+    let arch = nau_core::snap_types::host_arch();
     let mut resolved = Vec::new();
     for target in targets {
         let pin = SnapRef {

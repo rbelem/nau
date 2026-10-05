@@ -7,7 +7,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::snap;
+use nau_build::snap;
 use crate::tools::{self, ResolvedTool, ToolName};
 use miette::IntoDiagnostic;
 

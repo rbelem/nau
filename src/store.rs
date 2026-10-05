@@ -11,7 +11,7 @@ pub use nau_infra::store::*;
 mod tests {
     use super::*;
     use crate::command::RunnerOutput;
-    use crate::snap::snap_ref_from_pin;
+    use nau_chart::snap_lua::snap_ref_from_pin;
     use std::sync::Mutex;
 
     #[test]

@@ -108,7 +108,7 @@ pub(crate) fn pending_dep_jobs(
     cli_archs: &[String],
     pkg_cache: Option<&crate::cache::PackageCache>,
     lockfile: &LockFile,
-) -> miette::Result<BTreeMap<String, crate::snap::SnapMeta>> {
+) -> miette::Result<BTreeMap<String, nau_core::snap_types::SnapMeta>> {
     let iter = select_outputs(all_outputs, output_name, file, target, true)?;
     let dep_nodes = collect_dep_graph(&iter);
     let (metas, _closures, pre_done) =
