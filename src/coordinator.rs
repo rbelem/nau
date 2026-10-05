@@ -237,7 +237,7 @@ impl<R: CommandRunner + Sync> ManifestSource for FarmSource<'_, R> {
                 miette::miette!("farm job: cannot read dep payload {}: {e}", path.display())
             })?;
             closure.push(crate::worker::ClosureObject {
-                sha256: crate::oci::sha256_hex(&bytes),
+                sha256: nau_ship::oci::sha256_hex(&bytes),
                 size: bytes.len() as u64,
                 purpose: format!("dep:{dep}"),
             });
@@ -257,7 +257,7 @@ impl<R: CommandRunner + Sync> ManifestSource for FarmSource<'_, R> {
         if let Some(stage) = &plan.stage_from {
             let bytes = pack_stage_tar(stage)?;
             closure.push(crate::worker::ClosureObject {
-                sha256: crate::oci::sha256_hex(&bytes),
+                sha256: nau_ship::oci::sha256_hex(&bytes),
                 size: bytes.len() as u64,
                 purpose: "stage".to_string(),
             });
@@ -328,7 +328,7 @@ impl<R: CommandRunner + Sync> ManifestSource for FarmSource<'_, R> {
         // agree by construction.
         if let Some(stage_dir) = &plan.stage_from {
             let bytes = pack_stage_tar(stage_dir)?;
-            let sha = crate::oci::sha256_hex(&bytes);
+            let sha = nau_ship::oci::sha256_hex(&bytes);
             std::fs::write(stage.path().join(&sha), &bytes).map_err(|e| {
                 miette::miette!("farm job: cannot write the stage blob into the payload: {e}")
             })?;
@@ -435,7 +435,7 @@ pub fn fetch_pinned_source<R: CommandRunner>(
     }
     let bytes = std::fs::read(dest)
         .map_err(|e| miette::miette!("farm job: cannot read the fetched source {url}: {e}"))?;
-    let got = crate::oci::sha256_hex(&bytes);
+    let got = nau_ship::oci::sha256_hex(&bytes);
     if got != sha256 {
         return Err(miette::miette!(
             "farm job: source {url} hashes to {got} but the pin says {sha256} — refusing to \
@@ -557,7 +557,7 @@ pub fn placement_objects(
     // worker holding it earns the preference.
     if let Some(stage) = &plan.stage_from {
         if let Ok(bytes) = pack_stage_tar(stage) {
-            objects.insert(crate::oci::sha256_hex(&bytes));
+            objects.insert(nau_ship::oci::sha256_hex(&bytes));
         }
     }
     for dep in &plan.deps {
@@ -570,7 +570,7 @@ pub fn placement_objects(
             pkg_cache,
         ) {
             if let Ok(bytes) = std::fs::read(&path) {
-                objects.insert(crate::oci::sha256_hex(&bytes));
+                objects.insert(nau_ship::oci::sha256_hex(&bytes));
             }
         }
     }
@@ -605,7 +605,7 @@ pub fn local_held_objects(
     let mut held = BTreeSet::new();
     if let Some(stage) = &plan.stage_from {
         if let Ok(bytes) = pack_stage_tar(stage) {
-            held.insert(crate::oci::sha256_hex(&bytes));
+            held.insert(nau_ship::oci::sha256_hex(&bytes));
         }
     }
     for dep in &plan.deps {
@@ -618,7 +618,7 @@ pub fn local_held_objects(
             pkg_cache,
         ) {
             if let Ok(bytes) = std::fs::read(&path) {
-                held.insert(crate::oci::sha256_hex(&bytes));
+                held.insert(nau_ship::oci::sha256_hex(&bytes));
             }
         }
     }
@@ -634,7 +634,7 @@ pub fn local_held_objects(
         let filename = spec.url().rsplit('/').next().unwrap_or("");
         let blob = output_dir.join(filename);
         if let Ok(bytes) = std::fs::read(&blob) {
-            if crate::oci::sha256_hex(&bytes) == pin {
+            if nau_ship::oci::sha256_hex(&bytes) == pin {
                 held.insert(pin.to_string());
             }
         }

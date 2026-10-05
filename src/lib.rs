@@ -36,9 +36,10 @@ pub use nau_core::snap_types;
 // to nau-image (the units vocabulary shim FILE is gone — callers use
 // `nau_core::units` directly; the emission half lives in nau_image::units).
 pub use nau_image::{boot_test, emit, esp, image, uc};
-// The ship domain (issue #326 PR 4): oci stays a root shim FILE (it
-// carries the root-side `pending_from_blob` — the pull --install
-// revision resolution rides the runtime's lockfile records); pull_ref
+// The ship domain (issue #326 PR 4): the oci shim FILE is gone —
+// callers use `nau_ship::oci` directly; `pending_from_blob` (the
+// `pull --install` revision resolution) lives beside its caller in
+// src/commands.rs, riding the runtime's lockfile records; pull_ref
 // and the peer-lane glue re-export from nau-ship.
 pub use nau_ship::pull_ref;
 // The peer domain (issue #326 PR 5): discovery/serve/export moved
@@ -68,7 +69,6 @@ pub use nau_trust::ca;
 // vocabulary from nau_pool::worker) and provision/ stays a real shim
 // DIR (the clap-typed dispatch + burst-count glue stay root).
 pub use nau_pool::{build_sched, ssh_exec};
-pub mod oci;
 #[cfg(test)]
 pub(crate) mod test_env;
 pub mod worker;

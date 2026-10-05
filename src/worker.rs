@@ -457,7 +457,7 @@ fn collect_artifacts(out_dir: &Path) -> Vec<Artifact> {
         if path.extension().is_none_or(|e| e != "snap") || !path.is_file() {
             continue;
         }
-        let Ok(sha) = crate::oci::sha256_file(&path) else {
+        let Ok(sha) = nau_ship::oci::sha256_file(&path) else {
             continue;
         };
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -599,7 +599,7 @@ fn verify_blob(dir: &Path, obj: &ClosureObject) -> miette::Result<()> {
             size
         ));
     }
-    let computed = crate::oci::sha256_file(&blob).map_err(|e| {
+    let computed = nau_ship::oci::sha256_file(&blob).map_err(|e| {
         miette::miette!(
             "worker-job: payload blob {} cannot be hashed: {e}",
             blob.display()
@@ -695,7 +695,7 @@ fn refuse_unshipped_sources(
         }
         // Last belt: the shipped bytes themselves must hash to the recipe's
         // own pin (verified again by snap.rs, but here it is a refusal).
-        let computed = crate::oci::sha256_file(blob)?;
+        let computed = nau_ship::oci::sha256_file(blob)?;
         if computed != *expected {
             return Err(miette::miette!(
                 "worker-job: shipped source payload for {url} does not match the recipe pin — \

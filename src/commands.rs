@@ -2265,7 +2265,7 @@ fn print_pod_services(report: &crate::services::ServiceReconcileReport) {
 /// Assemble registry credentials from the CLI flags: anonymous by
 /// default; `--username` requires `--password-stdin` (fail-closed) and
 /// the password is read as one line from stdin.
-fn registry_auth(username: Option<&str>, password_stdin: bool) -> miette::Result<crate::oci::Auth> {
+fn registry_auth(username: Option<&str>, password_stdin: bool) -> miette::Result<nau_ship::oci::Auth> {
     match (username, password_stdin) {
         (Some(user), true) => {
             let mut line = String::new();
@@ -2276,7 +2276,7 @@ fn registry_auth(username: Option<&str>, password_stdin: bool) -> miette::Result
             if password.is_empty() {
                 miette::bail!("no password received on stdin (provide one line)");
             }
-            Ok(crate::oci::Auth {
+            Ok(nau_ship::oci::Auth {
                 username: Some(user.to_string()),
                 password: Some(password),
             })
@@ -2285,7 +2285,7 @@ fn registry_auth(username: Option<&str>, password_stdin: bool) -> miette::Result
             miette::bail!("--password-stdin is required with --username (no interactive prompt)")
         }
         (None, true) => miette::bail!("--username is required with --password-stdin"),
-        (None, false) => Ok(crate::oci::Auth::default()),
+        (None, false) => Ok(nau_ship::oci::Auth::default()),
     }
 }
 
@@ -2303,21 +2303,21 @@ pub fn cmd_push(
     record: Option<&str>,
 ) -> miette::Result<()> {
     let auth = registry_auth(username, password_stdin)?;
-    let reference = crate::oci::Reference::parse(reference)?;
+    let reference = nau_ship::oci::Reference::parse(reference)?;
     let explicit: Vec<PathBuf> = snap.iter().chain(image).map(PathBuf::from).collect();
     for p in &explicit {
         if !p.exists() {
             miette::bail!("artifact {} does not exist", p.display());
         }
     }
-    let plan = crate::oci::plan_push(Path::new(dir), &explicit, tag, &reference)?;
+    let plan = nau_ship::oci::plan_push(Path::new(dir), &explicit, tag, &reference)?;
     crate::output::info(format!(
         "bundle {} v{} ({}) → tag '{}'",
         plan.meta.name, plan.meta.version, plan.meta.arch, plan.tag
     ));
-    let report = crate::oci::push(&reference, &plan, auth, insecure_http, mount_from)?;
+    let report = nau_ship::oci::push(&reference, &plan, auth, insecure_http, mount_from)?;
     if let Some(rec) = record {
-        crate::oci::write_built_record(Path::new(rec), &plan)?;
+        nau_ship::oci::write_built_record(Path::new(rec), &plan)?;
         crate::output::ok(format!("built-manifest record written to {rec}"));
     }
     print_report(&report);
@@ -2368,12 +2368,12 @@ fn cmd_pull(
     state_dir: Option<String>,
 ) -> miette::Result<()> {
     let auth = registry_auth(username, password_stdin)?;
-    let reference = crate::oci::Reference::parse(reference)?;
+    let reference = nau_ship::oci::Reference::parse(reference)?;
     let expected = match expect {
-        Some(p) => Some(crate::oci::read_built_record(Path::new(p))?),
+        Some(p) => Some(nau_ship::oci::read_built_record(Path::new(p))?),
         None => None,
     };
-    let mut report = crate::oci::pull(
+    let mut report = nau_ship::oci::pull(
         &reference,
         Path::new(&out_dir),
         auth,
@@ -2631,13 +2631,63 @@ fn cmd_pull_peer(
     crate::pull_peer::run(pull_ref, pod, allow_downgrade)
 }
 
+/// Resolve one pulled `.snap` blob into a [`PendingSnap`].
+///
+/// # Revision-resolution rule (the Phase 25 documented follow-up)
+///
+/// The artifact filename carries `{name}_{version}_{arch}` — the store
+/// revision is NOT in the filename. It is resolved from the local
+/// lockfile ([`LockFile`]) by matching the blob's sha3-384 against the
+/// pinned entry for the parsed name:
+///
+/// - name pinned and sha3-384 matches → that pin's revision;
+/// - name pinned but sha3-384 differs → named refusal (the pulled
+///   content diverged from the lock — installing it would put a
+///   foreign payload behind a trusted dedup key);
+/// - name absent from the lockfile → named refusal to install an
+///   unpinned blob; plain `pull` (without `--install`) still writes
+///   the files.
+///
+/// [`install_batch`][crate::runtime::RuntimeStore::install_batch]'s
+/// dedup key (name+revision+sha3-384) therefore only ever sees
+/// lockfile-backed revisions. The filename parser is the SAME one push
+/// uses ([`nau_ship::oci::parse_artifact_filename`],
+/// ambiguous-underscore rejection included); the payload path is passed
+/// through untouched and install re-verifies sha3-384 fail-closed on
+/// its own.
+pub fn pending_from_blob(payload: &Path, lockfile: &LockFile) -> miette::Result<PendingSnap> {
+    let (name, _version, _arch) = nau_ship::oci::parse_artifact_filename(payload)?;
+    let sha3_384 = nau_infra::store::sha3_384_file(payload)?;
+    let entry = lockfile.snaps.get(&name).ok_or_else(|| {
+        miette::miette!(
+            "'{name}' has no {pin} entry — refusing to install a blob whose \
+             store revision cannot be established; use plain `pull` (without \
+             --install) or `nau lock` the snap first",
+            pin = LockFile::FILENAME
+        )
+    })?;
+    if entry.sha3_384 != sha3_384 {
+        miette::bail!(
+            "'{name}' pulled blob sha3-384 {sha3_384} does not match the \
+             lockfile pin ({}) — refusing to install (fail-closed)",
+            entry.sha3_384
+        );
+    }
+    Ok(PendingSnap {
+        name,
+        revision: entry.revision,
+        sha3_384,
+        payload_path: payload.to_path_buf(),
+        ..Default::default()
+    })
+}
+
 /// `pull --install`: resolve revisions for the pulled `.snap` payloads
 /// from the local lockfile pins and install them as one generation.
-/// The revision-resolution rule lives in
-/// [`crate::oci::pending_from_blob`]; unpinned or divergent blobs are
-/// refused there (fail-closed).
+/// The revision-resolution rule lives in [`pending_from_blob`]; unpinned
+/// or divergent blobs are refused there (fail-closed).
 fn install_pulled(
-    report: &crate::oci::PullReportJson,
+    report: &nau_ship::oci::PullReportJson,
     state_dir: Option<&str>,
 ) -> miette::Result<crate::runtime::InstallReport> {
     let lock_path = Path::new(LockFile::FILENAME);
@@ -2651,10 +2701,7 @@ fn install_pulled(
     let mut pending: Vec<PendingSnap> = Vec::new();
     for f in &report.files {
         if f.path.ends_with(".snap") {
-            pending.push(crate::oci::pending_from_blob(
-                Path::new(&f.path),
-                &lockfile,
-            )?);
+            pending.push(pending_from_blob(Path::new(&f.path), &lockfile)?);
         }
     }
     if pending.is_empty() {
@@ -3169,6 +3216,71 @@ mod tests {
             "ok: 2 output(s): bzip2 1.0.8, hello 2.10"
         );
         assert_eq!(check_ok_message(&[]), "ok: 0 output(s)");
+    }
+
+    // ── pull --install revision resolution (pending_from_blob) ──
+
+    fn write_artifact(dir: &Path, file: &str, content: &[u8]) -> PathBuf {
+        let p = dir.join(file);
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    fn lock_with(name: &str, revision: u32, sha3_384: &str) -> LockFile {
+        let mut lock = LockFile {
+            version: 1,
+            sources: Default::default(),
+            snaps: Default::default(),
+            inputs: Default::default(),
+            packages: Default::default(),
+            build_deps: Default::default(),
+        };
+        lock.snaps.insert(
+            name.to_string(),
+            nau_core::lock::SnapLockEntry {
+                revision,
+                sha3_384: sha3_384.to_string(),
+            },
+        );
+        lock
+    }
+
+    #[test]
+    fn pending_from_blob_resolves_revision_from_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = write_artifact(dir.path(), "app_1.0.0_amd64.snap", b"payload");
+        let sha3 = nau_infra::store::sha3_384_file(&payload).unwrap();
+        let lock = lock_with("app", 7, &sha3);
+
+        let pending = pending_from_blob(&payload, &lock).unwrap();
+        assert_eq!(pending.name, "app");
+        assert_eq!(pending.revision, 7);
+        assert_eq!(pending.sha3_384, sha3);
+        assert_eq!(pending.payload_path, payload);
+    }
+
+    #[test]
+    fn pending_from_blob_refuses_unpinned_divergent_and_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = write_artifact(dir.path(), "app_1.0.0_amd64.snap", b"payload");
+        let sha3 = nau_infra::store::sha3_384_file(&payload).unwrap();
+
+        // name absent from the lockfile → unpinned refusal
+        let lock = lock_with("other", 7, &sha3);
+        let err = pending_from_blob(&payload, &lock).unwrap_err().to_string();
+        assert!(err.contains("no nau.lock entry"), "{err}");
+        assert!(err.contains("plain `pull`"), "{err}");
+
+        // pinned but content diverged → fail-closed
+        let lock = lock_with("app", 7, &"f".repeat(96));
+        let err = pending_from_blob(&payload, &lock).unwrap_err().to_string();
+        assert!(err.contains("does not match the lockfile pin"), "{err}");
+
+        // ambiguous filename rejected by the SHARED push parser
+        let amb = write_artifact(dir.path(), "a_b_c_d.snap", b"payload");
+        let lock = lock_with("a", 1, "x");
+        let err = pending_from_blob(&amb, &lock).unwrap_err().to_string();
+        assert!(err.contains("ambiguous"), "{err}");
     }
 
     /// Sync-speed plan item E: exactly the mutate/reconcile family is

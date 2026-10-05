@@ -1685,7 +1685,7 @@ pub fn add_snap_pod(
     let mut lock = LockFile::load(&lock_path)?.unwrap_or_else(LockFile::empty);
     // (filename, pinned sha3-384) when the filename names a package the
     // pod already blob-pins — the cheap re-add/divergence probe.
-    let pinned_name = crate::oci::parse_artifact_filename(payload)
+    let pinned_name = nau_ship::oci::parse_artifact_filename(payload)
         .ok()
         .map(|(name, _, _)| name)
         .filter(|n| parse_pod_package_spec_names(&decl, n))
@@ -1696,7 +1696,7 @@ pub fn add_snap_pod(
             // re-add is still an add, and the filename's arch claim is
             // knowable before the report — refuse foreign-arch content
             // zero-write exactly like the post-unpack gate below.
-            if let Ok((_, _, arch)) = crate::oci::parse_artifact_filename(payload) {
+            if let Ok((_, _, arch)) = nau_ship::oci::parse_artifact_filename(payload) {
                 refuse_foreign_arch(payload, arch.as_deref())?;
             }
             if let Some(mut report) = sideload_readd_report(root, pod_name, fname, &sha3_384)? {
@@ -1778,7 +1778,7 @@ pub fn add_snap_pod(
     // Filename↔meta identity (the `pending_from_blob` rule, copied):
     // the artifact filename is a claim about the payload; a mismatch
     // refuses fail-closed.
-    if let Ok((fname, fversion, arch)) = crate::oci::parse_artifact_filename(payload) {
+    if let Ok((fname, fversion, arch)) = nau_ship::oci::parse_artifact_filename(payload) {
         if fname != name {
             miette::bail!(
                 "{}: filename says '{fname}' but meta/snap.yaml says '{name}' — \

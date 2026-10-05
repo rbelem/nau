@@ -202,7 +202,7 @@ fn issue_and_pickup_round_trip_through_the_real_binary() {
     assert_eq!(record["public_key"], serde_json::json!(guest_pub));
     assert_eq!(
         record["token_sha256"],
-        serde_json::json!(nau::oci::sha256_hex(token.as_bytes())),
+        serde_json::json!(nau_ship::oci::sha256_hex(token.as_bytes())),
         "the record ties back to the publish token (hashed at rest)"
     );
     assert!(

@@ -1367,7 +1367,7 @@ fn dispatch_lands_the_artifact_in_the_coordinator_ingest() {
         let stored = dir.join(&art.filename);
         assert!(stored.exists(), "artifact ingested: {stored:?}");
         assert_eq!(
-            nau::oci::sha256_file(&stored).unwrap(),
+            nau_ship::oci::sha256_file(&stored).unwrap(),
             art.sha256,
             "stored bytes hash to the verified claim"
         );
@@ -1485,7 +1485,7 @@ fn delta_sync_ships_only_the_missing_objects() {
     let dir = ex.ingest_dir(&manifest).unwrap();
     let stored = dir.join("worker-hello_1.0_amd64.snap");
     assert_eq!(
-        nau::oci::sha256_file(&stored).unwrap(),
+        nau_ship::oci::sha256_file(&stored).unwrap(),
         sha256_hex(&artifact_bytes)
     );
 }
@@ -1644,7 +1644,7 @@ fn dispatch_persists_the_built_artifact_into_the_store() {
         .join(".cache/nau/worker/objects")
         .join(&artifact_sha);
     assert_eq!(
-        nau::oci::sha256_file(&stored).unwrap(),
+        nau_ship::oci::sha256_file(&stored).unwrap(),
         artifact_sha,
         "the built artifact is content-addressed in the store"
     );

@@ -90,7 +90,7 @@ mod tests {
 
     use nau_core::pkg_manifest::{ManifestFile, PackageManifest};
 
-    use crate::oci::sha256_hex;
+    use nau_ship::oci::sha256_hex;
     use crate::pull_ref::PullRef;
     use crate::runtime::RuntimeStore;
     use std::path::PathBuf;
