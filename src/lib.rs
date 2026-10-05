@@ -20,7 +20,6 @@ pub mod plugins;
 pub mod pod;
 pub mod provision;
 pub mod pull_peer;
-pub mod runtime;
 pub mod secrets;
 pub mod services;
 pub mod sign;
@@ -54,14 +53,15 @@ pub use nau_peer::{discovery, export, queue, serve};
 // src/pod.rs, which remains the orchestrator file.
 pub use nau_pod::{confine, desktop, farm, fonts};
 // The runtime domain (issue #326 PR 7): RuntimeStore + the mutation
-// machinery + slot_recovery moved to nau-runtime; src/runtime.rs stays
-// a real shim FILE (the verify cluster + its cosign/attest suite —
-// the trust domain, later crate) re-exporting the moved names.
+// machinery + slot_recovery moved to nau-runtime (the runtime shim FILE
+// is gone — callers use `nau_runtime::runtime`, `nau_trust::verify`,
+// `nau_core::pkg_manifest`, and `nau_core::paths` directly; the trust
+// test cluster moved to tests/sign_attestation.rs).
 pub use nau_runtime::slot_recovery;
 // The trust domain (issue #326 PR 8): the signing ceremony policy, the
-// device verify cluster, and the SSH host-CA ceremony. sign.rs and
-// runtime.rs stay real shim FILES (the eval-coupled test clusters live
-// there); ca is a pure re-export.
+// device verify cluster, and the SSH host-CA ceremony. sign.rs's
+// eval-coupled test clusters moved to tests/sign_attestation.rs;
+// ca is a pure re-export.
 pub use nau_trust::ca;
 // The pool domain (issue #326 PR 9): the SSH worker transport and the
 // farm build scheduler moved whole; worker.rs stays a real shim FILE

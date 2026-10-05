@@ -2692,7 +2692,7 @@ fn fake_systemd_tool(dir: &Path, name: &str, marker: &Path, exit_code: i32) -> P
 /// payload build (the store layout is a plain directory contract).
 fn seed_pod_generation(pod_dir: &Path, n: u64, pkg: &str, unit: &str) {
     use nau::farm::ClaimLayer;
-    use nau::runtime::{Generation, InstalledPackage};
+    use nau_core::pkg_manifest::{Generation, InstalledPackage};
 
     let mut packages = std::collections::BTreeMap::new();
     packages.insert(

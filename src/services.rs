@@ -40,7 +40,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use crate::runtime::{Generation, RuntimeStore};
+use nau_core::pkg_manifest::Generation;
+use nau_runtime::runtime::RuntimeStore;
 
 /// The services directory inside a generation:
 /// `<root>/generations/<n>/services` (the launchers'/farm's sibling).
@@ -297,11 +298,11 @@ pub fn record_in(
 fn resolve_service_claims(
     gen: &Generation,
 ) -> (
-    BTreeMap<String, &crate::runtime::InstalledPackage>,
+    BTreeMap<String, &nau_core::pkg_manifest::InstalledPackage>,
     BTreeSet<String>,
 ) {
     let mut seen: BTreeMap<&str, (&str, crate::farm::ClaimLayer)> = Default::default();
-    let mut winners: BTreeMap<String, &crate::runtime::InstalledPackage> = BTreeMap::new();
+    let mut winners: BTreeMap<String, &nau_core::pkg_manifest::InstalledPackage> = BTreeMap::new();
     for pkg in crate::farm::layered_packages(gen) {
         for svc in pkg.services.keys() {
             if let Some((incumbent_pkg, incumbent_layer)) = seen.get(svc.as_str()) {
@@ -349,7 +350,7 @@ struct ResolveCtx<'a> {
 fn build_unit(
     ctx: &ResolveCtx,
     svc: &str,
-    pkg: &crate::runtime::InstalledPackage,
+    pkg: &nau_core::pkg_manifest::InstalledPackage,
     decl: &nau_core::snap_types::ServiceDecl,
     resolved: &crate::pod::ResolvedServiceOptions,
     nau_services: &BTreeSet<String>,
@@ -929,7 +930,7 @@ pub fn units_referencing_envfile(
 /// real error naming the unit (D7). Returns (restarted, skipped).
 pub fn restart_units(
     units: &[String],
-    tools: &crate::runtime::RuntimeTools,
+    tools: &nau_runtime::runtime::RuntimeTools,
 ) -> miette::Result<(Vec<String>, Vec<String>)> {
     let mut restarted = Vec::new();
     let mut skipped = Vec::new();
@@ -1186,7 +1187,7 @@ fn plan_reconcile(
 /// is a real error: the running contract is not ours to guess around.
 /// Returns true only when the step actually ran.
 fn run_systemctl(
-    tools: &crate::runtime::RuntimeTools,
+    tools: &nau_runtime::runtime::RuntimeTools,
     args: &[&str],
     what: &str,
     unit: &str,
@@ -1276,7 +1277,7 @@ fn apply_deactivations(
     unit_dir: &std::path::Path,
     pod: &str,
     names: &[String],
-    tools: &crate::runtime::RuntimeTools,
+    tools: &nau_runtime::runtime::RuntimeTools,
     report: &mut ServiceReconcileReport,
 ) -> miette::Result<()> {
     for svc in names {
@@ -1318,7 +1319,7 @@ fn apply_unit_steps(
     names: &[String],
     verb: &[&str],
     what: &str,
-    tools: &crate::runtime::RuntimeTools,
+    tools: &nau_runtime::runtime::RuntimeTools,
     report: &mut ServiceReconcileReport,
 ) -> miette::Result<Vec<String>> {
     let mut ran = Vec::new();
@@ -1341,7 +1342,7 @@ fn apply_unit_steps(
 /// seam like every other tool, so `NAU_POD_TOOLS=absent` silences
 /// the probe instead of tests having to scrub PATH.
 fn check_linger(
-    tools: &crate::runtime::RuntimeTools,
+    tools: &nau_runtime::runtime::RuntimeTools,
     pod: &str,
     report: &mut ServiceReconcileReport,
 ) {
@@ -1385,7 +1386,7 @@ pub fn reconcile(
     store: &RuntimeStore,
     dir: &std::path::Path,
     pod_name: &str,
-    tools: &crate::runtime::RuntimeTools,
+    tools: &nau_runtime::runtime::RuntimeTools,
 ) -> miette::Result<ServiceReconcileReport> {
     let mut report = ServiceReconcileReport {
         pod: pod_name.to_string(),
@@ -1437,7 +1438,7 @@ pub fn reconcile(
 pub fn reconcile_empty(
     dir: &std::path::Path,
     pod_name: &str,
-    tools: &crate::runtime::RuntimeTools,
+    tools: &nau_runtime::runtime::RuntimeTools,
 ) -> miette::Result<ServiceReconcileReport> {
     let mut report = ServiceReconcileReport {
         pod: pod_name.to_string(),
@@ -1462,7 +1463,7 @@ pub fn reconcile_empty(
 fn withdraw_applied_units(
     store: &RuntimeStore,
     pod_name: &str,
-    tools: &crate::runtime::RuntimeTools,
+    tools: &nau_runtime::runtime::RuntimeTools,
     applied: &AppliedState,
     report: &mut ServiceReconcileReport,
 ) -> miette::Result<()> {
@@ -1493,7 +1494,7 @@ struct ReconcileInput<'a> {
 fn reconcile_presented(
     input: &ReconcileInput,
     pod_name: &str,
-    tools: &crate::runtime::RuntimeTools,
+    tools: &nau_runtime::runtime::RuntimeTools,
     report: &mut ServiceReconcileReport,
 ) -> miette::Result<()> {
     let unit_dir = user_systemd_unit_dir();
@@ -1806,7 +1807,7 @@ fn endpoint_option_family(key: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::farm::ClaimLayer;
-    use crate::runtime::InstalledPackage;
+    use nau_core::pkg_manifest::InstalledPackage;
     use nau_core::snap_types::{ServiceDaemon, ServiceDecl};
 
     fn store_fixture(dir: &std::path::Path) -> RuntimeStore {
@@ -2636,7 +2637,7 @@ mod tests {
         // No loginctl on the seam → silent (NAU_POD_TOOLS=absent).
         let mut report = ServiceReconcileReport::default();
         check_linger(
-            &crate::runtime::RuntimeTools::default(),
+            &nau_runtime::runtime::RuntimeTools::default(),
             "pilot",
             &mut report,
         );
@@ -2652,7 +2653,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&loginctl, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let tools = crate::runtime::RuntimeTools {
+        let tools = nau_runtime::runtime::RuntimeTools {
             loginctl: Some(loginctl),
             ..Default::default()
         };

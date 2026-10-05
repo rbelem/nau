@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use nau::farm::ClaimLayer;
-use nau::runtime::{Generation, InstalledPackage};
+use nau_core::pkg_manifest::{Generation, InstalledPackage};
 use nau::services::ServiceUnit;
 use nau_core::snap_types::ServiceDaemon;
 

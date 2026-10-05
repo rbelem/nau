@@ -13,7 +13,8 @@ use crate::cli::{
 use crate::image::ImageDeclaration;
 use crate::index::{IndexEntry, PackageIndex, StoreRef};
 use crate::lock::LockFile;
-use crate::runtime::{changed_pins, PendingSnap, RuntimeStore, RuntimeTools, SignatureEnvelope};
+use nau_runtime::runtime::{changed_pins, PendingSnap, RuntimeStore, RuntimeTools};
+use nau_core::sign::SignatureEnvelope;
 use nau_core::snap_types::{PackageInput, SnapRef};
 use miette::{IntoDiagnostic, WrapErr};
 
@@ -1375,7 +1376,7 @@ pub fn cmd_runtime(sub: RuntimeCommand) -> miette::Result<()> {
             json,
         } => {
             crate::output::set_mode(json);
-            runtime_gc(crate::runtime::GcOpts { prune, downloads }, state_dir)
+            runtime_gc(nau_runtime::runtime::GcOpts { prune, downloads }, state_dir)
         }
         RuntimeCommand::Activate { state_dir, json } => {
             crate::output::set_mode(json);
@@ -1439,7 +1440,7 @@ fn cmd_pod_secrets(
             Ok(())
         }
         crate::cli::PodSecretsCommand::Refresh => {
-            let tools = crate::runtime::RuntimeTools::for_pod_runtime();
+            let tools = nau_runtime::runtime::RuntimeTools::for_pod_runtime();
             let report = crate::secrets::refresh_pod(&root, pod_name, None, &tools)?;
             if report.resolved == 0 {
                 crate::output::info(format!("pod '{pod_name}' has no secret references"));
@@ -1767,7 +1768,7 @@ pub fn cmd_pod(name: Option<&str>, sub: PodCommand) -> miette::Result<()> {
             downloads,
             root,
             ..
-        } => cmd_pod_gc(pod_name, crate::runtime::GcOpts { prune, downloads }, root),
+        } => cmd_pod_gc(pod_name, nau_runtime::runtime::GcOpts { prune, downloads }, root),
         PodCommand::Secrets { command, root, .. } => cmd_pod_secrets(pod_name, command, root),
         // Unreachable: the `pod run` arm returned above (it carries the
         // legacy `nau run` flag surface, not the common `--name` merge).
@@ -2157,7 +2158,7 @@ fn cmd_pod_rollback(
 /// `nau pod gc`: report pruned generations and swept blobs.
 fn cmd_pod_gc(
     pod_name: &str,
-    opts: crate::runtime::GcOpts,
+    opts: nau_runtime::runtime::GcOpts,
     root: Option<String>,
 ) -> miette::Result<()> {
     let root = crate::pod::pod_root(root.as_deref());
@@ -2648,7 +2649,7 @@ fn cmd_pull_peer(
 ///   unpinned blob; plain `pull` (without `--install`) still writes
 ///   the files.
 ///
-/// [`install_batch`][crate::runtime::RuntimeStore::install_batch]'s
+/// [`install_batch`][nau_runtime::runtime::RuntimeStore::install_batch]'s
 /// dedup key (name+revision+sha3-384) therefore only ever sees
 /// lockfile-backed revisions. The filename parser is the SAME one push
 /// uses ([`nau_ship::oci::parse_artifact_filename`],
@@ -2689,7 +2690,7 @@ pub fn pending_from_blob(payload: &Path, lockfile: &LockFile) -> miette::Result<
 fn install_pulled(
     report: &nau_ship::oci::PullReportJson,
     state_dir: Option<&str>,
-) -> miette::Result<crate::runtime::InstallReport> {
+) -> miette::Result<nau_runtime::runtime::InstallReport> {
     let lock_path = Path::new(LockFile::FILENAME);
     let lockfile = LockFile::load(lock_path)?.ok_or_else(|| {
         miette::miette!(
@@ -2712,7 +2713,7 @@ fn install_pulled(
         &pending,
         &SignatureEnvelope::default(),
         &RuntimeTools::for_pod_runtime(),
-        &crate::runtime::verify_signatures,
+        &nau_trust::verify::verify_signatures,
     )
 }
 
@@ -2759,7 +2760,7 @@ fn runtime_install(name: &str, channel: &str, state_dir: Option<String>) -> miet
         &[pending],
         &SignatureEnvelope::default(),
         &RuntimeTools::for_pod_runtime(),
-        &crate::runtime::verify_signatures,
+        &nau_trust::verify::verify_signatures,
     )?;
     print_install_report(&report);
     Ok(())
@@ -2801,13 +2802,13 @@ fn runtime_upgrade(
         &pending,
         &SignatureEnvelope::default(),
         &RuntimeTools::for_pod_runtime(),
-        &crate::runtime::verify_signatures,
+        &nau_trust::verify::verify_signatures,
     )?;
     print_install_report(&report);
     Ok(())
 }
 
-fn active_or_err(store: &RuntimeStore) -> miette::Result<crate::runtime::Generation> {
+fn active_or_err(store: &RuntimeStore) -> miette::Result<nau_core::pkg_manifest::Generation> {
     store
         .active_generation()?
         .ok_or_else(|| miette::miette!("nothing installed — no active generation to upgrade"))
@@ -2828,7 +2829,7 @@ fn fetch_changed(
 /// `upgrade <name>` targets one installed snap; anything else (bare
 /// `upgrade` or `--all`) targets the whole installed set.
 fn upgrade_targets(
-    active: &crate::runtime::Generation,
+    active: &nau_core::pkg_manifest::Generation,
     name: &Option<String>,
 ) -> miette::Result<Vec<String>> {
     if let Some(n) = name {
@@ -2863,7 +2864,7 @@ fn resolve_targets(
     Ok(resolved)
 }
 
-fn print_install_summary(report: &crate::runtime::InstallReport) {
+fn print_install_summary(report: &nau_runtime::runtime::InstallReport) {
     for note in &report.notes {
         crate::output::info(note);
     }
@@ -2882,7 +2883,7 @@ fn print_install_summary(report: &crate::runtime::InstallReport) {
     }
 }
 
-fn print_install_report(report: &crate::runtime::InstallReport) {
+fn print_install_report(report: &nau_runtime::runtime::InstallReport) {
     print_install_summary(report);
     print_report(report);
 }
@@ -2907,7 +2908,7 @@ fn runtime_rollback(generation: Option<u64>, state_dir: Option<String>) -> miett
     Ok(())
 }
 
-fn runtime_gc(opts: crate::runtime::GcOpts, state_dir: Option<String>) -> miette::Result<()> {
+fn runtime_gc(opts: nau_runtime::runtime::GcOpts, state_dir: Option<String>) -> miette::Result<()> {
     let store = RuntimeStore::from_state_dir(state_dir.as_deref());
     let report = store.gc(opts)?;
     if !report.generations_removed.is_empty() {

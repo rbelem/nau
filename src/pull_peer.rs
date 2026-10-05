@@ -34,7 +34,7 @@ fn operator_keys_dir() -> PathBuf {
 pub fn run(source: &PullRef, pod: Option<&str>, allow_downgrade: bool) -> miette::Result<()> {
     let store = pod::resolve_pod_store(pod)?;
     let keys = operator_keys_dir();
-    let anchor = PathBuf::from(crate::runtime::DEVICE_ANCHOR);
+    let anchor = PathBuf::from(nau_core::paths::DEVICE_ANCHOR);
     let pkg = pkg_name(source)?.to_string();
     let installed = store
         .active_generation()?
@@ -92,7 +92,7 @@ mod tests {
 
     use nau_ship::oci::sha256_hex;
     use crate::pull_ref::PullRef;
-    use crate::runtime::RuntimeStore;
+    use nau_runtime::runtime::RuntimeStore;
     use std::path::PathBuf;
 
     /// Deterministic keypair from a single seed byte (test-only).
@@ -253,7 +253,7 @@ mod tests {
         /// Seed an active generation 1 with `pkg` installed at
         /// `revision` (the freshness gate's input).
         fn seed_installed(&self, pkg: &str, revision: u32) {
-            let installed = crate::runtime::InstalledPackage {
+            let installed = nau_core::pkg_manifest::InstalledPackage {
                 name: pkg.to_string(),
                 version: "1.0".to_string(),
                 revision,
@@ -273,7 +273,7 @@ mod tests {
                 service_bins: BTreeMap::new(),
                 meta_digest: None,
             };
-            let gen = crate::runtime::Generation {
+            let gen = nau_core::pkg_manifest::Generation {
                 n: 1,
                 base_version: "test".to_string(),
                 packages: BTreeMap::from([(pkg.to_string(), installed)]),

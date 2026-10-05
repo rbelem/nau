@@ -718,7 +718,7 @@ fn nau_run_overlays_resolved_secrets_declared_replaces_inherited() {
             command: vec![provider_s.clone()],
         },
     )]);
-    let store = nau::runtime::RuntimeStore::new(pod.clone());
+    let store = nau_runtime::runtime::RuntimeStore::new(pod.clone());
     nau::farm::write_generation_secrets(&store.store_view(), 1, &refs).unwrap();
 
     let expected = "-----BEGIN RUN KEY-----\nMIIrun\n-----END RUN KEY-----";

@@ -253,7 +253,7 @@ pub fn refresh_pod(
     root: &Path,
     pod_name: &str,
     cache_base_override: Option<&Path>,
-    tools: &crate::runtime::RuntimeTools,
+    tools: &nau_runtime::runtime::RuntimeTools,
 ) -> miette::Result<SecretsRefreshReport> {
     let inputs = verb_inputs(root, pod_name)?;
     let mut report = SecretsRefreshReport::default();
@@ -755,7 +755,7 @@ mod tests {
             tmp.path(),
             "work",
             Some(&cache),
-            &crate::runtime::RuntimeTools::default(),
+            &nau_runtime::runtime::RuntimeTools::default(),
         )
         .unwrap();
         assert_eq!(first.resolved, 1);
@@ -772,7 +772,7 @@ mod tests {
             tmp.path(),
             "work",
             Some(&cache),
-            &crate::runtime::RuntimeTools::default(),
+            &nau_runtime::runtime::RuntimeTools::default(),
         )
         .unwrap();
         assert_eq!(second.purged, 1);
@@ -835,7 +835,7 @@ mod tests {
     /// A fake systemctl: appends its argv (one arg per line) to `log`,
     /// then exits `code` — the runtime.rs fake-tool pattern, extended
     /// to record WHAT it was asked to run.
-    fn fake_systemctl(dir: &Path, log: &Path, code: i32) -> crate::runtime::RuntimeTools {
+    fn fake_systemctl(dir: &Path, log: &Path, code: i32) -> nau_runtime::runtime::RuntimeTools {
         let path = dir.join("fake-systemctl");
         std::fs::write(
             &path,
@@ -847,7 +847,7 @@ mod tests {
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        crate::runtime::RuntimeTools {
+        nau_runtime::runtime::RuntimeTools {
             systemctl: Some(path),
             ..Default::default()
         }
@@ -1039,7 +1039,7 @@ mod tests {
             tmp.path(),
             "work",
             Some(&cache),
-            &crate::runtime::RuntimeTools::default(),
+            &nau_runtime::runtime::RuntimeTools::default(),
         )
         .unwrap();
         assert!(report.restarted.is_empty());
@@ -2001,7 +2001,7 @@ end'"#
             tmp.path(),
             "cold",
             None,
-            &crate::runtime::RuntimeTools::default(),
+            &nau_runtime::runtime::RuntimeTools::default(),
         );
         if let Some(dir) = saved {
             std::env::set_var("XDG_RUNTIME_DIR", dir);

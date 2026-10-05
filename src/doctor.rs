@@ -1166,7 +1166,7 @@ pub fn check_pod_failed_units(pod: &str) -> Check {
         &crate::pod::pod_root(None),
         pod,
         None,
-        &crate::runtime::RuntimeTools::for_pod_runtime(),
+        &nau_runtime::runtime::RuntimeTools::for_pod_runtime(),
     )
 }
 
@@ -1178,7 +1178,7 @@ pub(crate) fn check_pod_failed_units_with(
     root: &Path,
     pod: &str,
     cache_base: Option<&Path>,
-    tools: &crate::runtime::RuntimeTools,
+    tools: &nau_runtime::runtime::RuntimeTools,
 ) -> Check {
     let name = POD_FAILED_UNITS_CHECK;
     let pod_dir = root.join(pod);
@@ -3500,7 +3500,7 @@ done
 
     /// A fake systemctl for the `is-failed` probe: exits 0 (failed)
     /// only when the unit argument is on the list, 1 otherwise.
-    fn fake_is_failed(dir: &Path, failed_units: &[&str]) -> crate::runtime::RuntimeTools {
+    fn fake_is_failed(dir: &Path, failed_units: &[&str]) -> nau_runtime::runtime::RuntimeTools {
         let path = dir.join("fake-systemctl");
         std::fs::write(
             &path,
@@ -3512,7 +3512,7 @@ done
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        crate::runtime::RuntimeTools {
+        nau_runtime::runtime::RuntimeTools {
             systemctl: Some(path),
             ..Default::default()
         }
@@ -3624,7 +3624,7 @@ done
     fn pod_failed_units_skips_named_when_systemctl_absent() {
         let tmp = tempfile::tempdir().unwrap();
         let (cache, _) = seed_consumer_pod(tmp.path(), true);
-        let tools = crate::runtime::RuntimeTools::default();
+        let tools = nau_runtime::runtime::RuntimeTools::default();
         let check = check_pod_failed_units_with(tmp.path(), "work", Some(&cache), &tools);
         // Reconcile semantics: tool absence is a NAMED skip, never a
         // failed check.

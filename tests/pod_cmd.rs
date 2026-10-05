@@ -930,7 +930,7 @@ fn seed_generation_secrets(
     pod: &str,
     refs: &std::collections::BTreeMap<String, nau::pod::SecretSource>,
 ) {
-    let store = nau::runtime::RuntimeStore::new(root.join(pod));
+    let store = nau_runtime::runtime::RuntimeStore::new(root.join(pod));
     nau::farm::write_generation_secrets(&store.store_view(), 1, refs).unwrap();
 }
 
@@ -972,7 +972,7 @@ fn shellenv_exports_resolved_secrets_after_env_lines_and_evals_safe() {
     // The declared env rides the generation record (env.json) — write it
     // the way sync does, so SH_EDITOR is a real declared export, not an
     // ambient accident.
-    let store = nau::runtime::RuntimeStore::new(root.path().join("default"));
+    let store = nau_runtime::runtime::RuntimeStore::new(root.path().join("default"));
     nau::farm::write_generation_env(
         &store.store_view(),
         1,

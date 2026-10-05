@@ -140,8 +140,8 @@ pub fn resolve_pod_secrets(
 /// stayed root (issue #326 PR 6) — this is the root glue that keeps the
 /// ONE emit-everything entry point the sync/rollback tails call.
 pub(crate) fn emit_pod_surfaces(
-    store: &crate::runtime::RuntimeStore,
-    gen: &crate::runtime::Generation,
+    store: &nau_runtime::runtime::RuntimeStore,
+    gen: &nau_core::pkg_manifest::Generation,
 ) -> miette::Result<std::path::PathBuf> {
     let farm = crate::farm::emit(&store.store_view(), gen)?;
     crate::services::emit(store, gen)?;
@@ -1950,7 +1950,7 @@ pub fn add_snap_pod(
     // Install the payload through the store's normal batch path: it
     // re-verifies sha3-384 fail-closed, refuses infrastructure types,
     // records `type: store` inert, and emits the loud unsigned note.
-    let pending = crate::runtime::PendingSnap {
+    let pending = nau_runtime::runtime::PendingSnap {
         name: name.clone(),
         revision: 0,
         sha3_384: sha3_384.clone(),
@@ -1959,13 +1959,13 @@ pub fn add_snap_pod(
         meta_digest: None,
         // Sideload: bytes this process never observed at write time —
         // the install-time re-verify stays (issue #116).
-        provenance: crate::runtime::SnapProvenance::Fetched,
+        provenance: nau_runtime::runtime::SnapProvenance::Fetched,
     };
     let install = store.install_batch(
         &[pending],
         &Default::default(),
         &tools,
-        &crate::runtime::verify_signatures,
+        &nau_trust::verify::verify_signatures,
     )?;
     for note in &install.notes {
         crate::output::info(note.clone());
@@ -2161,7 +2161,7 @@ fn payload_layer(decl: &PodDeclaration, name: &str) -> crate::farm::ClaimLayer {
 
 /// Unpack a payload with unsquashfs and read its `meta/snap.yaml`
 /// identity: the runtime-planner shape plus the version field. The
-/// [`crate::runtime::RuntimeStore`] twin (`unpack_payload`) stays
+/// [`nau_runtime::runtime::RuntimeStore`] twin (`unpack_payload`) stays
 /// private to the install path; the sideload gate needs the same read
 /// BEFORE any write.
 fn unpack_payload_identity(
@@ -2210,7 +2210,7 @@ fn unpack_payload_identity(
 /// pod can accumulate sideloaded payloads.
 struct PodPins<'a> {
     lock: &'a LockFile,
-    active: Option<&'a crate::runtime::Generation>,
+    active: Option<&'a nau_core::pkg_manifest::Generation>,
 }
 
 impl PodPins<'_> {
@@ -2218,7 +2218,7 @@ impl PodPins<'_> {
     /// carries — the #135/#151 blob-pin lookup shape (`hold_blob_pinned`):
     /// the lockfile pin's sha3-384 must match the generation's content.
     /// `None` leaves the sibling to the collection fallback.
-    fn carried(&self, name: &str) -> Option<&crate::runtime::InstalledPackage> {
+    fn carried(&self, name: &str) -> Option<&nau_core::pkg_manifest::InstalledPackage> {
         let pin = self.lock.snaps.get(name)?;
         let pkg = self.active?.packages.get(name)?;
         (pkg.sha3_384 == pin.sha3_384).then_some(pkg)
@@ -2915,7 +2915,7 @@ pub fn rollback_pod_with(
     root: &Path,
     pod_name: &str,
     target: Option<u64>,
-    tools: &crate::runtime::RuntimeTools,
+    tools: &nau_runtime::runtime::RuntimeTools,
 ) -> miette::Result<PodRollbackReport> {
     validate_pod_name(pod_name)?;
     let dir = pod_dir(root, pod_name);
@@ -2976,8 +2976,8 @@ pub fn rollback_pod_with(
 pub fn gc_pod(
     root: &Path,
     pod_name: &str,
-    opts: crate::runtime::GcOpts,
-) -> miette::Result<crate::runtime::GcReport> {
+    opts: nau_runtime::runtime::GcOpts,
+) -> miette::Result<nau_runtime::runtime::GcReport> {
     validate_pod_name(pod_name)?;
     let dir = pod_dir(root, pod_name);
     let store = pod_store(&dir);
@@ -3025,8 +3025,8 @@ pub struct PodSyncReport {
 /// pointed at the pod's state directory (issue #3 seam — no forked
 /// store). The sysext presentation links are kept INSIDE the pod dir so
 /// a per-user pod never writes to the system extensions directory.
-pub fn pod_store(pod_dir: &Path) -> crate::runtime::RuntimeStore {
-    crate::runtime::RuntimeStore::new(pod_dir.to_path_buf())
+pub fn pod_store(pod_dir: &Path) -> nau_runtime::runtime::RuntimeStore {
+    nau_runtime::runtime::RuntimeStore::new(pod_dir.to_path_buf())
         .with_extensions_link_dir(pod_dir.join("extensions"))
 }
 
@@ -3034,7 +3034,7 @@ pub fn pod_store(pod_dir: &Path) -> crate::runtime::RuntimeStore {
 /// resolved [`pod_root`] (the peer/static pull's staging target,
 /// ADR-0033 Decision 5; shared with `serve --pod` via
 /// [`resolve_pod_dir`]).
-pub fn resolve_pod_store(pod: Option<&str>) -> miette::Result<crate::runtime::RuntimeStore> {
+pub fn resolve_pod_store(pod: Option<&str>) -> miette::Result<nau_runtime::runtime::RuntimeStore> {
     let (_, dir) = resolve_pod_dir(pod)?;
     Ok(pod_store(&dir))
 }
@@ -3047,10 +3047,10 @@ pub fn resolve_pod_store(pod: Option<&str>) -> miette::Result<crate::runtime::Ru
 /// resolves every tool to `None`, so `pod sync`/`pod rollback` reach
 /// activation with no external tool at all and cannot touch the host
 /// system bus. Production never sets it.
-fn pod_runtime_tools() -> crate::runtime::RuntimeTools {
+fn pod_runtime_tools() -> nau_runtime::runtime::RuntimeTools {
     match std::env::var("NAU_POD_TOOLS").as_deref() {
-        Ok("absent") => crate::runtime::RuntimeTools::default(),
-        _ => crate::runtime::RuntimeTools::for_pod_runtime(),
+        Ok("absent") => nau_runtime::runtime::RuntimeTools::default(),
+        _ => nau_runtime::runtime::RuntimeTools::for_pod_runtime(),
     }
 }
 
@@ -3231,7 +3231,7 @@ fn hold_style_skip_claims(
     desktop_claims: &mut Vec<DesktopClaim>,
     binary_claims: &mut Vec<BinaryClaim>,
     service_claims: &mut Vec<ServiceClaim>,
-    installed_pkg: &crate::runtime::InstalledPackage,
+    installed_pkg: &nau_core::pkg_manifest::InstalledPackage,
     meta: &nau_core::snap_types::SnapMeta,
     layer: crate::farm::ClaimLayer,
 ) {
@@ -3253,7 +3253,7 @@ fn held_at_pin(
     lock: &LockFile,
     name: &str,
     meta_version: &str,
-    active: Option<&crate::runtime::Generation>,
+    active: Option<&nau_core::pkg_manifest::Generation>,
 ) -> bool {
     let Some(pin) = lock.packages.get(name) else {
         return false;
@@ -3278,7 +3278,7 @@ fn held_at_pin(
 /// (version, observed source sha256, resolved deps hash) equals the
 /// recorded one, with the drift observation never skipped.
 fn held_at_content(
-    active: Option<&crate::runtime::Generation>,
+    active: Option<&nau_core::pkg_manifest::Generation>,
     meta: &nau_core::snap_types::SnapMeta,
 ) -> bool {
     if meta.floating {
@@ -3303,7 +3303,7 @@ fn held_at_undigested_pin(
     lock: &LockFile,
     name: &str,
     meta_version: &str,
-    active: Option<&crate::runtime::Generation>,
+    active: Option<&nau_core::pkg_manifest::Generation>,
 ) -> bool {
     lock.packages.get(name).is_some_and(|pin| {
         pin.version == meta_version
@@ -3382,7 +3382,7 @@ fn queue_held_loaded_deps_verify(
     let blob = ctx.store.blob_path(&hash);
     let fallback = source_pod.map(|pod| FallbackBlob {
         pod: pod.to_string(),
-        blob: crate::runtime::RuntimeStore::new(ctx.root.join(pod)).blob_path(&hash),
+        blob: nau_runtime::runtime::RuntimeStore::new(ctx.root.join(pod)).blob_path(&hash),
     });
     build.held_blob_verifies.push(HeldBlobVerify {
         name: name.to_string(),
@@ -4080,7 +4080,7 @@ fn reconcile_pod_scoped(
     root: &Path,
     pod_name: &str,
     opts: &ReconcileOpts<'_>,
-    tools: &crate::runtime::RuntimeTools,
+    tools: &nau_runtime::runtime::RuntimeTools,
 ) -> miette::Result<(PodSyncReport, bool)> {
     // Reconcile-lifetime eval memo (sync-speed plan item 5): pod.lua
     // declarations and recipe metas evaluate once and clone thereafter.
@@ -4186,7 +4186,7 @@ fn present_and_reconcile(
     env_vars: &BTreeMap<String, String>,
     secrets: &BTreeMap<String, SecretSource>,
     svc_overrides: &PodServiceOverrides,
-    tools: &crate::runtime::RuntimeTools,
+    tools: &nau_runtime::runtime::RuntimeTools,
     secrets_cache_base: Option<&Path>,
 ) -> miette::Result<(
     Option<u64>,
@@ -4224,9 +4224,9 @@ struct ReconcileState {
     pod_name: String,
     decl: PodDeclaration,
     dir: PathBuf,
-    store: crate::runtime::RuntimeStore,
-    tools: crate::runtime::RuntimeTools,
-    active: Option<crate::runtime::Generation>,
+    store: nau_runtime::runtime::RuntimeStore,
+    tools: nau_runtime::runtime::RuntimeTools,
+    active: Option<nau_core::pkg_manifest::Generation>,
     lock: LockFile,
     lock_path: PathBuf,
     loaded_versions: BTreeMap<String, ContributedPkg>,
@@ -4247,8 +4247,8 @@ fn validate_reconcile_inputs(root: &Path, pod_name: &str) -> miette::Result<PodD
 /// True when the host can build and unpack payloads: the squashfs pair
 /// is on PATH. The single install-capability gate — the degraded
 /// guard and the build phase must agree.
-fn install_capable(tools: &crate::runtime::RuntimeTools) -> bool {
-    tools.unsquashfs.is_some() && crate::runtime::tool_on_path("mksquashfs")
+fn install_capable(tools: &nau_runtime::runtime::RuntimeTools) -> bool {
+    tools.unsquashfs.is_some() && nau_runtime::runtime::tool_on_path("mksquashfs")
 }
 
 /// Prepare one scoped reconcile: validate the declaration, open the
@@ -4261,7 +4261,7 @@ fn prepare_reconcile(
     root: &Path,
     pod_name: &str,
     allow_degraded: bool,
-    tools: &crate::runtime::RuntimeTools,
+    tools: &nau_runtime::runtime::RuntimeTools,
 ) -> miette::Result<ReconcileState> {
     let decl = validate_reconcile_inputs(root, pod_name)?;
     if !allow_degraded && !install_capable(tools) {
@@ -4398,7 +4398,7 @@ fn install_pending(
             &build.pending,
             &Default::default(),
             &state.tools,
-            &crate::runtime::verify_signatures,
+            &nau_trust::verify::verify_signatures,
         )?;
         if !report.noop {
             installed = report.installed.iter().map(|s| s.name.clone()).collect();
@@ -4412,10 +4412,10 @@ fn install_pending(
 /// commit into it per package, issue #142), and the active generation
 /// when one exists.
 struct ReconcileCtx<'a> {
-    store: &'a crate::runtime::RuntimeStore,
+    store: &'a nau_runtime::runtime::RuntimeStore,
     lock: &'a mut LockFile,
     lock_path: &'a Path,
-    active: Option<&'a crate::runtime::Generation>,
+    active: Option<&'a nau_core::pkg_manifest::Generation>,
     root: &'a Path,
     pod_name: &'a str,
 }
@@ -4426,7 +4426,7 @@ struct ReconcileCtx<'a> {
 #[derive(Default)]
 struct ReconcileBuild {
     /// Packages resolved + built, awaiting install.
-    pending: Vec<crate::runtime::PendingSnap>,
+    pending: Vec<nau_runtime::runtime::PendingSnap>,
     /// Names held at their pins this reconcile (plain sync, issue #5).
     held: Vec<String>,
     /// Package names of the post-state (own + loaded).
@@ -5157,7 +5157,7 @@ fn loaded_hold_record<'a>(
     own_overlay: bool,
     meta: &nau_core::snap_types::SnapMeta,
     build: &ReconcileBuild,
-) -> miette::Result<Option<&'a crate::runtime::InstalledPackage>> {
+) -> miette::Result<Option<&'a nau_core::pkg_manifest::InstalledPackage>> {
     if build.refresh_members.contains(&meta.name) || build.recipe_drift_members.contains(&meta.name)
     {
         return Ok(None);
@@ -5238,7 +5238,7 @@ fn loaded_float_hold_record<'a>(
     source_pod: Option<&str>,
     own_overlay: bool,
     meta: &nau_core::snap_types::SnapMeta,
-) -> miette::Result<Option<&'a crate::runtime::InstalledPackage>> {
+) -> miette::Result<Option<&'a nau_core::pkg_manifest::InstalledPackage>> {
     if own_overlay {
         return Ok(None);
     }
@@ -5298,8 +5298,8 @@ fn float_lock_tuple_holds(
 /// pod's generation must carry the member at the same version, payload
 /// hash, and build-input digest this pod's installed record carries.
 fn same_declaring_content(
-    recorded: &crate::runtime::InstalledPackage,
-    installed: &crate::runtime::InstalledPackage,
+    recorded: &nau_core::pkg_manifest::InstalledPackage,
+    installed: &nau_core::pkg_manifest::InstalledPackage,
 ) -> bool {
     recorded.version == installed.version
         && recorded.sha3_384 == installed.sha3_384
@@ -5316,7 +5316,7 @@ fn declaring_pod_member_record(
     ctx: &ReconcileCtx<'_>,
     source_pod: Option<&str>,
     name: &str,
-) -> miette::Result<Option<crate::runtime::InstalledPackage>> {
+) -> miette::Result<Option<nau_core::pkg_manifest::InstalledPackage>> {
     let Some(pod) = source_pod else {
         return Ok(None);
     };
@@ -5335,7 +5335,7 @@ fn declaring_pod_member_record(
 fn hold_loaded_member(
     ctx: &ReconcileCtx<'_>,
     source_pod: Option<&str>,
-    installed: &crate::runtime::InstalledPackage,
+    installed: &nau_core::pkg_manifest::InstalledPackage,
     meta: &nau_core::snap_types::SnapMeta,
     build: &mut ReconcileBuild,
 ) -> miette::Result<()> {
@@ -5687,8 +5687,8 @@ fn stamp_pin_updates(
 /// unpacks, so it proceeds even in degraded mode. A package the
 /// degraded mode never installed is simply absent — skip it.
 fn remove_undeclared(
-    store: &crate::runtime::RuntimeStore,
-    tools: &crate::runtime::RuntimeTools,
+    store: &nau_runtime::runtime::RuntimeStore,
+    tools: &nau_runtime::runtime::RuntimeTools,
     declared_names: &std::collections::BTreeSet<String>,
 ) -> miette::Result<Vec<String>> {
     let mut removed = Vec::new();
@@ -5719,7 +5719,7 @@ fn remove_undeclared(
 /// the target generation's RECORDED env + units, not a re-resolution
 /// against the current declaration.
 fn present_active(
-    store: &crate::runtime::RuntimeStore,
+    store: &nau_runtime::runtime::RuntimeStore,
     dir: &Path,
     pod_name: &str,
     env_vars: &BTreeMap<String, String>,
@@ -5807,7 +5807,7 @@ fn push_meta_desktop_claims(
 /// package (a held pin): the ids recorded in its manifest entry.
 fn push_desktop_claims(
     claims: &mut Vec<DesktopClaim>,
-    pkg: &crate::runtime::InstalledPackage,
+    pkg: &nau_core::pkg_manifest::InstalledPackage,
     layer: crate::farm::ClaimLayer,
 ) {
     for app_id in pkg.desktops.keys() {
@@ -5981,7 +5981,7 @@ fn push_meta_binary_claims(
 /// held pin): the apps recorded in its manifest entry.
 fn push_installed_binary_claims(
     claims: &mut Vec<BinaryClaim>,
-    pkg: &crate::runtime::InstalledPackage,
+    pkg: &nau_core::pkg_manifest::InstalledPackage,
     layer: crate::farm::ClaimLayer,
 ) {
     for app in pkg.apps.keys() {
@@ -5999,7 +5999,7 @@ fn push_installed_binary_claims(
 /// meta to read them from.
 fn push_installed_service_claims(
     claims: &mut Vec<ServiceClaim>,
-    pkg: &crate::runtime::InstalledPackage,
+    pkg: &nau_core::pkg_manifest::InstalledPackage,
     layer: crate::farm::ClaimLayer,
 ) {
     for service in pkg.services.keys() {
@@ -6519,14 +6519,14 @@ fn set_pod_build_epoch() {
 /// sandbox. The leak scan runs on the same data — pod-built payloads
 /// carry no build-only references.
 fn build_pending_snap(
-    store: &crate::runtime::RuntimeStore,
+    store: &nau_runtime::runtime::RuntimeStore,
     meta: &nau_core::snap_types::SnapMeta,
     layer: crate::farm::ClaimLayer,
     deps_pin: Option<&crate::lock::PackageDepsLock>,
     source_pod: Option<&str>,
     bypass_source_cache: bool,
     content_check: bool,
-) -> miette::Result<(crate::runtime::PendingSnap, Vec<nau_build::snap::SourceInfo>)> {
+) -> miette::Result<(nau_runtime::runtime::PendingSnap, Vec<nau_build::snap::SourceInfo>)> {
     set_pod_build_epoch();
     let deps_dir = resolve_build_deps_dir(store, meta, deps_pin, source_pod)?;
     // Merged build prefix (ADR-0018, issue #35): `requires` ∪ `build_deps`
@@ -6622,7 +6622,7 @@ fn deps_gate_error(name: &str, source_pod: Option<&str>) -> miette::Error {
 /// The returned [`MergedPrefix`] owns its tempdir — the caller must keep
 /// it alive for as long as the build runs.
 fn pod_build_prefix(
-    store: &crate::runtime::RuntimeStore,
+    store: &nau_runtime::runtime::RuntimeStore,
     meta: &nau_core::snap_types::SnapMeta,
     building: &mut Vec<String>,
     content_check: bool,
@@ -6715,7 +6715,7 @@ enum PodContentCheck {
 /// rebuild) under `Strict` instead of forcing a rebuild — dead sources
 /// make forced rebuilds unbounded damage.
 fn ensure_pod_dep_payload(
-    store: &crate::runtime::RuntimeStore,
+    store: &nau_runtime::runtime::RuntimeStore,
     name: &str,
     dep_meta: &nau_core::snap_types::SnapMeta,
     building: &mut Vec<String>,
@@ -6911,7 +6911,7 @@ fn record_built_payload_provenance(
 /// declares deps builds against the closure its lock pin names; no pin is
 /// the named refusal.
 fn resolve_build_deps_dir(
-    store: &crate::runtime::RuntimeStore,
+    store: &nau_runtime::runtime::RuntimeStore,
     meta: &nau_core::snap_types::SnapMeta,
     deps_pin: Option<&crate::lock::PackageDepsLock>,
     source_pod: Option<&str>,
@@ -7078,7 +7078,7 @@ fn record_dep_payload_digest(payload: &Path, sha3_384: &str) -> miette::Result<(
 /// 4a — reused so the sync never downloads the source twice); `None`
 /// when the package declares no deps or nothing was fetched.
 fn ensure_own_deps(
-    store: &crate::runtime::RuntimeStore,
+    store: &nau_runtime::runtime::RuntimeStore,
     lock: &LockFile,
     meta: &nau_core::snap_types::SnapMeta,
     pkg_name: &str,
@@ -7196,7 +7196,7 @@ fn probe_full_fetch_line(meta: &nau_core::snap_types::SnapMeta, reason: ProbeSki
 /// (issue #113) — the install records it so a plain sync can hold
 /// recipe-identical packages instead of rebuilding them.
 ///
-/// Provenance is [`crate::runtime::SnapProvenance::Built`] (sync-speed
+/// Provenance is [`nau_runtime::runtime::SnapProvenance::Built`] (sync-speed
 /// plan item 6b): the caller hashed the sha3-384 over these exact bytes
 /// in this process immediately after the build wrote them, so
 /// `prepare_snap` skips the redundant re-hash. Every non-build origin
@@ -7206,15 +7206,15 @@ fn build_pending_snap_at(
     payload_path: &Path,
     sha3_384: String,
     layer: crate::farm::ClaimLayer,
-) -> crate::runtime::PendingSnap {
-    crate::runtime::PendingSnap {
+) -> nau_runtime::runtime::PendingSnap {
+    nau_runtime::runtime::PendingSnap {
         name: meta.name.clone(),
         revision: 0,
         sha3_384,
         payload_path: payload_path.to_path_buf(),
         layer,
         meta_digest: Some(meta.build_input_digest()),
-        provenance: crate::runtime::SnapProvenance::Built,
+        provenance: nau_runtime::runtime::SnapProvenance::Built,
     }
 }
 
@@ -7945,8 +7945,8 @@ pod {
 
     /// An installed record for `tool` with an optional build-input
     /// digest (the field a pre-#113 manifest carries `None` of).
-    fn installed_tool(meta_digest: Option<String>) -> crate::runtime::InstalledPackage {
-        crate::runtime::InstalledPackage {
+    fn installed_tool(meta_digest: Option<String>) -> nau_core::pkg_manifest::InstalledPackage {
+        nau_core::pkg_manifest::InstalledPackage {
             name: "tool".into(),
             version: "1.0".into(),
             revision: 1,
@@ -7969,10 +7969,10 @@ pod {
     }
 
     /// A generation carrying exactly one installed record.
-    fn gen_with_record(record: crate::runtime::InstalledPackage) -> crate::runtime::Generation {
+    fn gen_with_record(record: nau_core::pkg_manifest::InstalledPackage) -> nau_core::pkg_manifest::Generation {
         let mut packages = BTreeMap::new();
         packages.insert(record.name.clone(), record);
-        crate::runtime::Generation {
+        nau_core::pkg_manifest::Generation {
             n: 1,
             base_version: "24.04".into(),
             packages,
@@ -7985,15 +7985,15 @@ pod {
     /// 1.0 and whose active generation carries `record`.
     struct HoldFixture {
         _dir: tempfile::TempDir,
-        store: crate::runtime::RuntimeStore,
+        store: nau_runtime::runtime::RuntimeStore,
         lock: LockFile,
-        gen: crate::runtime::Generation,
+        gen: nau_core::pkg_manifest::Generation,
     }
 
-    fn hold_fixture(record: crate::runtime::InstalledPackage) -> HoldFixture {
+    fn hold_fixture(record: nau_core::pkg_manifest::InstalledPackage) -> HoldFixture {
         use std::collections::HashMap;
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::runtime::RuntimeStore::new(dir.path().join("store"));
+        let store = nau_runtime::runtime::RuntimeStore::new(dir.path().join("store"));
         let mut lock = LockFile {
             version: 1,
             sources: HashMap::new(),
@@ -8182,7 +8182,7 @@ pod {
     fn baseline_stamps_persist_per_member_in_commit_order() {
         use std::collections::HashMap;
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::runtime::RuntimeStore::new(dir.path().join("store"));
+        let store = nau_runtime::runtime::RuntimeStore::new(dir.path().join("store"));
         let lock_path = dir.path().join("pod.lock");
         let mut lock = LockFile {
             version: 1,
@@ -8386,13 +8386,13 @@ pod {
     /// sync's install of a loaded member leaves in the active
     /// generation, carrying an app and a desktop entry so the hold's
     /// installed-record claims are observable.
-    fn installed_loaded_tool(meta_digest: Option<String>) -> crate::runtime::InstalledPackage {
-        crate::runtime::InstalledPackage {
+    fn installed_loaded_tool(meta_digest: Option<String>) -> nau_core::pkg_manifest::InstalledPackage {
+        nau_core::pkg_manifest::InstalledPackage {
             layer: crate::farm::ClaimLayer::Loaded,
             apps: BTreeMap::from([("toolbin".to_string(), "sha-toolbin".to_string())]),
             desktops: BTreeMap::from([(
                 "tooldesk".to_string(),
-                crate::runtime::DesktopLauncher {
+                nau_core::pkg_manifest::DesktopLauncher {
                     name: Some("Tool".to_string()),
                     generic_name: None,
                     comment: None,
@@ -8552,7 +8552,7 @@ pod {
     fn pin_declaring_pod_generation(
         fixture: &HoldFixture,
         pod: &str,
-        record: &crate::runtime::InstalledPackage,
+        record: &nau_core::pkg_manifest::InstalledPackage,
     ) {
         let state = fixture._dir.path().join(pod);
         let gen_dir = state.join("generations").join("1");
@@ -8640,7 +8640,7 @@ pod {
             ._dir
             .path()
             .join("upstream/generations/1/manifest.json");
-        let mut gen: crate::runtime::Generation =
+        let mut gen: nau_core::pkg_manifest::Generation =
             serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
         gen.packages.clear();
         std::fs::write(&state, serde_json::to_string(&gen).unwrap()).unwrap();
@@ -9233,7 +9233,7 @@ pod {
         std::fs::create_dir_all(&gen_dir).unwrap();
         std::fs::write(
             gen_dir.join("manifest.json"),
-            serde_json::to_string(&crate::runtime::Generation {
+            serde_json::to_string(&nau_core::pkg_manifest::Generation {
                 n: 1,
                 base_version: "24.04".into(),
                 packages: BTreeMap::from([("tool".to_string(), record)]),
@@ -9251,7 +9251,7 @@ pod {
         declared.insert("tool".to_string());
         let removed = remove_undeclared(
             &fixture.store,
-            &crate::runtime::RuntimeTools::default(),
+            &nau_runtime::runtime::RuntimeTools::default(),
             &declared,
         )
         .unwrap();
@@ -9290,7 +9290,7 @@ pod {
         std::fs::create_dir_all(&gen_dir).unwrap();
         std::fs::write(
             gen_dir.join("manifest.json"),
-            serde_json::to_string(&crate::runtime::Generation {
+            serde_json::to_string(&nau_core::pkg_manifest::Generation {
                 n: 1,
                 base_version: "24.04".into(),
                 packages: BTreeMap::from([("ghost".to_string(), record)]),
@@ -9382,7 +9382,7 @@ pod {
         // store carries the intact blob.
         let mut fixture = hold_fixture(installed_loaded_tool(Some(meta.build_input_digest())));
         let declaring_store =
-            crate::runtime::RuntimeStore::new(fixture._dir.path().join("upstream"));
+            nau_runtime::runtime::RuntimeStore::new(fixture._dir.path().join("upstream"));
         let blob = declaring_store.blob_path(&hash);
         std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
         std::fs::write(&blob, content).unwrap();
@@ -9443,7 +9443,7 @@ pod {
         std::fs::create_dir_all(local.parent().unwrap()).unwrap();
         std::fs::write(&local, b"tampered").unwrap();
         let declaring_store =
-            crate::runtime::RuntimeStore::new(fixture._dir.path().join("upstream"));
+            nau_runtime::runtime::RuntimeStore::new(fixture._dir.path().join("upstream"));
         let blob = declaring_store.blob_path(&hash);
         std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
         std::fs::write(&blob, content).unwrap();
@@ -9492,7 +9492,7 @@ pod {
         });
 
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::runtime::RuntimeStore::new(dir.path().join("store"));
+        let store = nau_runtime::runtime::RuntimeStore::new(dir.path().join("store"));
         // The closure blob the pin names, already fetched into the
         // consuming pod's store (`nau deps fetch` in the declaring pod
         // shares the store layout this unit simulates).
@@ -9559,7 +9559,7 @@ pod {
             go: None,
         });
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::runtime::RuntimeStore::new(dir.path().join("store"));
+        let store = nau_runtime::runtime::RuntimeStore::new(dir.path().join("store"));
         // The declaring pod's lockfile exists but pins nothing.
         std::fs::create_dir_all(dir.path().join("upstream")).unwrap();
         LockFile::empty()
@@ -9633,7 +9633,7 @@ pod {
             go: None,
         });
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::runtime::RuntimeStore::new(dir.path().join("store"));
+        let store = nau_runtime::runtime::RuntimeStore::new(dir.path().join("store"));
 
         let err = build_pending_snap(
             &store,
@@ -9898,11 +9898,11 @@ pod {
 
     /// A minimal public-fields generation with one package, so the
     /// pod-level tests can drive `farm::emit` directly.
-    fn gen_with_one_pkg(n: u64, pkg: &str) -> crate::runtime::Generation {
+    fn gen_with_one_pkg(n: u64, pkg: &str) -> nau_core::pkg_manifest::Generation {
         let mut packages = BTreeMap::new();
         packages.insert(
             pkg.to_string(),
-            crate::runtime::InstalledPackage {
+            nau_core::pkg_manifest::InstalledPackage {
                 name: pkg.to_string(),
                 version: "1.0".into(),
                 revision: 1,
@@ -9923,7 +9923,7 @@ pod {
                 meta_digest: None,
             },
         );
-        crate::runtime::Generation {
+        nau_core::pkg_manifest::Generation {
             n,
             base_version: "24.04".into(),
             packages,
