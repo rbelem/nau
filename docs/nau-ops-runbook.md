@@ -33,6 +33,11 @@ The hcloud worker-lane token (§1) and the tofu full-account token (§2) are
 DIFFERENT credentials. The worker lane never reads `TOFU_INPUTS`
 (#271, INFRA D5) — that is the whole point of §1.
 
+Live pod-service state is systemd, not nau: `systemctl --user
+is-active/is-failed nau-pod-<pod>-<service>.service` is the authority;
+`nau doctor --pod` is advisory. The full verb → state map lives in
+[docs/agents/verb-state-map.md](agents/verb-state-map.md).
+
 ## 1. Worker account: isolated hcloud project (#271)
 
 Why: `hcloud_token` in SM secret `TOFU_INPUTS` owns the cluster and can

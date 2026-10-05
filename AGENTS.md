@@ -34,6 +34,7 @@ the suite spawns — see [Build & test](docs/agents/build-and-test.md).
 ## Detail docs
 
 - [Build & test](docs/agents/build-and-test.md) — commands, test layout, gates
+- [Verb → state map](docs/agents/verb-state-map.md) — what each verb touches; where live state actually lives (systemd, not nau)
 - [Git workflow](docs/agents/git-workflow.md) — commits, generated files
 - [Planning & docs](docs/agents/planning-and-docs.md) — grill-with-docs, CONTEXT.md, ADRs
 - [Project context](docs/agents/project-context.md) — constraints, stack, where things live

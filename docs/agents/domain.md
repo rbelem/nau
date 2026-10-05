@@ -10,6 +10,8 @@ How the engineering skills should consume this repo's domain documentation when 
 
 If any of these files don't exist, **proceed silently**. Don't flag their absence; don't suggest creating them upfront. The producer skill (`/grill-with-docs`) creates them lazily when terms or decisions actually get resolved.
 
+For "which verb touches what state" questions, read [docs/agents/verb-state-map.md](verb-state-map.md) — the verb → state table and the live-state rule (systemd user units are the authority on pod services).
+
 ## File structure
 
 Single-context repo (most repos):
