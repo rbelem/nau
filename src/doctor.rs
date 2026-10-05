@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::snap;
 use crate::tools::{self, ResolvedTool, ToolName};
 use miette::IntoDiagnostic;
+use nau_infra::pathsearch;
 
 // The image-layout audit cluster (Check/CheckStatus + the three
 // builder-context audits + their initrd/verity machinery) moved to
@@ -191,7 +192,7 @@ fn run_scoped(scope: Scope) -> Vec<Check> {
         Scope::Full => &SANDBOX_TOOLS,
         Scope::Pod => &POD_SANDBOX_TOOLS,
     };
-    let entries = snap::path_entries();
+    let entries = pathsearch::path_entries();
     match scope {
         Scope::Full => checks.extend(check_sandbox_tools_with(toolchain, &entries)),
         // Pod scope takes the #178 variant: cc/c++ also credit the pod
@@ -278,7 +279,7 @@ pub const EFI_STUB_CANDIDATES: [&str; 3] = [
 /// build a UKI with the real `ukify` CLI and fail closed without it, so a
 /// missing ukify must be named before any build starts.
 fn check_ukify() -> Check {
-    match snap::resolve_in_path("ukify", &snap::path_entries()) {
+    match pathsearch::resolve_in_path("ukify", &pathsearch::path_entries()) {
         Some(path) => Check::ok_at("ukify", format!("resolves to {path:?}")),
         None => Check::missing(
             "ukify",
@@ -313,7 +314,7 @@ fn check_efi_stub() -> Check {
 /// `veritysetup` CLI and fail closed without it, so a missing veritysetup
 /// must be named before any build starts.
 fn check_veritysetup() -> Check {
-    match snap::resolve_in_path("veritysetup", &snap::path_entries()) {
+    match pathsearch::resolve_in_path("veritysetup", &pathsearch::path_entries()) {
         Some(path) => Check::ok_at("veritysetup", format!("resolves to {path:?}")),
         None => Check::missing(
             "veritysetup",
@@ -365,10 +366,12 @@ fn check_sysupdate_prereqs() -> Check {
 /// One [`Check`] for the whole sysupdate prerequisite set, naming the
 /// missing piece precisely.
 fn check_sysupdate_version() -> SysupdatePrereq {
-    let Some(sysupdate) = snap::resolve_in_path("systemd-sysupdate", &snap::path_entries()) else {
+    let Some(sysupdate) =
+        pathsearch::resolve_in_path("systemd-sysupdate", &pathsearch::path_entries())
+    else {
         return SysupdatePrereq::MissingBinary;
     };
-    if snap::resolve_in_path("bootctl", &snap::path_entries()).is_none() {
+    if pathsearch::resolve_in_path("bootctl", &pathsearch::path_entries()).is_none() {
         return SysupdatePrereq::MissingBootctl;
     }
     let version = std::process::Command::new(&sysupdate)
@@ -737,9 +740,9 @@ fn squashfs_roundtrip(mksquashfs: &Path, unsquashfs: &Path) -> Result<String, St
     let file = work.path().join("probe.txt");
     std::fs::write(&file, PROBE_CONTENT).map_err(|e| format!("write probe file: {e}"))?;
 
-    let entries = snap::path_entries();
-    let setfattr = snap::resolve_in_path("setfattr", &entries);
-    let getfattr = snap::resolve_in_path("getfattr", &entries);
+    let entries = pathsearch::path_entries();
+    let setfattr = pathsearch::resolve_in_path("setfattr", &entries);
+    let getfattr = pathsearch::resolve_in_path("getfattr", &entries);
     // The xattr is set BEFORE packing: the probe asserts that the packed
     // bytes carry it and the unpack restores it — setting it after the
     // round-trip would prove nothing.
@@ -919,9 +922,9 @@ fn bwrap_failure_hint(code: i32, stderr: &str) -> String {
 /// host can run it.
 fn check_sandbox_tool(tool: &str, fix: &str, entries: &[PathBuf]) -> Check {
     let visible = snap::sandbox_visible_entries(entries);
-    match snap::resolve_in_path(tool, &visible) {
+    match pathsearch::resolve_in_path(tool, &visible) {
         Some(path) => Check::ok_at(format!("sandbox: {tool}"), format!("resolves to {path:?}")),
-        None => match snap::resolve_in_path(tool, entries) {
+        None => match pathsearch::resolve_in_path(tool, entries) {
             Some(host_path) => Check::error(
                 format!("sandbox: {tool}"),
                 format!(
@@ -989,7 +992,7 @@ fn check_pod_toolchain_tool_with(
 fn resolve_pod_tool_in(tool: &str, farms: &[PathBuf]) -> Option<PathBuf> {
     farms
         .iter()
-        .find_map(|farm| snap::resolve_in_path(tool, std::slice::from_ref(farm)))
+        .find_map(|farm| pathsearch::resolve_in_path(tool, std::slice::from_ref(farm)))
 }
 
 /// The sync environment's `cc` provenance (issue #180 item 3): warns
@@ -1008,7 +1011,7 @@ fn resolve_pod_tool_in(tool: &str, farms: &[PathBuf]) -> Option<PathBuf> {
 /// (absence already has the `sandbox: cc` check) and never a hard
 /// failure for the usually-working foreign cc.
 fn check_cc_provenance() -> Check {
-    let entries = snap::path_entries();
+    let entries = pathsearch::path_entries();
     let farms = pod_farm_dirs();
     check_cc_provenance_with(&entries, &farms)
 }
@@ -1018,7 +1021,7 @@ fn check_cc_provenance() -> Check {
 /// tempdirs without touching the real PATH or pod root.
 fn check_cc_provenance_with(entries: &[PathBuf], farms: &[PathBuf]) -> Check {
     let name = "sync cc provenance";
-    match snap::resolve_in_path("cc", entries) {
+    match pathsearch::resolve_in_path("cc", entries) {
         // Absence is the `sandbox: cc` check's verdict — this hint
         // would only duplicate it.
         None => Check::ok(name),
