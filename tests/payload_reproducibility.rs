@@ -32,6 +32,18 @@ fn real_mksquashfs_available() -> bool {
         .unwrap_or(false)
 }
 
+/// #364 verdict: the packing layer is reproducible only under the
+/// contract this suite was written against — SOURCE_DATE_EPOCH reaching
+/// the child (mksquashfs >= 4.4 honors it natively; doctor gates that
+/// floor). Without the pin, mksquashfs embeds real stage mtimes and any
+/// two builds straddling a wall-clock second diverge; the large-tree
+/// arm always straddles. Each arm pins it up front so the gate is
+/// hermetic and the fresh-mtime arm keeps meaning what its docblock
+/// says: the clamp must reach the payload bytes.
+fn pin_source_date_epoch() {
+    std::env::set_var("SOURCE_DATE_EPOCH", "946684800");
+}
+
 /// A stage with stable CONTENT: two files and a subdir, byte-identical
 /// across calls. `fresh_mtimes` controls the one deliberately varying
 /// input: the stage files' timestamps (a fresh build's stage always has
@@ -152,6 +164,7 @@ fn same_tree_twice_packs_identical_payloads_with_fresh_mtimes() {
         eprintln!("skipping: mksquashfs unavailable");
         return;
     }
+    pin_source_date_epoch();
     let a = build_once(true);
     let b = build_once(true);
     assert_eq!(
@@ -170,6 +183,7 @@ fn same_tree_twice_packs_identical_payloads_with_fixed_mtimes() {
         eprintln!("skipping: mksquashfs unavailable");
         return;
     }
+    pin_source_date_epoch();
     let a = build_once(false);
     let b = build_once(false);
     assert_eq!(
@@ -190,6 +204,7 @@ fn same_tree_different_creation_order_packs_identically() {
         eprintln!("skipping: mksquashfs unavailable");
         return;
     }
+    pin_source_date_epoch();
     let work = tempfile::tempdir().unwrap();
     let out = tempfile::tempdir().unwrap();
 
@@ -246,6 +261,7 @@ fn same_large_tree_twice_packs_identically() {
         eprintln!("skipping: mksquashfs unavailable");
         return;
     }
+    pin_source_date_epoch();
     let work = tempfile::tempdir().unwrap();
     let out = tempfile::tempdir().unwrap();
     let mut digests = Vec::new();
@@ -281,6 +297,6 @@ fn same_large_tree_twice_packs_identically() {
     }
     assert_eq!(
         digests[0], digests[1],
-        "large-tree builds diverged — mksquashfs parallelism is order-unstable (A2 root cause)"
+        "large-tree builds diverged — with SOURCE_DATE_EPOCH pinned this is real packing nondeterminism, not stage mtimes"
     );
 }

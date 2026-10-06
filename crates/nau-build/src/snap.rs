@@ -8,6 +8,7 @@ use mlua::Value;
 use sha2::Digest;
 
 use nau_infra::output;
+use nau_infra::pathsearch::{path_entries, resolve_in_path};
 
 // Re-exported from the value-type home ([`nau_core::snap_types`], #316)
 // so every pre-existing `crate::snap::` path keeps compiling.
@@ -1581,25 +1582,6 @@ fn system_elf_interpreter_for(machine: u64) -> String {
     }
 }
 
-/// Find the `patchelf` binary on PATH (used to repoint an ELF
-/// interpreter/RUNPATH at build time). Returns `None` when unavailable.
-fn find_patchelf() -> Option<String> {
-    std::process::Command::new("which")
-        .arg("patchelf")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| {
-            let s = s.trim().to_string();
-            if s.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
-        })
-}
-
 /// Rewrite a native command binary's ELF interpreter and RUNPATH so it runs
 /// on a non-nix host (ticket #12). A nix-toolchain build bakes the build
 /// machine's `/nix/store/...-glibc.../ld-linux-x86-64.so.2` as the
@@ -1612,7 +1594,13 @@ fn find_patchelf() -> Option<String> {
 /// Returns the number of ELF binaries repointed. Binaries whose interpreter
 /// and RUNPATH already carry no `/nix/store` reference are left untouched.
 fn repair_elf_for_portability(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<usize> {
-    let patchelf = find_patchelf();
+    // patchelf resolves through the sanctioned PATH-search seam
+    // (`nau_infra::pathsearch`) like every other host-tool discovery in
+    // this module — no `which` subprocess. `None` = unavailable; the
+    // repair path then fails closed only where an ELF actually needs
+    // repointing (see [`repair_elf_on_host`]).
+    let patchelf =
+        resolve_in_path("patchelf", &path_entries()).map(|p| p.to_string_lossy().into_owned());
     let mut repaired = 0usize;
     for (app_name, app) in &meta.apps {
         let Some(cmd_path) = nau_core::units::resolve_command_path(&app.command) else {
@@ -3107,7 +3095,7 @@ fn check_adopt_text_cap(field: &str, value: &str, from: &str, max: usize) -> mie
 /// documented deterministic tie-break (Lua tables don't preserve order, so
 /// any non-`after` ordering is intentionally unspecified beyond this
 /// determinism).
-pub fn order_parts(parts: &BTreeMap<String, SnapPart>) -> miette::Result<Vec<String>> {
+fn order_parts(parts: &BTreeMap<String, SnapPart>) -> miette::Result<Vec<String>> {
     for name in parts.keys() {
         validate_part_name(name)?;
     }
@@ -3426,7 +3414,7 @@ pub const SANDBOX_BUILD_PREFIX: &str = "/nau-build-prefix";
 /// paths baked into pool `.pc` files onto the prefix (ncurses ships
 /// `prefix=/usr` in its `.pc`); `CPPFLAGS`/`LDFLAGS` cover configure's
 /// header/link probes when no `.pc` file exists.
-pub fn build_prefix_env(prefix: &str) -> Vec<(&'static str, String)> {
+fn build_prefix_env(prefix: &str) -> Vec<(&'static str, String)> {
     vec![
         ("NAU_BUILD_PREFIX", prefix.to_string()),
         (
@@ -3625,7 +3613,7 @@ fn default_make_flags(ambient: Option<&str>) -> Option<(&'static str, String)> {
 /// earlier "cc1 carries RUNPATH=/nau-build-prefix/usr/lib{,64}"
 /// claim here described the pre-#164 source-built gcc recipe and died
 /// with it (#209 watch item).
-pub fn build_prefix_toolchain_env(prefix: &Path) -> Vec<(&'static str, String)> {
+fn build_prefix_toolchain_env(prefix: &Path) -> Vec<(&'static str, String)> {
     let bin = prefix.join("usr/bin");
     [
         ("CC", ["gcc", "clang"].as_slice()),
@@ -3670,7 +3658,7 @@ fn prefix_has_c_compiler(prefix: &Path) -> bool {
 ///
 /// Cross builds are exempt: `target` routes the C compiler through the
 /// sysroot machinery (`cross_compile_env`), not the merged prefix.
-pub fn ensure_cgo_toolchain(
+fn ensure_cgo_toolchain(
     cmd: &str,
     extra_env: &[(String, String)],
     build_prefix: Option<&Path>,
@@ -3694,18 +3682,11 @@ pub fn ensure_cgo_toolchain(
     Ok(())
 }
 
-/// The PATH-search mechanism moved to `nau_infra::pathsearch` (issue #326
-/// PR 3 down-move: generic host mechanism, consumed by the image domain
-/// and the doctor too). Re-exported so every `crate::snap::path_entries` /
-/// `crate::snap::resolve_in_path` path — including this module's sandbox
-/// plumbing — keeps resolving.
-pub use nau_infra::pathsearch::{path_entries, resolve_in_path};
-
 /// True if `path` lives under a sandbox bind root ([`SANDBOX_RO_ROOTS`])
 /// — the sandbox binds those roots at the same host path, so anything
 /// under them is visible to a sandboxed build. Component-wise, so a
 /// sibling prefix (`/usrlocal`) does not match.
-pub fn sandbox_visible(path: &Path) -> bool {
+fn sandbox_visible(path: &Path) -> bool {
     SANDBOX_RO_ROOTS.iter().any(|root| path.starts_with(root))
 }
 
@@ -3728,7 +3709,7 @@ pub fn sandbox_visible_entries(entries: &[PathBuf]) -> Vec<PathBuf> {
 /// sandbox binds `/nix`, but binds the *profile* dir nowhere). Entries that
 /// do not exist (a garbage-collected store path, a missing dir) resolve to
 /// nothing and are dropped, matching what the sandbox would see.
-pub fn sandbox_visible_entries_with(entries: &[PathBuf], extra_roots: &[PathBuf]) -> Vec<PathBuf> {
+fn sandbox_visible_entries_with(entries: &[PathBuf], extra_roots: &[PathBuf]) -> Vec<PathBuf> {
     entries
         .iter()
         .filter_map(|e| std::fs::canonicalize(e).ok())
@@ -3736,17 +3717,6 @@ pub fn sandbox_visible_entries_with(entries: &[PathBuf], extra_roots: &[PathBuf]
             (sandbox_visible(e) || extra_roots.iter().any(|r| e.starts_with(r))) && e.is_dir()
         })
         .collect()
-}
-
-/// The `PATH` the sandbox can actually see for the given `extra_roots`
-/// (a colon-joined [`sandbox_visible_entries_with`]) — the hermetic
-/// sandbox PATH baseline so inherited host env (devbox/nix-shell paths
-/// that are NOT bound) never leaks into the build. The sandboxed build
-/// ([`run_bwrapped`]) prepends the merged build prefix's bin dir when one
-/// is bound, so build_deps tooling shadows coincidental host tools.
-pub fn sandbox_path(extra_roots: &[PathBuf]) -> std::ffi::OsString {
-    let entries = sandbox_visible_entries_with(&path_entries(), extra_roots);
-    std::env::join_paths(entries).unwrap_or_default()
 }
 
 /// Shell keywords and POSIX sh builtins — never resolved through PATH.
@@ -4028,20 +3998,15 @@ fn is_variable_assignment(word: &str) -> bool {
 
 /// Fail a sandboxed build BEFORE running it when its command needs a tool
 /// the sandbox cannot see. Each PATH-resolved command word is resolved
-/// against the sandbox-visible PATH ([`sandbox_visible_entries`]); an
-/// invisible tool becomes a named error instead of an obscure mid-build
-/// failure (e.g. autotools `config.status` breaking because `make` sat
-/// only on an unbound PATH entry or was garbage-collected out of
-/// /nix/store). Tools shadowed by an unbound entry but also present under
-/// a bind root resolve fine and pass.
-pub fn preflight_sandbox_tools(cmd: &str, entries: &[PathBuf]) -> miette::Result<()> {
-    preflight_sandbox_tools_with(cmd, entries, &[])
-}
-
-/// Like [`preflight_sandbox_tools`], with `extra_roots`: host paths the
-/// sandbox binds at their own location (the stage dir), so PATH entries
-/// under them count as sandbox-visible.
-pub fn preflight_sandbox_tools_with(
+/// against the sandbox-visible PATH; an invisible tool becomes a named
+/// error instead of an obscure mid-build failure (e.g. autotools
+/// `config.status` breaking because `make` sat only on an unbound PATH
+/// entry or was garbage-collected out of /nix/store). Tools shadowed by
+/// an unbound entry but also present under a bind root resolve fine and
+/// pass. `extra_roots` are host paths the sandbox binds at their own
+/// location (the stage dir), so PATH entries under them count as
+/// sandbox-visible.
+fn preflight_sandbox_tools_with(
     cmd: &str,
     entries: &[PathBuf],
     extra_roots: &[PathBuf],
@@ -4628,6 +4593,13 @@ mod tests {
     use nau_chart::snap_lua::{
         deps_lock_spec_from_lua, parse_submodule_spec, FromLuaTable, FromLuaTableNamed,
     };
+
+    /// The no-`extra_roots` preflight form, test-only: production always
+    /// preflights with the stage dir bound as an extra root
+    /// ([`preflight_sandbox_tools_with`]).
+    fn preflight_sandbox_tools(cmd: &str, entries: &[PathBuf]) -> miette::Result<()> {
+        preflight_sandbox_tools_with(cmd, entries, &[])
+    }
 
     /// SHA3-384 hex of a file's bytes, streamed — the store-ingest
     /// digest. Duplicated from the root crate's `store.rs` (the moved
