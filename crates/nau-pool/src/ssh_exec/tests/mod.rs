@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn addr(user: Option<&str>, host: &str, port: Option<u16>) -> miette::Result<AddressParts> {

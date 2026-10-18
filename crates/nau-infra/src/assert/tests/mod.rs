@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// Real snap-revision + account-key assertions captured from the live

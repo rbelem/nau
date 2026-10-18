@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn launcher(name: Option<&str>, cats: &[&str]) -> DesktopLauncher {

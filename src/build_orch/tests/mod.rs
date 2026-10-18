@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn dep_fixture_meta(name: &str) -> crate::snap::SnapMeta {
