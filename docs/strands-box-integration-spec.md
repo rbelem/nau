@@ -188,6 +188,11 @@ Apple-silicon rental is justified.
 
 ## Ticket index
 
+The `#NNN` numbers below are stable labels carried from the tracker that
+predates the 2026-10-17 repository rebuild; they are not links into the
+current issue tracker (numbering restarted). Re-file on pickup if the
+phases are scheduled.
+
 | # | Title | Phase |
 |---|---|---|
 | #369 | box: spike nau-policy-check crate embedding the Dogwood Local Engine on Linux | 0 |
