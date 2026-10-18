@@ -46,3 +46,6 @@ graphify-out/
 .opencode/commands/
 .opencode/skills/
 .impeccable/
+
+# Python bytecode from repo scripts
+__pycache__/
