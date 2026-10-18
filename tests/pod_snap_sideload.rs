@@ -173,6 +173,8 @@ fn build_payload(
 
 /// Copy the built `{name}_{version}_*.snap` out of the builder pod's
 /// downloads dir into `dest_dir`, preserving the artifact filename.
+/// Built payloads carry `.sha3-384`/`.content-key` sidecars (issue #344)
+/// that share the name prefix, so the `.snap` extension disambiguates.
 fn harvest_payload(builder_root: &Path, dest_dir: &Path, name: &str, version: &str) -> PathBuf {
     let downloads = builder_root.join("build").join("downloads");
     let built = std::fs::read_dir(&downloads)
@@ -180,9 +182,9 @@ fn harvest_payload(builder_root: &Path, dest_dir: &Path, name: &str, version: &s
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .find(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(&format!("{name}_{version}_")))
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                n.starts_with(&format!("{name}_{version}_")) && n.ends_with(".snap")
+            })
         })
         .unwrap_or_else(|| panic!("no {name}_{version}_*.snap in {}", downloads.display()));
     std::fs::create_dir_all(dest_dir).unwrap();

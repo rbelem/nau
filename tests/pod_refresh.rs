@@ -345,7 +345,9 @@ fn sync_fixture_pod(server_dir: &Path, port: u16, name: &str) -> (PathBuf, PathB
 }
 
 /// Harvest a built payload from a pod's downloads dir (the builder-pod
-/// pattern of tests/pod_recipe_drift.rs).
+/// pattern of tests/pod_recipe_drift.rs). Built payloads carry
+/// `.sha3-384`/`.content-key` sidecars (issue #344) that share the name
+/// prefix, so the `.snap` extension disambiguates.
 fn harvest_payload(downloads: &Path, prefix: &str) -> PathBuf {
     std::fs::read_dir(downloads)
         .unwrap()
@@ -354,7 +356,7 @@ fn harvest_payload(downloads: &Path, prefix: &str) -> PathBuf {
         .find(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(prefix))
+                .is_some_and(|n| n.starts_with(prefix) && n.ends_with(".snap"))
         })
         .unwrap_or_else(|| panic!("harvest {prefix} payload from {}", downloads.display()))
 }

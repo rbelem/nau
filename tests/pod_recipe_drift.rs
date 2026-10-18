@@ -423,9 +423,11 @@ fn blob_pinned_member_drift_does_not_rebuild_root() {
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .find(|p| {
+            // `.sha3-384`/`.content-key` sidecars (issue #344) share the
+            // name prefix; the payload is the `.snap`.
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("libmember_1.0_"))
+                .is_some_and(|n| n.starts_with("libmember_1.0_") && n.ends_with(".snap"))
         })
         .expect("harvest libmember payload");
 
