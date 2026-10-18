@@ -273,6 +273,25 @@ def assign_names(groups):
     return names
 
 
+INCLUDE = re.compile(rb'(include(?:_str|_bytes)?!\s*\(\s*")([^"]+)(")')
+
+
+def rebase_includes(content, prefix):
+    """Point `include_str!` and friends at the same file from a deeper path.
+
+    A relative include resolves against the file holding the macro, so a file
+    that moved down one or two directories needs that many `../` in front.
+    """
+
+    def repl(m):
+        rel = m.group(2)
+        if rel.startswith(b"/") or b"://" in rel:
+            return m.group(0)
+        return m.group(1) + prefix + b"/" + rel + m.group(3)
+
+    return INCLUDE.sub(repl, content)
+
+
 def tests_dir_for(path):
     if os.path.basename(path) == "mod.rs":
         return os.path.join(os.path.dirname(os.path.abspath(path)), "tests")
@@ -287,10 +306,12 @@ def build_files(path, shared, names, groups):
         + b"".join(b"mod " + n.encode() + b";\n" for n in names)
     )
     tests_dir = tests_dir_for(path)
+    original_dir = os.path.dirname(os.path.abspath(path))
+    prefix = os.path.relpath(original_dir, tests_dir).encode()
     files = {os.path.join(tests_dir, "mod.rs"): mod_file}
     for name, group in zip(names, groups):
         files[os.path.join(tests_dir, name + ".rs")] = header + b"".join(group)
-    return files
+    return {name: rebase_includes(content, prefix) for name, content in files.items()}
 
 
 def plan(path, chunk_bytes):
