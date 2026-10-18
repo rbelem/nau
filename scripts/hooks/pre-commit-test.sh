@@ -92,6 +92,10 @@ fill LICENSE 200000
 git add LICENSE
 check 0 "a licence text is exempt"
 
+fill pkgs/s/skillranker/Cargo.lock.pathdeps 200000
+git add pkgs/s/skillranker/Cargo.lock.pathdeps
+check 0 "a generated lockfile with a suffix is exempt"
+
 git commit -q -m exempt
 mkdir -p gen
 printf 'gen/deep.rs linguist-generated=true\n' > .gitattributes
