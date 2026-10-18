@@ -2021,7 +2021,13 @@ fn go_zip_dirhash(path: &Path) -> miette::Result<String> {
         if member.is_dir() {
             continue;
         }
-        let name = member.name().to_string();
+        // zip 9 made the decoded name fallible; the dirhash is defined
+        // over the raw archive path bytes, so an undecodable name would
+        // hash the wrong string. Refuse instead.
+        let name = member
+            .name()
+            .map_err(|e| miette::miette!("zip entry {}: undecodable name: {e}", i))?
+            .to_string();
         let mut digest = Sha256::new();
         let mut buf = [0u8; 8192];
         loop {

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "nau's non-domain leaf: terminal presentation and external-tool provisioning (ADR-0053)"
 license = "GPL-3.0-only"
+publish = false
 
 [dependencies]
 # R1/R5 (issue #326 PR 3): the store client and the assertion gate name

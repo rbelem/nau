@@ -1819,7 +1819,7 @@ fn go_dirhash_zip(zip_path: &Path) -> String {
         if m.is_dir() {
             continue;
         }
-        let name = m.name().to_string();
+        let name = m.name().unwrap().to_string();
         let mut d = Sha256::new();
         let mut buf = [0u8; 8192];
         loop {

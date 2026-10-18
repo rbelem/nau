@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "nau's trust domain: the update-manifest signing/attestation ceremony, the device verify cluster, and the SSH host-CA ceremony (ADR-0011, ADR-0024, ADR-0045, ADR-0051, ADR-0053)"
 license = "GPL-3.0-only"
+publish = false
 
 [dependencies]
 # The spine (ADR-0051 Decision 3): the keychain/ceremony ledger core

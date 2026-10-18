@@ -18,6 +18,14 @@ allow = [
   "MPL-2.0",
   "GPL-3.0-only",
   "bzip2-1.0.6",
+  # webpki-roots carries the CA certificate data under the Community Data
+  # License Agreement Permissive 2.0 — a permissive data license (no
+  # copyleft, no attribution duty beyond the notice), pulled via ureq.
+  "CDLA-Permissive-2.0",
+  # zip 9's default feature set pulls ppmd-rust (PPMd decompression)
+  # under CC0-1.0 OR MIT-0: public-domain-equivalent permissive terms.
+  "CC0-1.0",
+  "MIT-0",
 ]
 # The repo is GPL-3.0-only: strong copyleft is compatible here, permissive
 # is always fine. Everything else (AGPL, SSPL, proprietary) needs a look.
@@ -44,8 +52,23 @@ ignore = [
   # Lua parser's derive macros). No advisory of impact, no replacement
   # to force upstream; drop when full_moon sheds it.
   "RUSTSEC-2024-0436",
+  # unsafe-libyaml is unmaintained (RUSTSEC-2024-0449), pulled by
+  # serde_yaml 0.9.34+deprecated across nine crates. The advisory is
+  # maintenance-status only: no vulnerability, and no fixed release
+  # exists. The parser handles the workspace's own rendered YAML
+  # (meta/snap.yaml, units) plus fixture user-data — not a
+  # remote-attacker-controlled channel. The real fix is migrating off
+  # serde_yaml to a maintained parser; the migration is a cross-crate
+  # change of its own and is tracked separately. Re-evaluate on that
+  # migration.
+  "RUSTSEC-2024-0449",
 ]
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace-internal dependencies are path-only by design (ADR-0051: the
+# root is the only shipped binary; the nau-* crates are never published),
+# so their implicit `*` version is the intended shape rather than a
+# reproducibility hole. External deps still must pin a real range.
+allow-wildcard-paths = true

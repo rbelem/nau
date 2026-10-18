@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "nau's image domain: UC image build/verify, partitions, boot, initramfs, verity, release media, UC seed assertions (ADR-0051, ADR-0053)"
 license = "GPL-3.0-only"
+publish = false
 
 [dependencies]
 # The spine (ADR-0051 Decision 3): snap value types, manifest IR, the
@@ -48,6 +49,11 @@ libc = "0.2"
 nau-chart = { path = "../nau-chart" }
 # The tests drive the real Luau VM (recipe loading).
 mlua = { version = "0.12", features = ["luau"] }
+# The Linux-lzma dev-edge: the initramfs decompression test must WRITE a
+# real .xz stream, since the build shells out to `xz -dc`. The module is
+# already in the workspace lock (the root's direct dep) at the identical
+# version floor, so no new vendored module enters the graph.
+xz2 = "0.1"
 # The verify/release tests pin Ed25519 fixture keys (deterministic
 # seeds through the same signing substrate as `nau_core::sign`).
 ed25519-dalek = "2"

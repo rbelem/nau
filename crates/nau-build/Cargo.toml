@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "nau's build domain: snap build machinery, build cache, build prefixes, leak scanning, the source cache (ADR-0051, ADR-0053)"
 license = "GPL-3.0-only"
+publish = false
 
 [dependencies]
 # The spine (ADR-0051 Decision 3): snap value types, manifest IR, the blob

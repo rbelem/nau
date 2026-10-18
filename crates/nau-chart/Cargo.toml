@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "nau's definition/eval domain: Lua DSL, eval, analysis, check/lint/audit/lock/index/deps (ADR-0051, ADR-0053)"
 license = "GPL-3.0-only"
+publish = false
 
 [dependencies]
 # The spine (ADR-0051 Decision 3): snap value types, manifest IR, channel
@@ -28,7 +29,10 @@ base64 = "0.22"
 # module zips; uv.lock is TOML.
 flate2 = "1"
 tar = "0.4"
-zip = "2"
+# RUSTSEC-2026-0367/0368/0369: the fixes land in 9.0.0 and only guard the
+# extraction APIs. nau never extracts (it hashes members in place), but the
+# version floor keeps the advisories closed tree-wide rather than excepted.
+zip = "9"
 toml = "0.8"
 # Worker containment (rlimits) and fetch staging.
 libc = "0.2"

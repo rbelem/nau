@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "The pool/farm domain (ADR-0053): the SSH worker transport, the farm build scheduler, the machine provisioning + host-CA ceremony lane, and the worker wire protocol"
 license = "GPL-3.0-only"
+publish = false
 
 [dependencies]
 # The spine: the shared vocabulary this domain consumes (worker value

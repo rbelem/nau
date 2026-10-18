@@ -45,6 +45,14 @@ The build sandbox has **no network** (it unshares the network namespace):
 build commands cannot download anything. Fetch sources up front via the
 definition's `source` / `inputs` instead.
 
+The `nau.lua` file is executed during evaluation, with no `os` library,
+no file writes, and no `loadstring`. One eval-time global, `fetch()`, can
+reach the network so a recipe can resolve a floating upstream version.
+The normal eval path enables it, and `--offline` makes it refuse. This
+does not compromise reproducibility. The pinned `source` URL and sha256
+are what get verified, and a rerun with the lockfile pin fetches the
+same bytes. See [ADR-0010](docs/adr/0010-package-language-luau.md).
+
 Also disable build-time downloads — e.g. for CMake, pass
 `-DBUILD_TESTING=OFF` so FetchContent doesn't try to clone test
 dependencies at build time. When a build command fails and its output

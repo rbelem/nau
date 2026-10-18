@@ -719,6 +719,11 @@ fn seed_active_farm(root: &Path, pod: &str, generation: u64) {
         .join("farm");
     std::fs::create_dir_all(&farm).unwrap();
     std::fs::write(farm.join("tool"), "#!/bin/sh\n").unwrap();
+    // The real emitter chmods farm binaries 0o755 (farm.rs). Without the
+    // exec bit here, `command -v tool` in the acceptance eval skips the
+    // entry and the test fails on any umask.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(farm.join("tool"), std::fs::Permissions::from_mode(0o755)).unwrap();
     std::os::unix::fs::symlink(
         format!("generations/{generation}/farm"),
         pod_d.join("current"),

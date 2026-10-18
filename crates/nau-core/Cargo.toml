@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Shared vocabulary of nau: snap value types, manifest IR, plugin option values (ADR-0051)"
 license = "GPL-3.0-only"
+publish = false
 
 [dependencies]
 # The ceremony ledger and the keychain persist as JSON.

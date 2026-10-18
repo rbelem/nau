@@ -498,15 +498,20 @@ fn write_prefix_consumer(project: &Path, srcs: &Path, port: u16) {
 }
 
 /// Locate the built `{name}_{version}_*.snap` in a pod's downloads dir.
+///
+/// Built payloads carry two sidecars beside them, `<payload>.sha3-384`
+/// and `<payload>.content-key` (issue #344), and both share the
+/// `{name}_{version}_` prefix — so the payload must be the entry that
+/// carries the `.snap` extension, never the first name match.
 fn built_payload(downloads: &Path, name: &str, version: &str) -> PathBuf {
     std::fs::read_dir(downloads)
         .unwrap_or_else(|e| panic!("downloads dir {}: {e}", downloads.display()))
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .find(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(&format!("{name}_{version}_")))
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                n.starts_with(&format!("{name}_{version}_")) && n.ends_with(".snap")
+            })
         })
         .unwrap_or_else(|| panic!("no {name}_{version}_*.snap in {}", downloads.display()))
 }

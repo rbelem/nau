@@ -1200,11 +1200,19 @@ kernel/drivers/md/dm-verity.ko: kernel/drivers/md/dm-bufio.ko
         let root = tempfile::tempdir().unwrap();
         let (modules_root, config) = write_fixture_tree(root.path());
         // Compress the dm-bufio fixture on disk the way a modern kernel
-        // snap ships it, and point modules.dep at the compressed spelling.
+        // snap ships it (a real .xz stream — the build shells out to
+        // `xz -dc`), and point modules.dep at the compressed spelling.
         let bufio = std::fs::read(modules_root.join(DM_BUFIO)).unwrap();
+        let mut compressed = Vec::new();
+        let mut encoder = xz2::write::XzEncoder::new(&mut compressed, 6);
+        {
+            use std::io::Write;
+            encoder.write_all(&bufio).unwrap();
+        }
+        encoder.finish().unwrap();
         std::fs::write(
             modules_root.join("kernel/drivers/md/dm-bufio.ko.xz"),
-            &bufio,
+            &compressed,
         )
         .unwrap();
         std::fs::remove_file(modules_root.join(DM_BUFIO)).unwrap();
