@@ -34,3 +34,15 @@ stage.lock
 # Local tooling artifacts (generated)
 .audit/
 graphify-out/
+
+# Agent-tooling installs (impeccable skill's per-host drop): machine-local
+# symlinks and per-agent copies, not repo infrastructure. The skill itself
+# lives at ~/.agents/skills/impeccable.
+.agents/skills/impeccable/
+.codex/
+.github/agents/
+.github/hooks/
+.github/skills/
+.opencode/commands/
+.opencode/skills/
+.impeccable/
