@@ -342,4 +342,3 @@ pub fn funnel_down_if_drained(config: &Path) -> miette::Result<()> {
 
 #[cfg(test)]
 mod tests;
-

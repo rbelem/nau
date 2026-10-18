@@ -345,4 +345,3 @@ impl S3Client {
 
 #[cfg(test)]
 mod tests;
-

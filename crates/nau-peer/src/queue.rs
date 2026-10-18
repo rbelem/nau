@@ -364,4 +364,3 @@ fn write_atomic(dest: &Path, bytes: &[u8]) -> miette::Result<()> {
 
 #[cfg(test)]
 mod tests;
-

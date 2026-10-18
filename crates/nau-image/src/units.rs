@@ -213,4 +213,3 @@ fn emit_one_snap(
 
 #[cfg(test)]
 mod tests;
-

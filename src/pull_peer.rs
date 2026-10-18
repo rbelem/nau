@@ -84,4 +84,3 @@ fn print_report(report: &PullPeerReport) {
 
 #[cfg(test)]
 mod tests;
-

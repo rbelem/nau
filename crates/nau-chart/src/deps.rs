@@ -464,4 +464,3 @@ pub fn recipe_dir(name_or_path: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests;
-

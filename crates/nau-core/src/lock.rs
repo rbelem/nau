@@ -403,4 +403,3 @@ pub fn pinned_member(name: &str, lock: &LockFile) -> Option<crate::cache_key::Re
 
 #[cfg(test)]
 mod tests;
-

@@ -454,4 +454,3 @@ pub fn sha3_384_file(path: &Path) -> miette::Result<String> {
 
 #[cfg(test)]
 mod tests;
-

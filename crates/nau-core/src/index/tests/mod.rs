@@ -1,18 +1,18 @@
 
-    use super::*;
-    use tempfile::tempdir;
+use super::*;
+use tempfile::tempdir;
 
-    fn sample_entry() -> IndexEntry {
-        IndexEntry {
-            name: "core22".into(),
-            summary: Some("Ubuntu 22.04 base".into()),
-            store: Some(StoreRef {
-                name: Some("core22".into()),
-                channel: "latest/stable".into(),
-            }),
-            pins: {
-                let mut map = HashMap::new();
-                map.insert(
+fn sample_entry() -> IndexEntry {
+    IndexEntry {
+        name: "core22".into(),
+        summary: Some("Ubuntu 22.04 base".into()),
+        store: Some(StoreRef {
+            name: Some("core22".into()),
+            channel: "latest/stable".into(),
+        }),
+        pins: {
+            let mut map = HashMap::new();
+            map.insert(
                     "amd64".into(),
                     PinEntry {
                         revision: 2411,
@@ -20,26 +20,25 @@
                         channel: Some("latest/stable".into()),
                     },
                 );
-                Some(map)
-            },
-            source: None,
-            build: None,
-            apps: None,
-            aliases: vec![],
-        }
+            Some(map)
+        },
+        source: None,
+        build: None,
+        apps: None,
+        aliases: vec![],
     }
+}
 
-    fn pin(revision: u32, channel: Option<&str>) -> PinEntry {
-        PinEntry {
-            revision,
-            sha3_384: "a".repeat(96),
-            channel: channel.map(str::to_string),
-        }
+fn pin(revision: u32, channel: Option<&str>) -> PinEntry {
+    PinEntry {
+        revision,
+        sha3_384: "a".repeat(96),
+        channel: channel.map(str::to_string),
     }
+}
 
-    fn pins_with(entries: Vec<(String, PinEntry)>) -> HashMap<String, PinEntry> {
-        entries.into_iter().collect()
-    }
-
+fn pins_with(entries: Vec<(String, PinEntry)>) -> HashMap<String, PinEntry> {
+    entries.into_iter().collect()
+}
 
 mod test_index;

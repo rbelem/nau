@@ -488,4 +488,3 @@ impl PackageIndex {
 
 #[cfg(test)]
 mod tests;
-
