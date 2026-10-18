@@ -41,7 +41,8 @@
       "clippy": "cargo clippy --workspace --all-targets -- -D warnings",
       "fmt": "cargo fmt --all",
       "fmt-check": "cargo fmt --all --check",
-      "check": "NAU_SYSTEMD=off cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check"
+      "check": "NAU_SYSTEMD=off cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check",
+      "hooks": "git config core.hooksPath scripts/hooks"
     }
   }
 }

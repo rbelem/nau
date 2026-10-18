@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# Pre-commit token-budget gate. Limit is 5,000 tokens per file, 1 token = 4 bytes.
+#
+# Why a hook and not CI. A file past the budget is unreadable in one agent pass
+# and unreviewable in one human sitting, and every branch touching it conflicts.
+# CI reports that after the work exists. The hook reports it while splitting is
+# still cheap. It measures the STAGED snapshot (index against HEAD), so it
+# judges exactly what the commit will contain, not the working tree.
+#
+# Grandfather clause. The repo already carries files far past the limit
+# (src/pod.rs 448 KB, crates/nau-build/src/snap.rs 464 KB). Failing those on
+# every touch would freeze work on the code that most needs editing, so a file
+# already over budget may shrink or hold. It may not grow, and a file new to
+# the index may not arrive over budget. NAU_TOKEN_BUDGET_STRICT=1 drops the
+# clause; NAU_TOKEN_BUDGET overrides the limit.
+#
+# Exemptions. Lockfiles, vendored trees, minified bundles, and generated
+# sources are not authored here, so their size says nothing about review load.
+# Two ways to exempt a generated file: mark it in .gitattributes
+# (`<pattern> linguist-generated=true`), which works in any checkout, or add
+# the pattern to is_exempt below.
+#
+# Install once per clone. `git config core.hooksPath scripts/hooks`
+set -eu
+
+LIMIT="${NAU_TOKEN_BUDGET:-5000}"
+MAX_BYTES=$((LIMIT * 4))
+STRICT="${NAU_TOKEN_BUDGET_STRICT:-0}"
+
+# A merge commit stages whatever the merge produced. Refusing it strands the
+# merge with no way forward except --no-verify, which is worse than the check.
+if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+    exit 0
+fi
+
+if git rev-parse -q --verify HEAD >/dev/null; then
+    HAS_HEAD=1
+else
+    HAS_HEAD=0
+fi
+
+is_exempt() {
+    local path="$1" base="${1##*/}" attrs
+    case "$base" in
+        Cargo.lock|package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|bun.lockb) return 0 ;;
+        flake.lock|devbox.lock|poetry.lock|uv.lock|Pipfile.lock|Gemfile.lock|composer.lock|go.sum) return 0 ;;
+        *.lock|*.lock.json|*-lock.json|*.min.js|*.min.css|*.map) return 0 ;;
+        *.pb.go|*.pb.cc|*.pb.h|*_pb2.py|*_generated.rs|*.generated.*|*.g.dart|*.freezed.dart) return 0 ;;
+    esac
+    case "$path" in
+        vendor/*|*/vendor/*|third_party/*|*/third_party/*|*/node_modules/*) return 0 ;;
+    esac
+    # --cached judges the staged snapshot: the commit is what the gate measures.
+    attrs="$(git check-attr --cached linguist-generated -- "$path" 2>/dev/null || true)"
+    case "$attrs" in
+        *": linguist-generated: true"|*": linguist-generated: set") return 0 ;;
+    esac
+    return 1
+}
+
+is_binary() {
+    local counts
+    counts="$(git diff --cached --numstat -- "$1" 2>/dev/null || true)"
+    [ -n "$counts" ] && [ "${counts%%$'\t'*}" = "-" ]
+}
+
+staged_bytes() {
+    git cat-file -s ":$1" 2>/dev/null || printf '0\n'
+}
+
+head_bytes() {
+    if [ "$HAS_HEAD" = 1 ]; then
+        git cat-file -s "HEAD:$1" 2>/dev/null || printf '0\n'
+    else
+        printf '0\n'
+    fi
+}
+
+violations=""
+violation_count=0
+
+while IFS= read -r -d '' path; do
+    bytes="$(staged_bytes "$path")"
+    tokens=$((bytes / 4))
+    if [ "$tokens" -le "$LIMIT" ]; then
+        continue
+    fi
+    if is_exempt "$path"; then
+        continue
+    fi
+    if is_binary "$path"; then
+        continue
+    fi
+
+    prior="$(head_bytes "$path")"
+    prior_tokens=$((prior / 4))
+    # The only tolerated case: already over budget before this commit and not
+    # a single byte larger now.
+    if [ "$STRICT" != 1 ] && [ "$prior_tokens" -gt "$LIMIT" ] && [ "$bytes" -le "$prior" ]; then
+        continue
+    fi
+
+    violations+="${tokens}	${bytes}	${prior}	${path}"$'\n'
+    violation_count=$((violation_count + 1))
+done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+
+if [ "$violation_count" -eq 0 ]; then
+    exit 0
+fi
+
+if [ "$violation_count" -eq 1 ]; then
+    SUBJECT="1 staged file exceeds"
+else
+    SUBJECT="$violation_count staged files exceed"
+fi
+
+{
+    printf '\npre-commit: %s the token budget.\n\n' "$SUBJECT"
+    printf '  limit %s tokens per file. 1 token = 4 bytes, so %s bytes.\n' "$LIMIT" "$MAX_BYTES"
+    printf '  Sizes are the staged snapshot (index against HEAD).\n\n'
+    printf '%s' "$violations" | sort -rns | while IFS=$'\t' read -r t b p f; do
+        if [ "$p" -eq 0 ]; then
+            printf '  %8s tokens  %10s B  new file  %s\n' "$t" "$b" "$f"
+        else
+            printf '  %8s tokens  %10s B  +%s B  %s\n' "$t" "$b" "$((b - p))" "$f"
+        fi
+    done
+    printf '\nA file this size is read in slices by agents and reviewed by nobody.\n'
+    printf 'Split it on responsibility before committing.\n'
+    cat <<'RECIPE'
+
+Rust, for src/<name>.rs or crates/<crate>/src/<name>.rs
+
+  1. Group the file's items by job. One verb or subcommand per group, one
+     external system per group, one parser per group. A group is the set of
+     items that change together, not the set that fits under the limit.
+  2. Turn the file into a directory, one group per file. Write
+     src/<name>/<group>.rs, delete those items from src/<name>.rs, and declare
+         mod <group>;
+     in src/<name>.rs (or src/<name>/mod.rs). Git records the rename at commit
+     time, so no `git mv` is needed.
+  3. Re-export only names that callers outside the module already import:
+         pub(crate) use <group>::*;
+     A path that no caller uses stays private. This is the seam ADR-0051 uses
+     to move a domain into a member crate without touching call sites.
+  4. Move one group at a time and run `cargo check -p <crate>` after each.
+     A broken import then belongs to the move that broke it.
+  5. Re-stage, commit again, repeat until every file is under budget.
+
+Lua, for pkgs/<letter>/<pkg>/init.lua
+
+  1. Move the section into a library file next to the existing ones: write
+     pkgs/lib/<group>.lua returning a table of the moved functions.
+  2. Require it from the package: local <group> = require("lib/<group>").
+     Call sites become <group>.<function>(...). The package init.lua keeps the
+     top-level declaration and the build steps.
+
+Markdown, for a brief or a spec
+
+  1. One section per file in a directory named for the topic, plus an index
+     that links them in reading order.
+  2. The index keeps the summary and the decisions. The evidence moves out.
+
+Do not split a single function across files to reach the number, and do not
+add `pub` or `#[allow(dead_code)]` to silence the fallout. Both hide the seam
+the split was supposed to find.
+
+If the file is generated rather than authored, exempt it in the same commit.
+Add `<pattern> linguist-generated=true` to .gitattributes, or add the pattern
+to is_exempt in scripts/hooks/pre-commit.
+
+One-commit escape hatch, when the split is a separate change. `git commit --no-verify`
+RECIPE
+    printf '\n'
+} >&2
+
+exit 1
