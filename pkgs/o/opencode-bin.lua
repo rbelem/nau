@@ -61,15 +61,25 @@ local registry_url = "https://registry.npmjs.org/@opencode%2fcli"
 -- older. Total and strict: equal versions are not "newer".
 local function semver_newer(a, b)
     local as, bs = {}, {}
-    for seg in string.gmatch(a, "[^.]+") do as[#as + 1] = seg end
-    for seg in string.gmatch(b, "[^.]+") do bs[#bs + 1] = seg end
+    for seg in string.gmatch(a, "[^.]+") do
+        as[#as + 1] = seg
+    end
+    for seg in string.gmatch(b, "[^.]+") do
+        bs[#bs + 1] = seg
+    end
     for i = 1, math.max(#as, #bs) do
         local x, y = as[i], bs[i]
-        if x == nil then return false end
-        if y == nil then return true end
+        if x == nil then
+            return false
+        end
+        if y == nil then
+            return true
+        end
         local xn, yn = tonumber(x), tonumber(y)
         if xn and yn then
-            if xn ~= yn then return xn > yn end
+            if xn ~= yn then
+                return xn > yn
+            end
         elseif xn then
             return true
         elseif yn then
@@ -113,11 +123,15 @@ local function resolve_version()
             return pinned
         end
     end
-    error(string.format(
-        "opencode-bin: constraint '@%s' names no upstream release — \
+    error(
+        string.format(
+            "opencode-bin: constraint '@%s' names no upstream release — \
          refusing to pin a different version; run \
          `nau chart versions pkgs/o/opencode-bin.lua` for the listing",
-        pinned), 2)
+            pinned
+        ),
+        2
+    )
 end
 
 local version = resolve_version()

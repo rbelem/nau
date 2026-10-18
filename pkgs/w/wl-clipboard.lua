@@ -56,7 +56,7 @@ return {
 
         type = "source",
         requires = { "glibc", "wayland" },
-        build_deps = { "meson", "ninja", "pkg-config", "wayland", "wayland-protocols", "gcc"},
+        build_deps = { "meson", "ninja", "pkg-config", "wayland", "wayland-protocols", "gcc" },
 
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22): the
         -- nix gcc wrapper bakes the merged build prefix into produced

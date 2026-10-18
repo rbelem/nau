@@ -32,10 +32,14 @@ local lines = {
 local line = constraint and constraint:match("^(%d+)") or "26"
 local picked = lines[line]
 if picked == nil then
-    error(string.format(
-        "node: constraint '@%s' selects no declared line (declared: 22, 26) — \
+    error(
+        string.format(
+            "node: constraint '@%s' selects no declared line (declared: 22, 26) — \
          refusing to pin another line; widen the constraint or drop the pin",
-        tostring(line)), 2)
+            tostring(line)
+        ),
+        2
+    )
 end
 
 return {

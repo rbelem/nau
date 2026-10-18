@@ -84,7 +84,7 @@ return {
                 -- benchmark source is reached. Release flags append
                 -- AFTER the project flags, so -Wno-pedantic here wins
                 -- the last-flag-wins ordering.
-                .. "-DCMAKE_CXX_FLAGS_RELEASE=\"-O3 -DNDEBUG -Wno-pedantic\"",
+                .. '-DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -Wno-pedantic"',
             "cmake --build $SRC/build -j$(nproc)",
             "DESTDIR=$STAGE cmake --install $SRC/build",
         }, " && "),

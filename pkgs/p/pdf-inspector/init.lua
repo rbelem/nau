@@ -85,7 +85,6 @@ return {
 
         type = "source",
         requires = { "glibc" },
-        build_deps = { "gcc" },
         build_deps = { "rust", "gcc" },
 
         apps = {

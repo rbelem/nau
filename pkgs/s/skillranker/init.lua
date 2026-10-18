@@ -98,10 +98,10 @@ return {
             "mkdir -p vendor-git",
             "cp -a $SRC/frankensearch vendor-git/frankensearch",
             "cp -a $SRC/asupersync vendor-git/asupersync",
-            'sed -i \'\\|"tools/optimize_params",|d\' vendor-git/frankensearch/Cargo.toml',
+            "sed -i '\\|\"tools/optimize_params\",|d' vendor-git/frankensearch/Cargo.toml",
             "sed -E -i "
-                .. "-e 's#frankensearch-(core|quill|index) = \\{ git = \"[^\"]+\", rev = \"[^\"]+\"#frankensearch-\\1 = { path = \"vendor-git/frankensearch/crates/frankensearch-\\1\"#' "
-                .. "-e 's#asupersync = \\{ git = \"[^\"]+\", rev = \"[^\"]+\"#asupersync = { path = \"vendor-git/asupersync\"#' "
+                .. '-e \'s#frankensearch-(core|quill|index) = \\{ git = "[^"]+", rev = "[^"]+"#frankensearch-\\1 = { path = "vendor-git/frankensearch/crates/frankensearch-\\1"#\' '
+                .. '-e \'s#asupersync = \\{ git = "[^"]+", rev = "[^"]+"#asupersync = { path = "vendor-git/asupersync"#\' '
                 .. "Cargo.toml",
             "sed -i '/source = \"git+/d' Cargo.lock",
             -- Cargo offline wiring (statix pattern, issue #36): writable

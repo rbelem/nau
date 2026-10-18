@@ -41,7 +41,7 @@ archives, and binaries. This build targets x86_64-linux-gnu.]],
             -- source tree's include dir must win the search; libiberty's
             -- Makefile takes CPPFLAGS from the environment at make time,
             -- so the recipe re-exports it with the tree include first.
-            "export CPPFLAGS=\"-I$SRC/include $CPPFLAGS\"",
+            'export CPPFLAGS="-I$SRC/include $CPPFLAGS"',
             "./configure --prefix=/usr --target=x86_64-linux-gnu --disable-gprofng --disable-werror",
             "make -j$(nproc)",
             "make install DESTDIR=$STAGE",
@@ -66,7 +66,7 @@ archives, and binaries. This build targets x86_64-linux-gnu.]],
             -- in a tooldir tree usr/<triplet>/bin. The plain names are
             -- this payload's actual deliverable: merge the tooldir into
             -- usr/bin, then drop the empty tooldir tree.
-            "if [ -d \"$STAGE/usr/x86_64-linux-gnu/bin\" ]; then cp -a \"$STAGE/usr/x86_64-linux-gnu/bin/.\" \"$STAGE/usr/bin/\"; fi",
+            'if [ -d "$STAGE/usr/x86_64-linux-gnu/bin" ]; then cp -a "$STAGE/usr/x86_64-linux-gnu/bin/." "$STAGE/usr/bin/"; fi',
             "rm -rf $STAGE/usr/x86_64-linux-gnu",
         }, " && "),
 

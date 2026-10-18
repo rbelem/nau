@@ -30,6 +30,10 @@ globals = {
     "image",
     "node",
     "fetch",
+    -- ADR-0047 D4 for the version-LINE recipes (node, opencode-bin):
+    -- the pod spec's `@constraint` rides the eval as this global, so
+    -- line selection stays lockfile-reproducible.
+    "constraint",
 }
 
 exclude_files = {

@@ -193,7 +193,7 @@ return {
                 .. "-DWITH_SUBMODULES_SYSTEM=ON "
                 .. "-DCMAKE_PREFIX_PATH=$NAU_BUILD_PREFIX/usr "
                 .. "-DCMAKE_INSTALL_PREFIX=/usr "
-                .. "-DCMAKE_CXX_FLAGS=\"-idirafter $SRC/build-release/c-include\"",
+                .. '-DCMAKE_CXX_FLAGS="-idirafter $SRC/build-release/c-include"',
             "cmake --build $SRC/build-release -j$(nproc)",
             "install -Dm755 $SRC/build-release/libsearch.so $STAGE/usr/lib/libsearch.so",
         }, " && "),
@@ -220,7 +220,8 @@ return {
             "googletest",
             "google-benchmark",
             "gcc",
-            "gawk"},
+            "gawk",
+        },
 
         -- ADR-0018 interim escape (libsecret precedent): the nix gcc
         -- wrapper bakes RUNPATH=/nau-build-prefix/usr/lib into
