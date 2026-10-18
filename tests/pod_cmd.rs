@@ -993,11 +993,15 @@ fn shellenv_exports_resolved_secrets_after_env_lines_and_evals_safe() {
     assert_eq!(provider_calls(&counter), 1, "cold serve resolves once");
 
     // Eval under `set -u`: every export readable, PEM newline intact.
+    // The declared var is SH_EDITOR (the generation env record's key);
+    // strip any ambient EDITOR so an inherited value cannot stand in
+    // for the export under test.
     let eval = Command::new("sh")
         .arg("-c")
         .arg(format!(
-            "set -u\n{script}\nprintf '%s|%s' \"$EDITOR\" \"$A_PEM\""
+            "set -u\n{script}\nprintf '%s|%s' \"$SH_EDITOR\" \"$A_PEM\""
         ))
+        .env_remove("EDITOR")
         .output()
         .unwrap();
     assert!(
