@@ -318,6 +318,8 @@ def plan(path, chunk_bytes):
     data = open(path, "rb").read()
     start, end, body = find_module(data)
     items = top_level_chunks(body)
+    if b"".join(items) != body:
+        raise SplitError("item scan did not cover the module body exactly")
     shared = [c for c in items if not is_test(c)]
     tests = [c for c in items if is_test(c)]
     if not tests:
@@ -342,12 +344,9 @@ def verify(result, original):
             raise SplitError(
                 f"{name} would be {len(content)} bytes, over the {BUDGET_BYTES} budget"
             )
-    rebuilt = (
+    return (
         original[: result["start"]] + result["replacement"] + original[result["end"] :]
     )
-    if original[: result["start"]] != rebuilt[: result["start"]]:
-        raise SplitError("prefix does not round-trip")
-    return rebuilt
 
 
 def main():
