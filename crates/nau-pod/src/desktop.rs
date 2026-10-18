@@ -751,4 +751,3 @@ fn validate_categories(cats: &[String]) -> miette::Result<()> {
 
 #[cfg(test)]
 mod tests;
-

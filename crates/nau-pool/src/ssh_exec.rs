@@ -1456,4 +1456,3 @@ fn stdout_tail(stdout: &str) -> String {
 
 #[cfg(test)]
 mod tests;
-

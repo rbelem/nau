@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::command::RunnerOutput;
 use std::sync::Mutex;

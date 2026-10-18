@@ -1,4 +1,3 @@
-
 use super::*;
 use nau_core::manifest_ir::ImageManifest;
 use std::collections::BTreeMap;

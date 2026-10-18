@@ -1465,4 +1465,3 @@ fn partition_outcome<S: OutcomeFields>(names: &[String], s: &S) -> Result<(), Fa
 
 #[cfg(test)]
 mod tests;
-

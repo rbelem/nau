@@ -847,4 +847,3 @@ pub fn render_shellenv(env: &PodShellenv) -> String {
 
 #[cfg(test)]
 mod tests;
-

@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn make_source_meta(name: &str, url: &str) -> SnapMeta {

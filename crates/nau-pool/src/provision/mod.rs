@@ -2186,4 +2186,3 @@ fn is_word_at(b: &[u8], i: usize, word: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests;
-

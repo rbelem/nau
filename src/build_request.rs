@@ -751,4 +751,3 @@ fn drain_request(drain: &Drain, claimed: &QueuedRequest) -> miette::Result<Relea
 
 #[cfg(test)]
 mod tests;
-
