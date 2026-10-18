@@ -121,6 +121,17 @@ def skip_literal(data, i):
     return i + 1
 
 
+def at_literal(data, i):
+    """True when a comment, string, char, or raw string starts at i.
+
+    A raw string begins with a letter (`r`, `br`), so gating on the quote byte
+    alone misses it and the scan closes it at the first quote inside the body.
+    """
+    return (
+        data[i : i + 1] in (b'"', b"'", b"/") or RAW_STRING.match(data, i) is not None
+    )
+
+
 def find_module(data):
     m = ATTRIBUTE.search(data)
     if not m:
@@ -130,7 +141,7 @@ def find_module(data):
     i = brace
     while i < len(data):
         c = data[i : i + 1]
-        if c in (b'"', b"'", b"/"):
+        if at_literal(data, i):
             i = skip_literal(data, i)
             continue
         depth += 1 if c == b"{" else -1 if c == b"}" else 0
@@ -180,7 +191,7 @@ def item_boundary(body, i, item_start, line_start, depth):
 def advance(body, i, depth):
     """Consume one token at i. Return (next index, depth, at line start)."""
     c = body[i : i + 1]
-    if c in (b'"', b"'", b"/"):
+    if at_literal(body, i):
         j = skip_literal(body, i)
         j = j if j > i else i + 1
         return j, depth, body[j - 1 : j] == b"\n"
