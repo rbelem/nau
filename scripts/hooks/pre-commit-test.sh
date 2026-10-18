@@ -88,6 +88,10 @@ head -c 200000 /dev/urandom > blob.bin
 git add blob.bin
 check 0 "a binary blob is exempt"
 
+fill LICENSE 200000
+git add LICENSE
+check 0 "a licence text is exempt"
+
 git commit -q -m exempt
 mkdir -p gen
 printf 'gen/deep.rs linguist-generated=true\n' > .gitattributes

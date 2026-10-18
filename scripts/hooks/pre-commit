@@ -45,6 +45,7 @@ is_exempt() {
         Cargo.lock|package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|bun.lockb) return 0 ;;
         flake.lock|devbox.lock|poetry.lock|uv.lock|Pipfile.lock|Gemfile.lock|composer.lock|go.sum) return 0 ;;
         *.lock|*.lock.json|*-lock.json|*.min.js|*.min.css|*.map) return 0 ;;
+        LICENSE|LICENSE.*|COPYING|NOTICE) return 0 ;;
         *.pb.go|*.pb.cc|*.pb.h|*_pb2.py|*_generated.rs|*.generated.*|*.g.dart|*.freezed.dart) return 0 ;;
     esac
     case "$path" in
