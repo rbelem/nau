@@ -15,7 +15,9 @@ Usage:
   scripts/split-inline-tests.py <file.rs> [--chunk-bytes N] [--apply]
 
 Without --apply it prints the plan and exits. With --apply it rewrites the
-file and writes the module directory.
+file and writes the module directory. Moved items keep the indentation they
+had inside the inline module, so run `cargo fmt` after applying; the repo's
+gate checks formatting and would otherwise fail.
 """
 
 from __future__ import annotations
