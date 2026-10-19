@@ -161,6 +161,16 @@ fn raw_build_and_infra_process_calls_use_governor_seams() {
     assert!(image.contains("build_image_with(\n        &ImageTools,"));
 }
 
+#[test]
+fn build_sandbox_argv_must_not_unshare_the_cgroup_namespace() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let snap = fs::read_to_string(root.join("crates/nau-build/src/snap.rs")).unwrap();
+    assert!(
+        !snap.contains("--unshare-cgroup"),
+        "the build argv must not gain --unshare-cgroup; build children stay in nau-build"
+    );
+}
+
 fn live_test_lock() -> MutexGuard<'static, ()> {
     LIVE_TEST_LOCK
         .lock()
