@@ -11,7 +11,10 @@ fn percent(value: &str) -> MachinePercent {
 
 #[test]
 fn resolution_uses_flag_then_env_then_default() {
-    assert_eq!(ResourceLimit::resolve(None, None).unwrap(), ResourceLimit::DEFAULT);
+    assert_eq!(
+        ResourceLimit::resolve(None, None).unwrap(),
+        ResourceLimit::DEFAULT
+    );
     assert_eq!(
         ResourceLimit::resolve(Some("50"), Some("off")).unwrap(),
         ResourceLimit::Percent(percent("50"))
@@ -37,10 +40,14 @@ fn resolution_uses_flag_then_env_then_default() {
 #[test]
 fn invalid_values_name_their_input_field() {
     for value in ["0", "101", "960", "80%", "2.5", "OFF", "", " ", "+1"] {
-        let flag = ResourceLimit::resolve(Some(value), None).unwrap_err().to_string();
+        let flag = ResourceLimit::resolve(Some(value), None)
+            .unwrap_err()
+            .to_string();
         assert!(flag.contains("--resource-limit"), "{value:?}: {flag}");
 
-        let env = ResourceLimit::resolve(None, Some(value)).unwrap_err().to_string();
+        let env = ResourceLimit::resolve(None, Some(value))
+            .unwrap_err()
+            .to_string();
         assert!(env.contains("NAU_RESOURCE_LIMIT"), "{value:?}: {env}");
     }
 }
@@ -71,8 +78,14 @@ fn quota_core_floor_never_becomes_zero() {
 
 #[test]
 fn resource_limit_wire_values_are_validated() {
-    assert_eq!(serde_json::to_string(&ResourceLimit::Percent(percent("80"))).unwrap(), "80");
-    assert_eq!(serde_json::to_string(&ResourceLimit::Off).unwrap(), "\"off\"");
+    assert_eq!(
+        serde_json::to_string(&ResourceLimit::Percent(percent("80"))).unwrap(),
+        "80"
+    );
+    assert_eq!(
+        serde_json::to_string(&ResourceLimit::Off).unwrap(),
+        "\"off\""
+    );
     assert_eq!(
         serde_json::from_str::<ResourceLimit>("80").unwrap(),
         ResourceLimit::Percent(percent("80"))
