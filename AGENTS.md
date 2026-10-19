@@ -19,7 +19,14 @@ nix shell nixpkgs#gcc -c env -u LD_LIBRARY_PATH -u COMPILER_PATH -u LIBRARY_PATH
 bash scripts/gate.sh   # full gate (test + clippy -D + fmt-check, gcc14 pinned)
 nau run --pod gate -- cargo clippy -- -D warnings   # lint axis, pod gate
 nau run --pod gate -- cargo fmt --check             # fmt axis, pod gate
+devbox run -- luacheck                              # Lua lint axis
+devbox run -- stylua                                # Lua style axis
+devbox run -- shellcheck                             # shell script lint axis
 ```
+
+The three Lua/shell axes cover `pkgs/`, `test-fixtures/`, and every script
+under `scripts/`. CI runs the same three devbox scripts, so a local green and
+a CI green mean the same thing.
 
 Keep the pod shellenv on PATH (git and the curl shim ride it); the nix gcc
 prepend plus `CC=gcc` keeps every compiler invocation off the pod blobs.
@@ -41,6 +48,12 @@ nau-farm-ops; `nau run --pod gate` for the clippy/fmt axes). Local cargo is
 rationed to ONE foreground scoped job at a time — single crate (`-p`), no
 other cargo/devbox process alive — and run `scripts/target-clean.sh` when a
 lane's work is done so `target/` doesn't accumulate across lanes.
+
+**When no pool worker is provisioned** (`tailscale status` lists no worker
+node), a heavy build cannot run here at all. Run the static axes instead:
+recipe loading, closure order, and source URL and hash resolution. Then hand
+the build to a pool window. A recipe change nobody built is unproven, so
+report it that way rather than as done.
 
 ## Detail docs
 
