@@ -38,7 +38,7 @@ return {
         -- substitution interiors are runtime sub-commands, not build
         -- commands.
         build = table.concat({
-            "v=$(go version) && echo \"$v\" > go-version.txt",
+            'v=$(go version) && echo "$v" > go-version.txt',
             "grep -q 'go1.27.1 linux/amd64' go-version.txt",
             "go env GOROOT > goroot.txt && grep -q '/' goroot.txt",
             "cat go-version.txt goroot.txt",

@@ -567,6 +567,10 @@
       "last_modified": "2026-09-22T03:11:10Z",
       "resolved": "github:NixOS/nixpkgs/6774f7bc253789b113a4f39285dc0fa100abeacc?lastModified=1790046670&narHash=sha256-MYiI%2BCzL0tuWgRPjGsKCDHqYs2T3OzMlMQWOYWG0qso%3D#pkgsStatic.util-linux.bin"
     },
+    "github:NixOS/nixpkgs/nixos-unstable#shellcheck": {
+      "last_modified": "2026-09-22T03:11:10Z",
+      "resolved": "github:NixOS/nixpkgs/6774f7bc253789b113a4f39285dc0fa100abeacc?lastModified=1790046670&narHash=sha256-MYiI%2BCzL0tuWgRPjGsKCDHqYs2T3OzMlMQWOYWG0qso%3D#shellcheck"
+    },
     "github:NixOS/nixpkgs/nixos-unstable#squashfsTools": {
       "last_modified": "2026-09-22T03:11:10Z",
       "resolved": "github:NixOS/nixpkgs/6774f7bc253789b113a4f39285dc0fa100abeacc?lastModified=1790046670&narHash=sha256-MYiI%2BCzL0tuWgRPjGsKCDHqYs2T3OzMlMQWOYWG0qso%3D#squashfsTools"
@@ -837,7 +841,7 @@
     },
     "nodejs@latest": {
       "last_modified": "2026-08-27T23:47:58Z",
-      "plugin_version": "0.0.4",
+      "plugin_version": "0.0.5",
       "resolved": "github:NixOS/nixpkgs/7d1a7c21a4c00ea653fc7ed5c083d261340f185f#nodejs_26",
       "source": "devbox-search",
       "version": "26.8.1",

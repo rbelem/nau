@@ -45,7 +45,7 @@ return {
         -- include dirs; headers ride the compiler's baked sysroot).
         build = table.concat({
             "set -x",
-            "test \"$(command -v pkg-config)\" = /nau-build-prefix/usr/bin/pkg-config",
+            'test "$(command -v pkg-config)" = /nau-build-prefix/usr/bin/pkg-config',
             "pkg-config --modversion libffi | grep -q '^3\\.'",
             "pkg-config --libs libffi | grep -q 'nau-build-prefix/usr/lib'",
             "pkg-config --libs libffi | grep -q -- '-lffi'",

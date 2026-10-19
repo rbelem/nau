@@ -1,0 +1,14 @@
+# shellcheck configuration for the scripts under scripts/.
+#
+# SC2016 ("expressions don't expand in single quotes") fires on every
+# embedded jq, awk, and sed program that uses the embedded language's own
+# $variable, because it cannot tell the embedded program from a shell
+# string. In single quotes the shell correctly does not expand, and the
+# embedded language expands its own variables. The scripts embed enough
+# jq that a per-site suppression in each of them would cost more than
+# the check is worth, and the check is not load-bearing here: no shell
+# code in this repo wants a $variable expanded inside single quotes.
+#
+# The one site that does want deliberate word splitting, an ssh option
+# string, carries an inline suppression where the intent is visible.
+disable=SC2016

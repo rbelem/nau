@@ -114,7 +114,7 @@
 #   NAU_SWEEP_AZURE        1 → enable the azure axis
 #   NAU_SWEEP_SCW          1 → enable the scaleway axis
 #   NAU_SWEEP_SSH          ssh binary      (default: ssh)
-#   NAU_SWEEP_SSH_OPTS     ssh options     (default: BatchMode, 10s connect timeout, accept-new host keys)
+#   NAU_SWEEP_SSH_OPTS     ssh options     (see the assignment below)
 #   NAU_SWEEP_SSH_USER     guest ssh user  (default: root)
 #   NAU_SWEEP_MARKER_PATH  in-guest marker (default: /etc/nau/worker-ttl)
 #   NAU_SWEEP_HCLOUD       hcloud binary   (default: hcloud)
@@ -262,6 +262,7 @@ iso_to_epoch() {
 
 # fetch_marker IPV4 → marker text on stdout; nonzero rc if unreadable.
 fetch_marker() {
+    # shellcheck disable=SC2086
     "$SSH_BIN" $SSH_OPTS "$SSH_USER@$1" cat -- "$MARKER_PATH" 2>/dev/null
 }
 

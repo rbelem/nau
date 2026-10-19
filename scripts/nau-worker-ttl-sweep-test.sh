@@ -57,7 +57,6 @@ CURL_LOG=$TMP/curl.log
 AWS_LIST=$TMP/aws-list.json
 AWS_VOLUME_DIR=$TMP/aws-volumes
 AWS_TERMINATE_LOG=$TMP/aws-terminate.log
-AWS_CALLS_LOG=$TMP/aws-calls.log
 # gcp fixtures
 GCLOUD_LIST=$TMP/gcp-list.json
 GCLOUD_DESCRIBE_DIR=$TMP/gcp-describe

@@ -29,6 +29,7 @@
     "cryptsetup@latest",
     "github:NixOS/nixpkgs/nixos-unstable#lua54Packages.luacheck",
     "github:NixOS/nixpkgs/nixos-unstable#stylua",
+    "github:NixOS/nixpkgs/nixos-unstable#shellcheck",
     "github:NixOS/nixpkgs/nixos-unstable#cargo-llvm-cov"
   ],
   "shell": {
@@ -41,6 +42,9 @@
       "clippy": "cargo clippy --workspace --all-targets -- -D warnings",
       "fmt": "cargo fmt --all",
       "fmt-check": "cargo fmt --all --check",
+      "luacheck": "luacheck pkgs/ test-fixtures/",
+      "stylua": "stylua --check pkgs/ test-fixtures/",
+      "shellcheck": "bash scripts/shellcheck-all.sh",
       "check": "NAU_SYSTEMD=off cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check",
       "hooks": "git config core.hooksPath scripts/hooks"
     }
