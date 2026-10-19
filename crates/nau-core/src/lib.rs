@@ -21,6 +21,7 @@ pub mod paths;
 pub mod pkg_manifest;
 pub mod pkg_source;
 pub mod plugins;
+pub mod resource_limit;
 pub mod servers;
 pub mod sign;
 pub mod snap;
