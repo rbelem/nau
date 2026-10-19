@@ -148,9 +148,9 @@ mechanism); landing the artifacts (commits/PR) still needs the operator.
 ## Open decisions
 
 
-- gcc payload version: decided, 15.2.0 (the recipe is the contract; the
-  gate pod already carries it). The plan's earlier note about a 14.2.0
-  choice was an error (corrected).
+- gcc payload version: decided, 16.2.0 (the recipe is the contract; the
+  earlier 15.2.0 choice was superseded by the version bump run below, and
+  the plan's note about a 14.2.0 choice was an error, corrected twice).
 - Whether `build-deps` (toolchain + autotools) becomes the default
   `build_deps` floor for recipes, shrinking the 83 recipes that declare
   ad-hoc `{ "gcc", "make" }`. Out of scope for the build; noted as the
