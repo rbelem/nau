@@ -39,12 +39,54 @@ else
     HAS_HEAD=0
 fi
 
+# ── devbox.lock rewrite fingerprint ──
+# `devbox run` rewrites devbox.lock when the committed lock carries an
+# older plugin_version than the installed devbox writes. The rewrite
+# lands in whatever commit follows, and nobody authored it.
+#
+# A plugin_version-only diff with devbox.json unstaged is that rewrite.
+# A devbox.json change is a deliberate lock update and is exempt, and so
+# is a lock diff that carries real resolution changes (a new package, a
+# new version, a new resolved hash).
+devbox_lock_rewritten() {
+    # No staged lock change: nothing to judge.
+    git diff --cached --quiet -- devbox.lock && return 1
+    # A staged devbox.json means the lock update was asked for; the
+    # plugin_version bump rides along with it.
+    git diff --cached --quiet -- devbox.json || return 1
+    local changed
+    changed="$(git diff --cached -U0 -- devbox.lock | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)')" || true
+    [ -n "$changed" ] || return 1
+    # Every changed line must be a plugin_version line.
+    while IFS= read -r line; do
+        case "$line" in
+            *plugin_version*) ;;
+            *) return 1 ;;
+        esac
+    done <<<"$changed"
+    return 0
+}
+
+if devbox_lock_rewritten; then
+    {
+        printf '\npre-commit: devbox.lock carries a plugin_version-only rewrite.\n\n'
+        printf '  The devbox run command rewrote the lock; you did not author this.\n'
+        printf '  The committed lock carried an older plugin_version than the\n'
+        printf '  installed devbox writes. Unstage and restore it:\n\n'
+        printf '    git restore --staged devbox.lock\n'
+        printf '    git checkout -- devbox.lock\n\n'
+        printf '  If a devbox upgrade is the intent, commit the lock together\n'
+        printf '  with the devbox.json change that caused it.\n'
+    } >&2
+    exit 1
+fi
+
 is_exempt() {
     local path="$1" base="${1##*/}" attrs
     case "$base" in
         Cargo.lock|package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|bun.lockb) return 0 ;;
         flake.lock|devbox.lock|poetry.lock|uv.lock|Pipfile.lock|Gemfile.lock|composer.lock|go.sum) return 0 ;;
-        *.lock|*.lock.*|*.lock.json|*-lock.json|*.min.js|*.min.css|*.map) return 0 ;;
+        *.lock|*.lock.*|*-lock.json|*.min.js|*.min.css|*.map) return 0 ;;
         LICENSE|LICENSE.*|COPYING|NOTICE) return 0 ;;
         *.pb.go|*.pb.cc|*.pb.h|*_pb2.py|*_generated.rs|*.generated.*|*.g.dart|*.freezed.dart) return 0 ;;
     esac
