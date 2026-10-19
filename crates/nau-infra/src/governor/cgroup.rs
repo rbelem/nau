@@ -261,6 +261,10 @@ fn sweep_claims(directory: &Path) -> io::Result<(Vec<Claim>, usize)> {
             continue;
         };
         let Ok(pid) = name.parse::<u32>() else {
+            if name.starts_with('.') {
+                // A crash between create and rename can leave a temp behind; remove it.
+                let _ = fs::remove_file(entry.path());
+            }
             continue;
         };
         let path = entry.path();
