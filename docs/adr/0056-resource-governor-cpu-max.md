@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted (2026-10-19). The Worker path has not had a live-cgroup acceptance
+Accepted (2026-10-19). Amended 2026-10-19: the default percentage is 50, not
+80 (see Amendment 1). The Worker path has not had a live-cgroup acceptance
 run; see Revisit triggers.
 
 ## Context
@@ -12,9 +13,9 @@ use all online CPUs. `make` and `mksquashfs` can therefore compete with other
 work on the host. A slot limit does not impose a machine-wide CPU budget.
 
 The limit is a percentage of the machine's online CPUs. On a 12-CPU host,
-80 means 9.6 CPUs. In cgroup v2, that is `cpu.max` set to
-`960000 100000`. A value of `80%` in systemd's `CPUQuota` instead means 0.8
-CPU. The CLI must state the unit clearly.
+50 means 6 CPUs. In cgroup v2, that is `cpu.max` set to `600000 100000`. A
+value of `80%` in systemd's `CPUQuota` instead means 0.8 CPU. The CLI must
+state the unit clearly.
 
 Some supported hosts have no usable cgroup v2 delegation. Builds must keep
 working there, with an explicit warning that they run uncapped. The mechanism
@@ -29,14 +30,14 @@ build children inside it.
 
 1. **Expose one CPU limit at the build boundary.** `nau build` and `nau image`
    accept `--resource-limit PERCENT|off`. `NAU_RESOURCE_LIMIT` supplies the
-   value only when the flag is absent. The default is 80. A percentage must be
+   value only when the flag is absent. The default is 50. A percentage must be
    an integer from 1 through 100. Invalid input names the flag or environment
    variable that supplied it. The CLI flag wins over the environment.
 
 2. **Define the percentage against all online CPUs.** For percentage `p`,
    online CPU count `n`, and the fixed 100,000-microsecond period, the governor
-   writes `p * n * 100000 / 100` as the quota. At 80 on 12 CPUs, the file reads
-   `960000 100000`. At 100, it reads `1200000 100000`, not `max`. The exact
+   writes `p * n * 100000 / 100` as the quota. At 50 on 12 CPUs, the file reads
+   `600000 100000`. At 100, it reads `1200000 100000`, not `max`. The exact
    quota can shave the end of a CPU period. `off` is the uncapped value.
 
 3. **Share one `nau-build` cgroup per user.** Every limited build child joins
@@ -68,7 +69,7 @@ build children inside it.
 
 6. **Carry the limit to Workers without changing job identity.** The
    coordinator resolves the limit and writes it to `JobManifest.resource_limit`.
-   The field defaults to 80 and is removed from canonical manifest bytes, so
+   The field defaults to 50 and is removed from canonical manifest bytes, so
    the execution setting does not change the job identity. A new Worker applies
    the limit to its own CPUs. An old Worker ignores the field and runs
    uncapped. The coordinator does not send a limit with `build-request submit`;
@@ -86,6 +87,22 @@ build children inside it.
    are per user, so separate user accounts do not share one machine-wide cap.
    An `off` build does not join a capped peer's cgroup and can raise total CPU
    use above the requested limit.
+
+## Amendment 1: default lowered to 50
+
+The default percentage is 50, not the 80 this ADR was accepted with.
+
+Why: a build host is usually not a build appliance. On a developer
+workstation the compiler, the editor, and the agent sessions compete with the
+build for the same cores, and 80% leaves too little headroom. The cap costs
+wall-clock time only when a build is CPU-bound and the machine is otherwise
+idle, which is the uncommon case for an interactive host. A dedicated build
+machine can pass `--resource-limit 100` or `NAU_RESOURCE_LIMIT=100`.
+
+This changes a constant, not the mechanism. The quota math, the shared
+`nau-build` cgroup, the claim protocol, and the degradation path are
+unchanged. Operators who set the flag or the environment variable are
+unaffected.
 
 ## Alternatives considered
 
@@ -118,6 +135,8 @@ share across user accounts, or contain a concurrent `off` build.
 
 - Probe a real Worker with `nau __worker-job` and verify that its build child
   joins the local `nau-build` cgroup.
+- Revisit the 50 default if dedicated build hosts report that interactive-host
+  headroom is no longer the binding constraint.
 - Add `NAU_BUILD_JOBS` to the build sandbox and update recipes that use
   `-j$(nproc)` if users need those commands to shrink with the quota.
 - Add the effective limit to `CapabilityDoc` if coordinators need to inspect

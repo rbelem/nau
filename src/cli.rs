@@ -510,7 +510,7 @@ pub struct BuildArgs {
     #[arg(long)]
     pub offline: bool,
 
-    /// Percent of online CPUs. 80% allows 9.6 cores on a 12-CPU host.
+    /// Percent of online CPUs. 50% allows 6 cores on a 12-CPU host.
     /// This is not systemd CPUQuota. 100% still throttles at each period boundary; use `off` to disable.
     #[arg(long, value_name = "PERCENT|off")]
     pub resource_limit: Option<String>,
@@ -584,7 +584,7 @@ pub struct ImageArgs {
     #[arg(long, default_value = "nau.lock")]
     pub lockfile: String,
 
-    /// Percent of online CPUs. 80% allows 9.6 cores on a 12-CPU host.
+    /// Percent of online CPUs. 50% allows 6 cores on a 12-CPU host.
     /// This is not systemd CPUQuota. 100% still throttles at each period boundary; use `off` to disable.
     #[arg(long, value_name = "PERCENT|off")]
     pub resource_limit: Option<String>,

@@ -150,7 +150,7 @@ then
 fi
 
 epoch=1700000000
-expected_max="$((cpus * 80 * 1000)) 100000"
+expected_max="$((cpus * 50 * 1000)) 100000"
 probe_error=""
 baseline_nr=""
 last_nr=""

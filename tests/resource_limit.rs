@@ -103,6 +103,21 @@ fn resource_limit_wire_values_are_validated() {
 }
 
 #[test]
+fn default_is_half_the_machine() {
+    // Pinned deliberately: ADR-0056 Amendment 1 chose 50 over 80 so an
+    // interactive build host keeps headroom. A change here is a product
+    // decision, not a refactor.
+    assert_eq!(
+        ResourceLimit::DEFAULT,
+        ResourceLimit::Percent(percent("50"))
+    );
+    assert_eq!(
+        CpuMax::from_machine(percent("50"), NonZeroU32::new(12).unwrap()).file_text(),
+        "600000 100000"
+    );
+}
+
+#[test]
 fn default_detection_and_degrade_names_are_stable() {
     assert_eq!(ResourceLimit::default(), ResourceLimit::DEFAULT);
     assert!(ResourceLimit::DEFAULT.is_default());

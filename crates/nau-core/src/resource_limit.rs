@@ -8,7 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub struct MachinePercent(u8);
 
 impl MachinePercent {
-    pub const DEFAULT: Self = Self(80);
+    pub const DEFAULT: Self = Self(50);
 
     pub const fn get(self) -> u8 {
         self.0
