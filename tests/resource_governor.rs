@@ -155,6 +155,10 @@ fn raw_build_and_infra_process_calls_use_governor_seams() {
         "raw process calls remain:\n{}",
         violations.join("\n")
     );
+    let image = fs::read_to_string(root.join("crates/nau-image/src/image/mod.rs")).unwrap();
+    assert!(image.contains("RealRunner as ImageTools"));
+    assert!(image.contains("runner: &dyn CommandRunner"));
+    assert!(image.contains("build_image_with(\n        &ImageTools,"));
 }
 
 fn live_test_lock() -> MutexGuard<'static, ()> {

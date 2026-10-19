@@ -510,6 +510,11 @@ pub struct BuildArgs {
     #[arg(long)]
     pub offline: bool,
 
+    /// Percent of online CPUs. 80% allows 9.6 cores on a 12-CPU host.
+    /// This is not systemd CPUQuota. 100% can CFS tail-shave; use `off` to disable.
+    #[arg(long, value_name = "PERCENT|off")]
+    pub resource_limit: Option<String>,
+
     /// Output structured JSON instead of human-friendly colored output.
     /// Useful for tooling, CI, or machine parsing.
     #[arg(long)]
@@ -579,6 +584,11 @@ pub struct ImageArgs {
     #[arg(long, default_value = "nau.lock")]
     pub lockfile: String,
 
+    /// Percent of online CPUs. 80% allows 9.6 cores on a 12-CPU host.
+    /// This is not systemd CPUQuota. 100% can CFS tail-shave; use `off` to disable.
+    #[arg(long, value_name = "PERCENT|off")]
+    pub resource_limit: Option<String>,
+
     /// Output structured JSON instead of human-friendly colored output.
     #[arg(long)]
     pub json: bool,
@@ -588,7 +598,7 @@ pub struct ImageArgs {
 #[derive(clap::Subcommand)]
 pub enum ImageCommand {
     /// Build a system image from pinned snaps
-    Build(ImageArgs),
+    Build(Box<ImageArgs>),
 
     /// Boot a built disk image in QEMU and assert the boot completed
     /// (the `nau test` harness)
@@ -1680,7 +1690,7 @@ pub fn normalize_domain(command: Command) -> Command {
                 command: None,
             },
             Some(ImageCommand::Build(args)) => Command::Image {
-                args,
+                args: *args,
                 command: None,
             },
             Some(ImageCommand::Test(test)) => Command::Test(test),
@@ -3071,6 +3081,31 @@ mod tests {
                 assert_eq!(cache.as_deref(), Some("/custom/cache"));
                 assert_eq!(output_name.as_deref(), Some("my-system"));
             }
+            _ => panic!("expected Image"),
+        }
+    }
+
+    #[test]
+    fn test_resource_limit_flags_parse_for_build_and_image() {
+        match parse_build(&["nau", "build", "--resource-limit", "50"]) {
+            Command::Build {
+                args: BuildArgs { resource_limit, .. },
+                ..
+            } => assert_eq!(resource_limit.as_deref(), Some("50")),
+            _ => panic!("expected Build"),
+        }
+
+        match normalize_domain(parse_build(&[
+            "nau",
+            "image",
+            "build",
+            "--resource-limit",
+            "off",
+        ])) {
+            Command::Image {
+                args: ImageArgs { resource_limit, .. },
+                command: None,
+            } => assert_eq!(resource_limit.as_deref(), Some("off")),
             _ => panic!("expected Image"),
         }
     }

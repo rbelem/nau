@@ -104,6 +104,7 @@ fn resource_limit_wire_values_are_validated() {
 
 #[test]
 fn default_detection_and_degrade_names_are_stable() {
+    assert_eq!(ResourceLimit::default(), ResourceLimit::DEFAULT);
     assert!(ResourceLimit::DEFAULT.is_default());
     assert!(!ResourceLimit::Off.is_default());
     assert_eq!(

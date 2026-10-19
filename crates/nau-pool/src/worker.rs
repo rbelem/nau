@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use nau_core::resource_limit::{DegradeReason, ResourceLimit};
 use serde::{Deserialize, Serialize};
 
 /// Wire protocol version carried by the cap document, every job manifest,
@@ -54,11 +55,18 @@ pub struct SourcePin {
     pub sha256: String,
 }
 
+fn is_default_resource_limit(limit: &ResourceLimit) -> bool {
+    limit.is_default()
+}
+
 /// One job manifest (ADR-0040 Decision 6): everything the Worker needs to
 /// build exactly one package with no upstream access.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobManifest {
     pub protocol_version: u32,
+
+    #[serde(default, skip_serializing_if = "is_default_resource_limit")]
+    pub resource_limit: ResourceLimit,
 
     /// The snap architecture to build for (the `arch` argument of
     /// `snap::build_snap`, e.g. "amd64").
@@ -135,6 +143,8 @@ pub struct JobResult {
     /// an optional field never bumps the protocol version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_degrade: Option<DegradeReason>,
 }
 
 // ── Transport side (ADR-0040 Decision 6, T4) ──
@@ -142,13 +152,14 @@ pub struct JobResult {
 /// The canonical manifest bytes the job identity digests (ADR-0040
 /// Decision 6): serde_json with sorted object keys plus the array members
 /// sorted — pins by URL, closure by sha256 — so two coordinators produce
-/// the same bytes for the same job. The transport-local `payload_dir` is
-/// stripped: it names coordinator-side disk, not job content.
+/// the same bytes for the same job. The transport-local `payload_dir` and
+/// `resource_limit` are stripped: they describe execution, not job content.
 pub fn canonical_manifest_bytes(manifest: &JobManifest) -> miette::Result<Vec<u8>> {
     let mut value = serde_json::to_value(manifest)
         .map_err(|e| miette::miette!("worker-job: cannot canonicalize the job manifest: {e}"))?;
     if let Some(obj) = value.as_object_mut() {
         obj.remove("payload_dir");
+        obj.remove("resource_limit");
         if let Some(pins) = obj.get_mut("pins").and_then(|v| v.as_array_mut()) {
             pins.sort_by(|a, b| a["url"].as_str().cmp(&b["url"].as_str()));
         }
@@ -263,4 +274,46 @@ pub fn validate_purpose(obj: &ClosureObject) -> miette::Result<()> {
 /// paths format with it after the split.
 pub fn short_sha(sha: &str) -> String {
     sha.chars().take(16).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest() -> JobManifest {
+        JobManifest {
+            protocol_version: WORKER_PROTOCOL_VERSION,
+            resource_limit: ResourceLimit::DEFAULT,
+            target: "amd64".into(),
+            cross_target: None,
+            source_date_epoch: None,
+            package: "identity-probe".into(),
+            recipes: BTreeMap::new(),
+            pins: Vec::new(),
+            closure: Vec::new(),
+            payload_dir: Some("/coordinator/payload".into()),
+        }
+    }
+
+    #[test]
+    fn resource_limit_does_not_change_the_job_identity() {
+        let baseline = manifest();
+        let identity = manifest_identity(&baseline).unwrap();
+        for limit in [
+            ResourceLimit::resolve(Some("50"), None).unwrap(),
+            ResourceLimit::Off,
+        ] {
+            let mut changed = baseline.clone();
+            changed.resource_limit = limit;
+            assert_eq!(manifest_identity(&changed).unwrap(), identity);
+        }
+    }
+
+    #[test]
+    fn missing_resource_limit_defaults_to_eighty_percent() {
+        let value = serde_json::to_value(manifest()).unwrap();
+        assert!(value.get("resource_limit").is_none());
+        let parsed: JobManifest = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.resource_limit, ResourceLimit::DEFAULT);
+    }
 }

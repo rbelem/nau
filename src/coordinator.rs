@@ -265,6 +265,8 @@ impl<R: CommandRunner + Sync> ManifestSource for FarmSource<'_, R> {
 
         Ok(crate::worker::JobManifest {
             protocol_version: crate::worker::WORKER_PROTOCOL_VERSION,
+            resource_limit: nau_infra::governor::configured_limit()
+                .unwrap_or(nau_core::resource_limit::ResourceLimit::DEFAULT),
             target: plan.arch.clone(),
             cross_target: plan.cross_target.clone(),
             source_date_epoch: self.epoch,

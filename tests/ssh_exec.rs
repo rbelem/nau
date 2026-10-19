@@ -542,6 +542,7 @@ fn hello_manifest() -> JobManifest {
     map.insert("pkgs/w/worker-hello.lua".to_string(), hello_recipe());
     JobManifest {
         protocol_version: WORKER_PROTOCOL_VERSION,
+        resource_limit: nau_core::resource_limit::ResourceLimit::DEFAULT,
         target: host_arch(),
         cross_target: None,
         source_date_epoch: Some(1700000000),
@@ -560,6 +561,7 @@ fn blob_manifest(blobs: &[(&str, &str)]) -> JobManifest {
     map.insert("pkgs/w/worker-hello.lua".to_string(), hello_recipe());
     JobManifest {
         protocol_version: WORKER_PROTOCOL_VERSION,
+        resource_limit: nau_core::resource_limit::ResourceLimit::DEFAULT,
         target: host_arch(),
         cross_target: None,
         source_date_epoch: Some(1700000000),
@@ -593,6 +595,7 @@ fn scripted_dispatch(outcome_artifact: &str, bytes: &[u8]) -> (JobResult, Vec<(S
         error: None,
         stderr: None,
         build_ms: None,
+        resource_degrade: None,
     };
     (result, vec![(outcome_artifact.to_string(), bytes.to_vec())])
 }

@@ -66,6 +66,12 @@ impl ResourceLimit {
     }
 }
 
+impl Default for ResourceLimit {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 impl Serialize for ResourceLimit {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
