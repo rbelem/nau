@@ -4,7 +4,7 @@
 return {
     default = snap {
         name = "isl",
-        version = "0.27",
+        version = "0.28",
         summary = "Integer Set Library for gcc loop optimization",
         description = [[ISL 0.27 is a C library for manipulating sets and relations of integer
 points bounded by linear constraints. It supports operations like union,
@@ -15,7 +15,10 @@ loop optimization framework to perform advanced loop nest optimizations.]],
         architectures = { "amd64" },
         type = "source",
         requires = { "gmp" },
-        source = { url = "https://libisl.sourceforge.io/isl-0.27.tar.xz" },
+        source = {
+            url = "https://libisl.sourceforge.io/isl-0.28.tar.xz",
+            sha256 = "3dc31b8e1b18329e42d5dfbf84dd55e15c59b61569a2ab246f61497d9592f727",
+        },
         build = table.concat({
             "./configure --prefix=/usr && make && make install DESTDIR=$STAGE",
             -- libtool .la metadata embeds the absolute build-time paths

@@ -5,60 +5,67 @@
 -- toolchain. The default "toolchain" alias lets system-base and
 -- build-deps reference this as the system's default compiler.
 --
--- Requires: binutils, gcc, glibc, gmp, mpfr, mpc, isl, linux-headers,
---           zlib
--- (Deliberately NOT libstdcpp: gcc's own payload installs
--- usr/lib64/libstdc++ and usr/lib64/libgcc_s, and the standalone
--- libstdcpp payload pulls pool libgcc — a second, byte-different
--- usr/lib64/libgcc_s.so that the merged-prefix merge rejects
--- outright. The compiler's own copies are the toolchain truth.)
+-- Requires: gcc, glibc, linux-headers, gmp, mpfr, mpc, isl, zlib
+-- (transitive: libgcc, m4, make)
 --
--- Apps (issue #38): gcc, g++, and the toolchain alias itself, so
--- `nau pod add toolchain` works. The apps are what make the meta
--- pod-installable in the first place: the farm exposes app commands,
--- and the commands must exist in THIS payload — a meta's requires
--- payloads never surface as another package's farm entries.
+-- Two consumer faces, both served from one payload:
 --
--- Payload shape — a self-contained toolchain tree at toolchain/:
--- the build copies the merged build prefix (the requires' payloads,
--- /nau-build-prefix) wholesale into $STAGE/toolchain/, so the
--- tree carries the SAME layout the gcc build was configured against:
--- usr/{bin,lib,libexec,include}, usr/lib64, and the runtime lib64/
--- (ld-linux, libc.so.6) that glibc's absolute-path libc.so linker
--- script references under a sysroot.
+--   * build_deps consumers (ADR-0018): the merged build prefix leads
+--     the sandbox PATH with <prefix>/usr/bin, and the harness probes
+--     that dir for bare `gcc`/`g++` to export CC/CXX
+--     (build_prefix_toolchain_env). The payload root therefore carries
+--     usr/bin/gcc and usr/bin/g++ as relative links into the payload's
+--     own toolchain/usr/bin, whose gcc/g++ links dispatch onto the gcc
+--     payload's cc/c++ shims.
 --
--- Launchers, not raw binaries (issue #37 assembly + #46 gap): the app
--- commands are sh scripts AT the toolchain/ root. The farm assembly
--- captures every payload entry under the command binary's directory,
--- so a launcher at toolchain/gcc assembles the ENTIRE toolchain/ tree
--- beside itself — a raw usr/bin/gcc command would assemble only the
--- usr/bin siblings and strand usr/libexec (cc1) and lib64. Each
--- launcher resolves its real dir at run time (readlink -f through the
--- farm symlink), execs the staged driver, and:
---   --sysroot="$d"      — the driver was configured with
---                         --with-sysroot=/nau-build-prefix, which
---                         exists only inside the build sandbox; the
---                         assembled toolchain/ has the same shape, so
---                         the launcher repoints the sysroot at itself
---                         and compiles against the staged glibc and
---                         linux-headers.
---   LD_LIBRARY_PATH=…   — the staged ELFs carry no RUNPATH (removed at
---                         build time, below), so cc1/cc1plus find the
---                         staged libstdc++/libgcc (usr/lib64) and
---                         libgmp/libmpfr/libmpc/libisl (usr/lib) via
---                         the launcher's environment instead of the
---                         host.
+--   * pod apps (issue #38): `gcc`, `g++`, and the `toolchain` alias are
+--     sh launchers at the toolchain/ root. The farm assembly captures
+--     every payload entry under the command binary's directory, so a
+--     launcher at toolchain/gcc assembles the ENTIRE staged tree beside
+--     itself. Each launcher resolves its real dir at run time (readlink
+--     -f through the farm symlink), execs the staged driver, and:
+--       LD_LIBRARY_PATH=…   — the staged ELFs carry no RUNPATH, so
+--                             cc1/cc1plus find the staged libstdc++/
+--                             libgcc (usr/lib64), the pool libs
+--                             (usr/lib), and the Debian multiarch dir
+--                             (usr/lib/x86_64-linux-gnu — libisl,
+--                             libmpfr, libgmp, libzstd, cc1's
+--                             DT_NEEDED) via the launcher's environment.
+--       --sysroot="$d"      — the staged tree has the prefix's shape;
+--                             the driver compiles against the staged
+--                             glibc and linux-headers. (Contingency if
+--                             the deb driver misbehaves under a
+--                             sysroot: drop the flag and ride the cc
+--                             shim's LIBRARY_PATH→-L translation, the
+--                             mechanism gate-pod round 9 proved.)
 --
--- Portability pass (ticket #12 at payload scale): every staged ELF
--- gets its interpreter repointed at /lib64/ld-linux-x86-64.so.2 and
--- its RUNPATH dropped — a nix-toolchain build bakes /nix/store paths
--- into both, and only the app commands get the mechanical repair.
--- patchelf failures on non-ELFs are silenced; the || true keeps the
--- chain green for exactly those files.
+-- Payload shape: the build copies the merged build prefix (the
+-- requires' payloads, /nau-build-prefix) wholesale into
+-- $STAGE/toolchain/, so the tree carries the SAME layout the gcc build
+-- was configured against: usr/{bin,lib,libexec,include}, usr/lib64, and
+-- the runtime lib64/ (ld-linux, libc.so.6) that glibc's absolute-path
+-- libc.so linker script references under a sysroot.
 --
--- The staged tree is stripped: GCC installs with full -g debug info
--- and unstripped cc1/cc1plus would bloat every pod that carries this
--- package. strip lives in the staged binutils, ahead on PATH.
+-- Bare names (#164): the gcc payload is a pure file-copy of Debian
+-- forky debs — drivers are versioned (gcc-16, x86_64-linux-gnu-gcc-16)
+-- and the unversioned names come from Debian alternatives this deb set
+-- does not carry. The payload's own shims are `cc` and `c++` (dispatch
+-- on the invoked name), so `gcc` and `g++` links onto them are authored
+-- inside the staged tree, and the payload root links through that tree.
+--
+-- Portability pass (ticket #12), conditional: pool-built binaries (m4,
+-- make) carry nix-store interpreters and must be repointed at
+-- /lib64/ld-linux-x86-64.so.2; the deb payload's ELFs already carry
+-- that interpreter and no RUNPATH, and a blind patchelf pass rewrites
+-- their bytes — which would break the per-file content-addressing
+-- dedupe with the requires' payloads (measured 2026-10-18). Only files
+-- whose interpreter or RUNPATH is actually wrong are touched. strip is
+-- byte-idempotent on already-stripped files and stays for payloads that
+-- arrive unstripped.
+--
+-- The staged tree is stripped: GCC ships full -g debug info and
+-- unstripped cc1/cc1plus would bloat every pod that carries this
+-- package.
 --
 -- source: the harness requires a fetchable source whenever `build` is
 -- set; the build stages nothing from it. Reuse the smallest
@@ -66,13 +73,14 @@
 -- fixture pattern as test-fixtures/toolchain-*-probe.lua.
 --
 -- The staged payload is content-addressed per file on pod install, so
--- files shared with the requires' own payloads (glibc, binutils, gcc…)
--- dedupe in the pod store — the meta adds no second copy of a byte.
+-- files byte-identical with the requires' own payloads (glibc,
+-- binutils, gcc…) dedupe in the pod store — that is why the
+-- portability pass is conditional.
 
 return {
     default = snap {
         name = "toolchain-gcc-gnu-x86_64",
-        version = "14.2.0",
+        version = "16.2.0",
         summary = "GCC toolchain (GNU libc, x86_64)",
         description = [[
             Complete GCC toolchain targeting x86_64-linux-gnu.
@@ -80,7 +88,8 @@ return {
             glibc runtime, and all supporting libraries (gmp, mpfr, mpc).
             Stages a self-contained toolchain/ tree whose gcc, g++ and
             toolchain commands drive a hermetic C/C++ build from a pod
-            farm or serve as a build_deps toolchain.
+            farm, and exposes bare gcc/g++ in its payload root for
+            build_deps consumers.
         ]],
         grade = "stable",
         confinement = "strict",
@@ -126,42 +135,53 @@ return {
             sha256 = "e7b39be070ad98f74a1edd59fefb8ac41865ab2aa2c5a4252eb71c5413f3f9df",
         },
 
-        -- Stage the merged prefix whole, make every staged ELF portable
-        -- (ticket #12 applies to app commands mechanically; the staged
-        -- cc1/cc1plus need the same treatment from the recipe), strip
-        -- it, and author the three root launchers. printf lines stay
-        -- single-quoted with no nesting so the sandbox preflight reads
-        -- them cleanly (the go.lua pattern); $() interiors are runtime
-        -- sub-commands.
+        -- Stage the merged prefix whole, author the bare-name links,
+        -- run the conditional portability pass, and author the three
+        -- root launchers. printf lines stay single-quoted with no
+        -- nesting so the sandbox preflight reads them cleanly (the
+        -- go.lua pattern); $() interiors are runtime sub-commands.
         build = table.concat({
             "mkdir -p $STAGE/toolchain",
             "cp -a /nau-build-prefix/. $STAGE/toolchain/",
-            -- The cross build installs only target-prefixed driver names
-            -- (x86_64-linux-gnu-gcc & co). Author the conventional
-            -- unprefixed names as symlinks so build_deps consumers reach
-            -- the toolchain by bare name in the merged prefix, and the
-            -- launchers below can exec usr/bin/gcc. Standard distro
-            -- layout (Ubuntu: gcc -> x86_64-linux-gnu-gcc-N).
-            'for t in gcc g++ cpp c++ gcov ar as ld nm ranlib strip readelf objcopy objdump; do ln -sf "x86_64-linux-gnu-$t" "$STAGE/toolchain/usr/bin/$t"; done',
-            -- NO root-level usr/bin names here: the gcc payload already
-            -- stages the plain compiler names (Debian gcc -> triplet
-            -- symlinks) and the binutils-tool bare names via its
-            -- LD-fixing shims (#171). Authoring ANY bare name at this
-            -- payload's usr/bin collides with those under ADR-0018
-            -- merge semantics (same path, different content or link
-            -- target) — the podman toolchain build_dep could never
-            -- materialize. The bare-name contract is satisfied by the
-            -- gcc payload itself; consumers reach the drivers through
-            -- their own prefix's usr/bin and the subtree via toolchain/*.
-            "find $STAGE -type f -exec patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 {} \\; 2>/dev/null || true",
-            "find $STAGE -type f -exec patchelf --remove-rpath {} \\; 2>/dev/null || true",
+            -- Fail closed when the gcc payload's shim shape changes: the
+            -- bare-name links below and the launchers depend on cc/c++.
+            "test -x /nau-build-prefix/usr/bin/cc || { echo 'toolchain: prefix carries no cc shim — the gcc payload shape changed (see pkgs/g/gcc.lua)' >&2; exit 1; }",
+            "test -x /nau-build-prefix/usr/bin/c++ || { echo 'toolchain: prefix carries no c++ shim — the gcc payload shape changed (see pkgs/g/gcc.lua)' >&2; exit 1; }",
+            -- Bare names onto the dispatch shims: the payload root serves
+            -- build_deps consumers (<prefix>/usr/bin leads the sandbox
+            -- PATH; CC/CXX probe gcc/g++ there), the staged tree serves
+            -- the launchers. Root links resolve through the payload's own
+            -- toolchain/ subtree, so they are self-contained in both the
+            -- payload and any merged prefix; no ADR-0018 collision, the
+            -- gcc payload stages neither name.
+            "mkdir -p $STAGE/usr/bin",
+            "ln -sf ../../toolchain/usr/bin/gcc $STAGE/usr/bin/gcc",
+            "ln -sf ../../toolchain/usr/bin/g++ $STAGE/usr/bin/g++",
+            "ln -sf cc $STAGE/toolchain/usr/bin/gcc",
+            "ln -sf c++ $STAGE/toolchain/usr/bin/g++",
+            -- The root links must RESOLVE (two hops into the payload's own
+            -- tree): a wrong relative depth is a dangling name that only
+            -- surfaces as a host compiler winning the PATH lookup, so fail
+            -- closed here — `test -x` follows the links.
+            "test -x $STAGE/usr/bin/gcc || { echo 'toolchain: payload-root gcc link does not resolve' >&2; exit 1; }",
+            "test -x $STAGE/usr/bin/g++ || { echo 'toolchain: payload-root g++ link does not resolve' >&2; exit 1; }",
+            -- Conditional portability pass — see the header note. A
+            -- wrong interpreter or a present RUNPATH gets repaired;
+            -- already-portable files stay byte-identical (dedupe).
+            'find $STAGE -type f -exec sh -c \'i=$(patchelf --print-interpreter "$1" 2>/dev/null) || exit 0; [ "$i" = /lib64/ld-linux-x86-64.so.2 ] || patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 "$1"\' _ {} \\;',
+            'find $STAGE -type f -exec sh -c \'r=$(patchelf --print-rpath "$1" 2>/dev/null) || exit 0; [ -z "$r" ] || patchelf --remove-rpath "$1"\' _ {} \\;',
             "find $STAGE -type f -exec strip --strip-unneeded {} \\; 2>/dev/null || true",
+            -- The staged tree must carry the bare names the launchers exec,
+            -- and the shims they dispatch onto.
+            "test -x $STAGE/toolchain/usr/bin/cc || { echo 'toolchain: staged tree carries no cc shim' >&2; exit 1; }",
+            "test -x $STAGE/toolchain/usr/bin/gcc || { echo 'toolchain: staged tree carries no gcc link' >&2; exit 1; }",
+            "test -x $STAGE/toolchain/usr/bin/g++ || { echo 'toolchain: staged tree carries no g++ link' >&2; exit 1; }",
             -- gcc driver launcher
-            "printf '%s\\n' '#!/bin/sh' 'p=$(readlink -f -- \"$0\") || exit 1' 'd=$(dirname -- \"$p\")' 'LD_LIBRARY_PATH=\"$d/usr/lib:$d/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"' 'export LD_LIBRARY_PATH' 'exec \"$d/usr/bin/gcc\" --sysroot=\"$d\" \"$@\"' > $STAGE/toolchain/gcc",
+            "printf '%s\\n' '#!/bin/sh' 'p=$(readlink -f -- \"$0\") || exit 1' 'd=$(dirname -- \"$p\")' 'LD_LIBRARY_PATH=\"$d/usr/lib:$d/usr/lib64:$d/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"' 'export LD_LIBRARY_PATH' 'exec \"$d/usr/bin/gcc\" --sysroot=\"$d\" \"$@\"' > $STAGE/toolchain/gcc",
             -- g++ driver launcher
-            "printf '%s\\n' '#!/bin/sh' 'p=$(readlink -f -- \"$0\") || exit 1' 'd=$(dirname -- \"$p\")' 'LD_LIBRARY_PATH=\"$d/usr/lib:$d/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"' 'export LD_LIBRARY_PATH' 'exec \"$d/usr/bin/g++\" --sysroot=\"$d\" \"$@\"' > $STAGE/toolchain/g++",
+            "printf '%s\\n' '#!/bin/sh' 'p=$(readlink -f -- \"$0\") || exit 1' 'd=$(dirname -- \"$p\")' 'LD_LIBRARY_PATH=\"$d/usr/lib:$d/usr/lib64:$d/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"' 'export LD_LIBRARY_PATH' 'exec \"$d/usr/bin/g++\" --sysroot=\"$d\" \"$@\"' > $STAGE/toolchain/g++",
             -- the toolchain alias as an app: cc-style face of the driver
-            "printf '%s\\n' '#!/bin/sh' 'p=$(readlink -f -- \"$0\") || exit 1' 'd=$(dirname -- \"$p\")' 'LD_LIBRARY_PATH=\"$d/usr/lib:$d/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"' 'export LD_LIBRARY_PATH' 'exec \"$d/usr/bin/gcc\" --sysroot=\"$d\" \"$@\"' > $STAGE/toolchain/toolchain",
+            "printf '%s\\n' '#!/bin/sh' 'p=$(readlink -f -- \"$0\") || exit 1' 'd=$(dirname -- \"$p\")' 'LD_LIBRARY_PATH=\"$d/usr/lib:$d/usr/lib64:$d/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"' 'export LD_LIBRARY_PATH' 'exec \"$d/usr/bin/gcc\" --sysroot=\"$d\" \"$@\"' > $STAGE/toolchain/toolchain",
             "chmod +x $STAGE/toolchain/gcc $STAGE/toolchain/g++ $STAGE/toolchain/toolchain",
         }, " && "),
 

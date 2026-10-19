@@ -10,9 +10,9 @@
 return {
     default = snap {
         name = "binutils",
-        version = "2.44",
+        version = "2.47",
         summary = "GNU assembler, linker, and binary utilities",
-        description = [[GNU Binutils 2.44 provides a collection of binary tools essential for
+        description = [[GNU Binutils 2.47 provides a collection of binary tools essential for
 building programs. It includes the GNU assembler (as), linker (ld), and
 utilities such as objdump, nm, strip, and ar for working with object files,
 archives, and binaries. This build targets x86_64-linux-gnu.]],
@@ -26,8 +26,8 @@ archives, and binaries. This build targets x86_64-linux-gnu.]],
         -- sync env.
         build_deps = { "gcc", "make" },
         source = {
-            url = "https://ftp.gnu.org/gnu/binutils/binutils-2.44.tar.xz",
-            sha256 = "ce2017e059d63e67ddb9240e9d4ec49c2893605035cd60e92ad53177f4377237",
+            url = "https://ftp.gnu.org/gnu/binutils/binutils-2.47.tar.xz",
+            sha256 = "154ab23b60070e8f27013c22977f1129425d67d1e8acd6e13010e617811e4cff",
         },
         build = table.concat({
             -- CPPFLAGS prepend (issue #217, root cause): glibc's public

@@ -4,7 +4,7 @@
 return {
     default = snap {
         name = "mpfr",
-        version = "4.2.1",
+        version = "4.2.2",
         summary = "GNU MPFR — multiple-precision floating-point",
         description = [[GNU MPFR 4.2.1 is a C library for multiple-precision floating-point
 computation with correct rounding. It is based on GMP and provides a
@@ -15,7 +15,10 @@ a required dependency for GCC's internal computations.]],
         architectures = { "amd64" },
         type = "source",
         requires = { "gmp" },
-        source = { url = "https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz" },
+        source = {
+            url = "https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.2.tar.xz",
+            sha256 = "b67ba0383ef7e8a8563734e2e889ef5ec3c3b898a01d00fa0a6869ad81c6ce01",
+        },
         build = table.concat({
             "./configure --prefix=/usr && make && make install DESTDIR=$STAGE",
             -- libtool .la metadata embeds the absolute build-time paths

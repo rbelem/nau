@@ -5,8 +5,8 @@
 -- package that lists the "toolchain" alias in build_deps gets the
 -- whole GCC toolchain merged into its build prefix (usr/bin leads the
 -- sandbox PATH), so the build script can compile C AND C++ through
--- bare `gcc`/`g++` inside the hermetic sandbox and run the results
--- against the prefix glibc.
+-- bare `gcc`/`g++` inside the hermetic sandbox and verify the results'
+-- linkage against the prefix glibc with the prefix's own readelf.
 --
 -- Build:
 --   nau build --file test-fixtures/toolchain-gcc-probe.lua
@@ -42,28 +42,33 @@ return {
         -- mpc, isl, linux-headers, zlib, libstdcpp) into one prefix.
         build_deps = { "toolchain" },
 
-        -- The merged prefix is the sysroot the pool gcc was configured
-        -- with, so in-sandbox compiles need no extra flags. The probe
-        -- asserts CONSUMPTION (both drivers compile and link against
-        -- the prefix glibc/libstdc++ inside the hermetic sandbox,
-        -- verified on the produced ELFs with the prefix's own
-        -- readelf): executing the artifacts is a runtime-environment
-        -- concern — the green bootstrap runs them on the host, where
-        -- the farm-built binaries resolve the host loader with the
-        -- staged libc via the launcher's LD_LIBRARY_PATH.
+        -- The merged prefix carries the pool toolchain (the gcc payload's
+        -- cc/c++ dispatch shims, glibc, linux-headers and the supporting
+        -- libs); the shims translate LIBRARY_PATH into -L, so in-sandbox
+        -- compiles link against the prefix. The probe asserts
+        -- CONSUMPTION (both drivers compile and link against the prefix
+        -- glibc/libstdc++ inside the hermetic sandbox, verified on the
+        -- produced ELFs with the prefix's own readelf): executing the
+        -- artifacts is a runtime-environment concern — the pod-level run
+        -- proves it through the farm's loader wrappers.
         build = table.concat({
             "set -x",
             "printf 'int main(void){return 42;}\\n' > t.c",
             "gcc t.c -o t",
             "test -x t",
             "readelf -d t | grep -q 'Shared library: \\[libc.so.6\\]'",
-            "printf '#include <cstdio>\\nint main(){return 7;}\\n' > t.cpp",
+            -- A C++ TU that references no libstdc++ symbol gets its
+            -- libstdc++ NEEDED dropped by the Debian toolchain's default
+            -- --as-needed link; std::string's ctor/size() give the binary
+            -- real libstdc++ references, so the assert measures the
+            -- runtime chain, not the driver's default flags.
+            "printf '#include <string>\\nint main(){std::string s(3, 0x78); return (int)s.size();}\\n' > t.cpp",
             "g++ t.cpp -o tc",
             "test -x tc",
             "readelf -d tc | grep -q 'Shared library: \\[libstdc++.so.6\\]'",
             "readelf -d tc | grep -q 'Shared library: \\[libc.so.6\\]'",
-            "gcc --version | head -1 | grep -q '16\\.1\\.0'",
-            "g++ --version | head -1 | grep -q '16\\.1\\.0'",
+            "gcc --version | head -1 | grep -q '16\\.2\\.0'",
+            "g++ --version | head -1 | grep -q '16\\.2\\.0'",
             "echo toolchain-gcc-probe: C and C++ builds green",
         }, " && "),
     },
