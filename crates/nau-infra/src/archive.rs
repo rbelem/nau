@@ -57,12 +57,9 @@ fn unpack_tar<R: std::io::Read>(reader: R, dest: &Path) -> std::io::Result<()> {
 /// cover. Same spawn the pre-#170 code used for every archive.
 fn extract_tarball_external(archive: &Path, dest: &Path) -> std::io::Result<()> {
     let tar = tar_tool().map_err(|e| std::io::Error::other(e.to_string()))?;
-    let status = std::process::Command::new(&tar)
-        .arg("xf")
-        .arg(archive)
-        .arg("-C")
-        .arg(dest)
-        .status()?;
+    let mut command = std::process::Command::new(&tar);
+    command.arg("xf").arg(archive).arg("-C").arg(dest);
+    let status = crate::governor::status(command)?;
     if status.success() {
         Ok(())
     } else {

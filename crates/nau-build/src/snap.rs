@@ -1688,8 +1688,7 @@ fn repair_elf_on_host(
         cmd.arg("--set-interpreter").arg(&interpreter);
     }
     cmd.arg("--set-rpath").arg(rpath).arg(entry);
-    let status = cmd
-        .status()
+    let status = nau_infra::governor::status(cmd)
         .map_err(|e| miette::miette!("{label}: running patchelf on {display_path}: {e}"))?;
     restore_write_permission(entry, saved);
     if !status.success() {
@@ -1890,7 +1889,8 @@ fn probe_zstd_support(mksquashfs: &Path, level: u32) -> miette::Result<()> {
     std::fs::write(probe.path().join("probe"), b"nau zstd probe\n")
         .map_err(|e| miette::miette!("zstd probe: failed to write probe file: {e}"))?;
     let image = probe.path().join("probe.snap");
-    let output = std::process::Command::new(mksquashfs)
+    let mut command = std::process::Command::new(mksquashfs);
+    command
         .arg(probe.path())
         .arg(&image)
         .arg("-noappend")
@@ -1898,14 +1898,13 @@ fn probe_zstd_support(mksquashfs: &Path, level: u32) -> miette::Result<()> {
         .arg("zstd")
         .arg("-Xcompression-level")
         .arg(level.to_string())
-        .arg("-no-progress")
-        .output()
-        .map_err(|e| {
-            miette::miette!(
-                "zstd probe: failed to execute {}: {e}",
-                mksquashfs.display()
-            )
-        });
+        .arg("-no-progress");
+    let output = nau_infra::governor::output(command).map_err(|e| {
+        miette::miette!(
+            "zstd probe: failed to execute {}: {e}",
+            mksquashfs.display()
+        )
+    });
     let result = match output {
         Ok(out) if out.status.success() => Ok(()),
         Ok(out) => Err(format!(
@@ -2087,8 +2086,7 @@ pub fn build_snap(
     // ensure it's propagated into the child process.
     // (We set it in main.rs from the --source-date-epoch flag.)
 
-    let status = mksquashfs
-        .status()
+    let status = nau_infra::governor::status(mksquashfs)
         .map_err(|e| miette::miette!("failed to execute mksquashfs: {}", e))?;
 
     if !status.success() {
@@ -2167,9 +2165,9 @@ fn fetch_single_source(
     }
 
     let curl = floor_tool(nau_infra::tools::ToolName::Curl)?;
-    let status = std::process::Command::new(&curl)
-        .args(["-fsSL", "-o", &dest.to_string_lossy(), url])
-        .status()
+    let mut command = std::process::Command::new(&curl);
+    command.args(["-fsSL", "-o", &dest.to_string_lossy(), url]);
+    let status = nau_infra::governor::status(command)
         .map_err(|e| miette::miette!("curl not found: {}", e))?;
 
     if !status.success() {
@@ -2587,9 +2585,9 @@ fn download_multi_source_tarball(
         }
         None => {
             let curl = floor_tool(nau_infra::tools::ToolName::Curl)?;
-            let status = std::process::Command::new(&curl)
-                .args(["-fsSL", "-o", &tarball.to_string_lossy(), url])
-                .status()
+            let mut command = std::process::Command::new(&curl);
+            command.args(["-fsSL", "-o", &tarball.to_string_lossy(), url]);
+            let status = nau_infra::governor::status(command)
                 .map_err(|e| miette::miette!("curl not found: {}", e))?;
             if !status.success() {
                 output::finish_err(&dl_spinner, &format!("download failed: {name}"));
@@ -3569,18 +3567,15 @@ fn default_curl_ca_bundle(
     Some(("CURL_CA_BUNDLE", SANDBOX_CA_BUNDLE.to_string()))
 }
 
-/// The default `MAKEFLAGS` for a build command: `-j` at the host's
-/// available parallelism (cgroup-aware via `available_parallelism`, so
-/// pod quotas apply). Sandbox builds ran serial — autotools make never
-/// saw a `-j`: one `cc1` pegged a single core while the worker idled,
-/// and glibc took ~1 h single-threaded on an 8-core EPYC (the
-/// wl-clipboard drain, 2026-10-04). Recipes override via `extra_env`
-/// (the #138 ambient-trust rule): an ambient `MAKEFLAGS` always wins.
 fn default_make_flags(ambient: Option<&str>) -> Option<(&'static str, String)> {
     if ambient.is_some() {
         return None;
     }
     let jobs = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let jobs = nau_infra::governor::clamp_jobs(
+        std::num::NonZeroUsize::new(jobs).expect("parallelism fallback is nonzero"),
+    )
+    .get();
     Some(("MAKEFLAGS", format!("-j{jobs}")))
 }
 
@@ -4111,7 +4106,7 @@ fn run_build_child(
     use std::io::BufRead;
     use std::process::Stdio;
     cmd_proc.stderr(Stdio::piped());
-    let mut child = cmd_proc.spawn()?;
+    let mut child = nau_infra::governor::spawn(cmd_proc)?;
     let forward = !buffer_child_stderr();
     let collected = match child.stderr.take() {
         Some(stderr) => std::thread::spawn(move || {
@@ -11374,7 +11369,11 @@ fi
     fn default_make_flags_issues_parallel_jobs() {
         let (key, val) = default_make_flags(None).expect("default issued");
         assert_eq!(key, "MAKEFLAGS");
-        let jobs = std::thread::available_parallelism().unwrap().get();
+        let jobs = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let jobs = nau_infra::governor::clamp_jobs(
+            std::num::NonZeroUsize::new(jobs).expect("parallelism fallback is nonzero"),
+        )
+        .get();
         assert_eq!(val, format!("-j{jobs}"));
         assert!(jobs >= 1);
     }

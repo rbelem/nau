@@ -17,6 +17,7 @@
 pub mod archive;
 pub mod assert;
 pub mod command;
+pub mod governor;
 pub mod output;
 pub mod pathsearch;
 pub mod pgp;

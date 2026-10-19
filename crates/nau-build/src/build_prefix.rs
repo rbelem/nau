@@ -180,18 +180,14 @@ fn floor_tool(name: nau_infra::tools::ToolName) -> miette::Result<PathBuf> {
 /// The payload is never executed — files are just extracted.
 fn unpack_snap(snap: &Path, dest: &Path) -> miette::Result<()> {
     let unsquashfs = floor_tool(nau_infra::tools::ToolName::Unsquashfs)?;
-    let output = std::process::Command::new(&unsquashfs)
-        .arg("-no-progress")
-        .arg("-d")
-        .arg(dest)
-        .arg(snap)
-        .output()
-        .map_err(|e| {
-            miette::miette!(
-                "unsquashfs not found (needed to unpack dependency payloads \
+    let mut command = std::process::Command::new(&unsquashfs);
+    command.arg("-no-progress").arg("-d").arg(dest).arg(snap);
+    let output = nau_infra::governor::output(command).map_err(|e| {
+        miette::miette!(
+            "unsquashfs not found (needed to unpack dependency payloads \
                  for the merged build prefix): {e}"
-            )
-        })?;
+        )
+    })?;
     if !output.status.success() {
         return Err(miette::miette!(
             "failed to unpack {} for the merged build prefix: {}",

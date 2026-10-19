@@ -104,6 +104,7 @@ tar = "0.4"
 # xz streams toolchain tarballs ship (rust dist = 128 MiB dict).
 xz2 = "0.1"
 libc = "0.2"
+syn = { version = "2", features = ["full", "visit"] }
 clap_complete = "4"
 
 [profile.release]
