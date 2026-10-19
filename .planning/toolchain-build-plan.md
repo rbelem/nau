@@ -191,11 +191,24 @@ stylua clean, all 8 recipes load through `nau build --order`, closure
 order intact, 72/72 source URLs reachable and 72/72 sha256 matching the
 downloaded bytes.
 
-Not verified: the actual payload builds. glibc 2.44 and binutils 2.47
-are source builds and gcc 16.2.0 is a 66-deb fetch-merge; AGENTS.md
-rations heavy compiles to pool workers, and no worker is provisioned
-(`tailscale status` shows no worker node). The bump is a recipe change
-that needs one pool window to become a proven payload.
+Not verified at the time of the bump: the actual payload builds. glibc
+2.44 and binutils 2.47 are source builds and gcc 16.2.0 is a 66-deb
+fetch-merge; AGENTS.md rations heavy compiles to pool workers, and no
+worker is provisioned (`tailscale status` shows no worker node). The
+bump was a recipe change that needed one pool window to become a proven
+payload.
+
+**Superseded 2026-10-19.** The payloads are now BUILT, locally, under a
+50% resource cap (no pool worker, no `HCLOUD_TOKEN`; the operator
+directed a local build on a budget). All four done-predicates are
+green. Three real defects surfaced and were fixed in that run: glibc
+2.44's `libc.so.6` needs a matching 2.44 dynamic loader, which the
+build's loader path and the farm's loader-lib list both broke; m4 and
+gmp needed the `leaks_ok` treatment the sibling recipes already had;
+and the gcc payload's driver shims needed a loader search. The
+run-by-run record, with the measured evidence, is in
+[toolchain-build-plan-evidence.md](toolchain-build-plan-evidence.md)
+(run 7).
 
 ### Resource limit 50%
 

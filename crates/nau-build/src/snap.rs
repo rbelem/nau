@@ -7,6 +7,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use mlua::Value;
 use sha2::Digest;
 
+use crate::prefix_paths::{
+    gconv_dirs as build_prefix_gconv_dirs, ld_flags as build_prefix_ld_flags,
+    ld_library_path as build_prefix_ld_library_path,
+    link_library_path as build_prefix_link_library_path,
+};
 use nau_infra::output;
 use nau_infra::pathsearch::{path_entries, resolve_in_path};
 
@@ -3446,7 +3451,11 @@ fn build_prefix_env(prefix: &str) -> Vec<(&'static str, String)> {
         // the ROOT lib64 while the dev half (ld scripts, crt, .a) lands
         // at usr/lib64 — the linker resolves the clean `libc.so` script
         // to bare `libc.so.6` and only searches -L/LIBRARY_PATH dirs for
-        // it, so the runtime slibdir has to be on this list too.
+        // it, so the runtime slibdir has to be on the LINK list (below).
+        // It is deliberately off the LOADER list: glibc 2.44's libc.so.6
+        // needs a matching 2.44 loader for `__pointer_chk_guard`, and a
+        // foreign loader kills every fortify-compiled tool in the build
+        // (see `build_prefix_ld_library_path`).
         ("LD_LIBRARY_PATH", build_prefix_ld_library_path(prefix)),
         // glibc's iconv() loads its conversion modules from the
         // compiled-in sysconfdir (/usr/lib64/gconv) — inside the sandbox
@@ -3465,64 +3474,11 @@ fn build_prefix_env(prefix: &str) -> Vec<(&'static str, String)> {
         // which exports them for farm-side builds). Without them the shim
         // execs the driver with an empty link/include search and every
         // sanity link dies on unresolvable -lgcc_s/libc (#180 item 2b).
-        ("LIBRARY_PATH", build_prefix_ld_library_path(prefix)),
+        ("LIBRARY_PATH", build_prefix_link_library_path(prefix)),
         ("CPATH", build_prefix_usr_include_dirs(prefix)),
         ("PKG_CONFIG_PATH", build_prefix_pkgconfig_dirs(prefix)),
         ("PKG_CONFIG_SYSROOT_DIR", prefix.to_string()),
     ]
-}
-
-/// The lib dirs `LIBRARY_PATH` exposes for the merged prefix: the same
-/// dirs as the LD list. The gcc payload's cc shims turn these into `-L`
-/// flags (gcc.lua shim contract), so link-time searches — libgcc_s.so.1,
-/// libc_nonshared.a, crt files — resolve against the prefix the same way
-/// loader-time searches do (#180 item 2b). Includes the prefix's root
-/// `lib64` — the glibc payload's slibdir (runtime) half, see
-/// `build_prefix_env` (#180 follow-up: the linker's `libc.so` script
-/// resolves to a bare `libc.so.6` only a listed dir can satisfy).
-///
-/// Foreign-arch caveat (#209 watch item): the triplet dirs are listed
-/// unconditionally, in a FIXED order (x86_64, aarch64, armhf), and the
-/// order is load-bearing the day a payload populates a dir it does not
-/// belong to. Today it is inert — a payload stages only its own arch's
-/// set (gcc.lua selects one deb set per build on
-/// `$CONFIGURE_TARGET`/`uname -m`), so at most one triplet dir exists.
-/// But the loader and the linker both take the FIRST dir carrying a
-/// soname: if a future payload ever stages a foreign arch's libs (or
-/// several arches at once), this amd64-first list would silently prefer
-/// x86_64 libraries for an aarch64/armhf link. Re-order or arch-filter
-/// this list before shipping such a payload — don't rely on the accident.
-fn build_prefix_ld_library_path(prefix: &str) -> String {
-    format!(
-        "{}/usr/lib:{}/usr/lib64:{}/lib64:{}/usr/lib/x86_64-linux-gnu:{}/usr/lib/aarch64-linux-gnu:{}/usr/lib/arm-linux-gnueabihf",
-        prefix, prefix, prefix, prefix, prefix, prefix
-    )
-}
-
-/// The gconv module dirs `GCONV_PATH` exposes for the merged prefix:
-/// the slibdir layout the glibc payload stages (`usr/lib64/gconv` — the
-/// same root-lib64 half the LD list covers) plus the Debian-style
-/// `usr/lib/gconv` other payloads may ship. glibc searches each dir for
-/// its gconv-modules cache and ignores missing ones, so listing both
-/// layouts unconditionally is safe.
-fn build_prefix_gconv_dirs(prefix: &str) -> String {
-    format!("{}/usr/lib64/gconv:{}/usr/lib/gconv", prefix, prefix)
-}
-
-/// The `-L` list `LDFLAGS` exposes for the merged prefix: one flag per
-/// dir of [`build_prefix_ld_library_path`], same order. Configure,
-/// meson, and libtool link probes read `LDFLAGS` directly — without the
-/// multiarch entries a link line that bypasses the gcc cc shim's
-/// LIBRARY_PATH→-L translation searched `{prefix}/usr/lib` only and
-/// missed the deb payloads' multiarch-staged libs (#209 watch item).
-/// The first flag is unchanged (`usr/lib` keeps priority), so existing
-/// consumers' search order only widens.
-fn build_prefix_ld_flags(prefix: &str) -> String {
-    build_prefix_ld_library_path(prefix)
-        .split(':')
-        .map(|dir| format!("-L{dir}"))
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// The include/pc dirs the merged prefix serves: the deb payloads keep
@@ -10907,13 +10863,16 @@ fi
         assert_eq!(
             get("LD_LIBRARY_PATH"),
             "/nau-build-prefix/usr/lib:/nau-build-prefix/usr/lib64:\
-             /nau-build-prefix/lib64:\
              /nau-build-prefix/usr/lib/x86_64-linux-gnu:\
              /nau-build-prefix/usr/lib/aarch64-linux-gnu:\
              /nau-build-prefix/usr/lib/arm-linux-gnueabihf",
             "prefix-built ELFs carry no RUNPATH (#12) — build-time execs \
              resolve merged libs through this var; the deb-gcc multiarch \
-             dir rides along for cc1's own DT_NEEDED (#180)"
+             dir rides along for cc1's own DT_NEEDED (#180). The root \
+             lib64 (glibc's runtime slibdir) is deliberately absent: \
+             glibc 2.44's libc.so.6 needs a matching 2.44 loader for \
+             __pointer_chk_guard, and a foreign loader kills every \
+             fortify-compiled tool in the build"
         );
         assert_eq!(
             get("PKG_CONFIG_PATH"),

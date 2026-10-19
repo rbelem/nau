@@ -28,6 +28,7 @@ pub mod confine;
 pub mod desktop;
 pub mod farm;
 pub mod fonts;
+pub mod loader_libs;
 pub mod pod;
 pub mod secrets;
 

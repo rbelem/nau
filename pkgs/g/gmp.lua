@@ -19,6 +19,15 @@ for building GCC, MPFR, and MPC.]],
         -- .asm files through m4; the sandbox toolchain ships none, so the
         -- pool m4 must be on the build PATH (merged build prefix, ADR-0018).
         build_deps = { "m4" },
+        -- The build's compiler bakes RUNPATH entries for the merged build
+        -- prefix into the produced libraries — the nix gcc wrapper's
+        -- documented case (leak_scan: "the nix gcc wrapper bakes
+        -- RUNPATH=/nau-build-prefix/usr/lib into produced binaries"). The
+        -- path does not exist at pod runtime, so the entry is inert there;
+        -- inside a build sandbox it is exactly where the prefix is bound.
+        -- Both spellings are listed, the autoconf/automake/binutils/make
+        -- precedent.
+        leaks_ok = { "/nau-build-prefix/usr/lib64", "/nau-build-prefix/usr/lib" },
         source = { url = "https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz" },
         build = table.concat({
             -- CFLAGS -O2 -std=gnu17: GMP 6.3.0's configure "long long

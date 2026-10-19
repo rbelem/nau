@@ -68,6 +68,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+pub use crate::loader_libs::loader_lib_dirs;
 use nau_core::generation_view::StoreView;
 use nau_core::pkg_manifest::{Generation, InstalledPackage};
 
@@ -116,29 +117,6 @@ pub const ENV_FILE: &str = "env.json";
 /// resolve at serve time (ADR-0042 D3), and the lockfile gains nothing.
 pub const SECRETS_FILE: &str = "secrets.json";
 
-/// The payload-relative lib directories the loader seam records.
-/// `usr/usr/lib` is the pool's libdir convention (`--prefix=/usr`);
-/// `usr/usr/lib64` is the glibc/toolchain layout. `usr/usr/libexec`
-/// holds non-linkable helpers and is never a search dir. The Debian
-/// multiarch dir (`usr/usr/lib/x86_64-linux-gnu`) covers deb-payload
-/// recipes (issue #164): trixie splits shared libs into it, and cc1's
-/// DT_NEEDED (libisl, libmpfr, ...) only resolves when it is listed.
-/// `usr/lib64` covers rootfs-layout payloads staged with `install_root`
-/// semantics (issue #164: glibc's slibdir /lib64 lands at usr/lib64 and
-/// holds the runtime sonames — libc.so.6 — that a bare-soname ld script
-/// GROUP must resolve through -L). `usr/lib` is NOT a key: the emit
-/// writes `usr/lib/extension-release` into every extension
-/// (runtime.rs), so the dir always exists and would wrap every app in
-/// every pod. A subdirectory of a recorded dir is NOT itself recorded —
-/// the loader searches only the listed dirs. Every entry is stat-gated
-/// at emit, so layouts a payload does not ship are never recorded.
-const LOADER_LIB_SUBDIRS: [&str; 4] = [
-    "usr/usr/lib",
-    "usr/usr/lib64",
-    "usr/usr/lib/x86_64-linux-gnu",
-    "usr/lib64",
-];
-
 /// Path of generation `n`'s loader-lib list.
 pub fn loader_libs_path(store: &StoreView, n: u64) -> PathBuf {
     store.generation_dir(n).join(LOADER_LIBS_FILE)
@@ -152,28 +130,6 @@ pub fn env_path(store: &StoreView, n: u64) -> PathBuf {
 /// Path of generation `n`'s recorded secret references.
 pub fn secrets_path(store: &StoreView, n: u64) -> PathBuf {
     store.generation_dir(n).join(SECRETS_FILE)
-}
-
-/// Collect the generation's loader-lib dirs, higher composition layer
-/// first ([`layered_packages`] reversed — the loader's first-match
-/// search must resolve a shared soname to the highest layer, the same
-/// precedence the farm's shared-name overwrite encodes), package name
-/// ascending within a layer. Only dirs that exist in the freshly
-/// staged tree are recorded — the emit runs right after materialization,
-/// so the stat is authoritative and no manifest schema changes.
-pub fn loader_lib_dirs(store: &StoreView, gen: &Generation) -> Vec<String> {
-    let extensions = store.generation_dir(gen.n).join("extensions");
-    let mut dirs: Vec<(ClaimLayer, String, String)> = Vec::new();
-    for pkg in layered_packages(gen) {
-        for sub in LOADER_LIB_SUBDIRS {
-            let rel = format!("extensions/{}/{}", pkg.name, sub);
-            if extensions.join(&pkg.name).join(sub).is_dir() {
-                dirs.push((pkg.layer, pkg.name.clone(), rel));
-            }
-        }
-    }
-    dirs.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    dirs.into_iter().map(|(_, _, rel)| rel).collect()
 }
 
 /// Record the generation's loader-lib dirs (issue #89). Written on

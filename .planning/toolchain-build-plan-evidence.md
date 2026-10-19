@@ -177,3 +177,63 @@ the plan keeps to the summary and the decisions.
   (artifacts + this validation evidence): correctness 6.9 → 7.9, every
   other metric flat or up, zero regressions. luacheck 0 warnings, stylua
   clean.
+
+- Run 7 (2026-10-19, LOCAL build at 16.2.0 under a 50% resource cap).
+  The 16.2.0 payloads are now BUILT, not only statically verified. No
+  pool worker was used: `tailscale status` listed none and no
+  `HCLOUD_TOKEN` was present, so the operator directed a local build on a
+  budget. The cap is proven live, not just configured: the governor
+  created `.../nau-build/cpu.max = 600000 100000` (6 of 12 CPUs) and
+  `nr_periods 2780 / nr_throttled 1853` climbed during the run, while
+  the build's `MAKEFLAGS` was `-j6` (`clamp_jobs` reads the cgroup quota,
+  so the job count and the quota agree).
+
+  Host preparation, both steps documented in issue #4 and the
+  nau-sandbox-gotchas contract: `nix profile install nixpkgs#bison`
+  (glibc's configure demands bison and the sandbox sees the profile
+  because it canonicalizes under the `/nix` bind root), and a fresh pod
+  `tchain16` seeded with the five unchanged closure payloads (gmp, mpc,
+  zlib, m4, make) carrying BOTH sidecars so the content check verifies
+  rather than baselines.
+
+  Three real defects surfaced, each fixed in this run:
+  1. glibc 2.44's `libc.so.6` references `__pointer_chk_guard` as
+     `UND@GLIBC_PRIVATE`: the symbol moved into the dynamic loader, so
+     only a matching 2.44 loader can satisfy it. A loader from another
+     build cannot, and every fortify-compiled binary in the build dies
+     ("symbol lookup error: ... undefined symbol: __pointer_chk_guard,
+     version GLIBC_PRIVATE"). Measured with nixpkgs' own glibc 2.44 AND
+     with the source-built 2.44, so it is a glibc-2.44 property, not a
+     payload defect. The build's runtime `LD_LIBRARY_PATH` no longer
+     carries the prefix's runtime slibdir; `LIBRARY_PATH` and `LDFLAGS`
+     still do, so the link is unchanged.
+  2. m4 and gmp built binaries carrying a RUNPATH into the merged build
+     prefix, which the leak scan refuses. Both recipes now declare
+     `leaks_ok` for the prefix paths, the same treatment make, mpc,
+     mpfr, zlib, isl and gawk already had.
+  3. The farm's loader-lib list carried the glibc extension's runtime
+     half, so the pod's binaries loaded the pod's glibc under the HOST's
+     loader: the gcc driver, cc1, cc1plus and the binutils shims all
+     died on the same symbol. The farm has no per-pod rootfs to pair a C
+     library with its loader, so the C library's runtime half stays off
+     the farm's loader path. The build sandbox and the toolchain meta's
+     own launcher already omitted it; the farm was the one inconsistent
+     face. The gcc payload's cc/c++ and binutils shims also gained a
+     loader search, so a driver started through them runs on a matching
+     loader.
+
+  Predicate results (2026-10-19, pod `tchain16` generation 3):
+
+  | # | Predicate | Verdict |
+  |---|---|---|
+  | 1 | `nau pod add toolchain` reconciles green | VERIFIED (generation 3, all twelve packages installed at their bumped versions: gcc 16.2.0, glibc 2.44, libgcc 16.2.0, linux-headers 7.2.8, mpfr 4.2.2, isl 0.28) |
+  | 2 | `gcc`/`g++` version + C and C++ compile and run through the farm | VERIFIED (`x86_64-linux-gnu-gcc-16 (Debian 16.2.0-3) 16.2.0`; C exits 42, C++ exits 3; the C binary NEEDs `libc.so.6`, the C++ binary NEEDs `libstdc++.so.6`) |
+  | 3 | `test-fixtures/toolchain-gcc-probe.lua` builds green | VERIFIED (`toolchain-gcc-probe: C and C++ builds green`, a 12-payload merged prefix) |
+  | 4 | A `build_deps = { "toolchain" }` consumer compiles | VERIFIED by the same probe (its `build_deps` is the alias) |
+
+  Still open: the runtime closure lane does no content check
+  (`PodContentCheck::Off`), so a meta payload is NOT rebuilt when one of
+  its members' recipe changes — the drift probe names it ("recipe drift:
+  toolchain (recipe changed)") and the payload is reused anyway. The
+  refresh verb's "rebuild byte-identical" verdict compounds it. Filed
+  as issue #5.

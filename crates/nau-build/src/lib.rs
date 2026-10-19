@@ -18,6 +18,7 @@
 pub mod build_prefix;
 pub mod cache;
 pub mod leak_scan;
+pub mod prefix_paths;
 pub mod snap;
 pub mod source_cache;
 pub mod source_fetch;
