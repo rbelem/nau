@@ -153,7 +153,8 @@ pub struct JobResult {
 /// Decision 6): serde_json with sorted object keys plus the array members
 /// sorted — pins by URL, closure by sha256 — so two coordinators produce
 /// the same bytes for the same job. The transport-local `payload_dir` and
-/// `resource_limit` are stripped: they describe execution, not job content.
+/// the execution-only `resource_limit` are stripped: neither describes job
+/// content.
 pub fn canonical_manifest_bytes(manifest: &JobManifest) -> miette::Result<Vec<u8>> {
     let mut value = serde_json::to_value(manifest)
         .map_err(|e| miette::miette!("worker-job: cannot canonicalize the job manifest: {e}"))?;

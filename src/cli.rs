@@ -511,7 +511,7 @@ pub struct BuildArgs {
     pub offline: bool,
 
     /// Percent of online CPUs. 80% allows 9.6 cores on a 12-CPU host.
-    /// This is not systemd CPUQuota. 100% can CFS tail-shave; use `off` to disable.
+    /// This is not systemd CPUQuota. 100% still throttles at each period boundary; use `off` to disable.
     #[arg(long, value_name = "PERCENT|off")]
     pub resource_limit: Option<String>,
 
@@ -585,7 +585,7 @@ pub struct ImageArgs {
     pub lockfile: String,
 
     /// Percent of online CPUs. 80% allows 9.6 cores on a 12-CPU host.
-    /// This is not systemd CPUQuota. 100% can CFS tail-shave; use `off` to disable.
+    /// This is not systemd CPUQuota. 100% still throttles at each period boundary; use `off` to disable.
     #[arg(long, value_name = "PERCENT|off")]
     pub resource_limit: Option<String>,
 
