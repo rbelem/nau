@@ -1504,28 +1504,6 @@ fn print_refresh_restarts(report: &crate::secrets::SecretsRefreshReport) {
     }
 }
 
-/// Render `nau pod list` output: one spec + resolved version per
-/// line (float-marked per ADR-0017), or an empty-pod notice.
-fn print_pod_packages(pod_name: &str, entries: &[crate::pod::PodListEntry]) {
-    if entries.is_empty() {
-        crate::output::info(format!("pod '{pod_name}' has no packages"));
-        return;
-    }
-    let width = entries.iter().map(|e| e.spec.len()).max().unwrap_or(0);
-    for entry in entries {
-        let version = entry.version.as_deref().unwrap_or("(unresolved)");
-        // Float marking (ADR-0017): floating packages say so.
-        let tag = if entry.floating { " (float)" } else { "" };
-        crate::output::status(format!(
-            "{:<width$}  {}{}",
-            entry.spec,
-            version,
-            tag,
-            width = width
-        ));
-    }
-}
-
 /// Resolve the effective pod name from the two `--name` positions
 /// (issue #4): before-verb (`nau pod --name X <verb>`) and
 /// after-verb (`nau pod <verb> --name X`). Both given and equal →
@@ -1757,7 +1735,7 @@ pub fn cmd_pod(name: Option<&str>, sub: PodCommand) -> miette::Result<()> {
         PodCommand::List { root, .. } => {
             let root = crate::pod::pod_root(root.as_deref());
             let entries = crate::pod::list_packages(&root, pod_name)?;
-            print_pod_packages(pod_name, &entries);
+            crate::pod::print_pod_packages(pod_name, &entries);
             Ok(())
         }
         PodCommand::Shellenv { json, root, .. } => cmd_pod_shellenv(pod_name, json, root),

@@ -18,6 +18,7 @@ pub mod leak_scan;
 pub mod pkg_manifest;
 pub mod plugins;
 pub mod pod;
+mod pod_content;
 pub mod provision;
 pub mod pull_peer;
 pub mod runtime;
