@@ -83,17 +83,17 @@ export CARGO_INCREMENTAL=0
 # under a foreign consumer (a dev-loop sync spawning children from
 # target/debug; a clean mid-flight). The flock is the truth (a dead
 # holder releases it); the advert line is the readable holder name.
-mkdir -p target
-exec 9>>target/.claim
+CLAIM_FILE="$(bash scripts/target-claim.sh path)"
+exec 9>>"$CLAIM_FILE"
 if ! flock -n 9; then
     echo "gate: FAIL — target/ is held by:" >&2
-    echo "  $(cat target/.claim 2>/dev/null || echo '(no advert file)')" >&2
-    echo "  wait for the holder; only clear target/.claim if it is" \
-         "provably stale (#349)." >&2
+    echo "  $(cat "$CLAIM_FILE" 2>/dev/null || echo '(no advert file)')" >&2
+    echo "  wait for the holder; proceed only if it is provably dead" \
+         "(the lock, not the file, decides, #349)." >&2
     exit 2
 fi
-printf '%s gate %s\n' "$$" "$(date -Is)" >target/.claim
-trap 'flock -u 9; : > target/.claim' EXIT
+printf '%s gate %s\n' "$$" "$(date -Is)" >"$CLAIM_FILE"
+trap 'flock -u 9; : > "$CLAIM_FILE" 2>/dev/null || true' EXIT
 echo "gate: claim axis: target/ claimed (pid $$)"
 
 # ── Gated-suite tool preflight (#291): a tool absent in the gate is a
@@ -153,6 +153,12 @@ fi
 # the long axes: a violating edge fails the gate in seconds.
 echo "gate: dep-direction (ADR-0051 R1): checking workspace edges"
 bash scripts/dep-direction.sh
+
+# Only target-clean.sh may invoke cargo clean, and it must hold the
+# claim. A new cleaner that bypasses the channel would delete artifacts
+# under a live run, so this check fails the gate instead.
+echo "gate: target-writes: only the claim holder cleans"
+bash scripts/target-writes.sh
 
 # ── luau dup-dep tripwire (luau-dedupe lane, 2026-10-03): the vendored
 # analyzer build resolves Ast/Config/VM against mlua's luau0-src objects
