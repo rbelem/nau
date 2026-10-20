@@ -409,13 +409,10 @@ pub(crate) fn collect_dep_graph(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for (_name, meta) in iter {
-        let seeds = crate::deps::build_dep_seeds(meta);
-        if !seeds.is_empty() {
-            if let Ok(deps) = crate::deps::resolve_deps(&seeds, true) {
-                for node in deps {
-                    if seen.insert(node.name.clone()) {
-                        nodes.push(node);
-                    }
+        if let Ok(deps) = crate::deps::resolve_build_dep_nodes(meta) {
+            for node in deps {
+                if seen.insert(node.name.clone()) {
+                    nodes.push(node);
                 }
             }
         }
@@ -456,7 +453,7 @@ fn ensure_build_prefix(
     if seeds.is_empty() {
         return Ok(None);
     }
-    let closure_names = crate::deps::resolve_dep_names(&seeds, true)?;
+    let closure_names = crate::deps::resolve_build_dep_names(meta)?;
     let mut payloads = Vec::new();
     for name in closure_names {
         let dep_meta = crate::deps::load_meta(&name)?;

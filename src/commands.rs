@@ -187,7 +187,7 @@ fn report_order_json(meta: &crate::snap::SnapMeta) {
         return;
     }
     let seen: std::collections::HashSet<&str> = seeds.iter().map(|s| s.as_str()).collect();
-    if let Ok(order) = crate::deps::resolve_dep_names(&seeds, true) {
+    if let Ok(order) = crate::deps::resolve_build_dep_names(meta) {
         for dep in &order {
             let kind = if seen.contains(dep.as_str()) {
                 "direct"
@@ -225,7 +225,7 @@ fn report_order_human(meta: &crate::snap::SnapMeta) {
 
     eprintln!("  Resolved build order (transitive):");
     let seeds = crate::deps::build_dep_seeds(meta);
-    match crate::deps::resolve_dep_names(&seeds, true) {
+    match crate::deps::resolve_build_dep_names(meta) {
         Ok(order) => {
             let seen: std::collections::HashSet<&str> = seeds.iter().map(|s| s.as_str()).collect();
             for dep in &order {
