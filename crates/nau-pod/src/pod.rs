@@ -19,7 +19,6 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use nau_core::generation_view::StoreView;
-use nau_core::lock::LockFile;
 use serde::Serialize;
 
 // The secret-reference grammar lives beside its resolver
@@ -42,10 +41,9 @@ pub fn pod_lua_path(root: &Path, pod_name: &str) -> PathBuf {
     nau_core::paths::pod_dir(root, pod_name).join(POD_FILE)
 }
 
-/// Path to a pod's lockfile.
-pub fn pod_lock_path(root: &Path, pod_name: &str) -> PathBuf {
-    nau_core::paths::pod_dir(root, pod_name).join(LockFile::FILENAME)
-}
+// Lockfile discovery (issue #3): `nau.lock` writes, either name reads.
+pub mod lockfile;
+pub use lockfile::{load_pod_lock, pod_lock_path};
 
 // ── Package specs ──
 
@@ -381,7 +379,7 @@ fn refuse_loaded_blob_pins(
                 continue;
             }
             let loaded_decl = load(loaded)?;
-            if let Some(lock) = LockFile::load(&pod_lock_path(root, loaded))? {
+            if let Some(lock) = load_pod_lock(root, loaded)? {
                 let mut pins: Vec<String> = lock.snaps.keys().cloned().collect();
                 pins.sort();
                 if !pins.is_empty() {

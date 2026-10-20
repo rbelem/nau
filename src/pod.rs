@@ -99,10 +99,15 @@ pub use nau_core::paths::{pod_dir, resolve_pod_dir_under, validate_pod_name, DEF
 // parameter there (eval stays root, mlua-direct); the wrappers below
 // keep the original signatures, injecting [`load_declaration`].
 pub use nau_pod::pod::{
-    parse_pod_package, pod_lock_path, pod_lua_path, render_pod_source, render_shellenv, shellenv,
-    shellenv_with, PodDeclaration, PodPackageSpec, PodShellenv, POD_FILE,
+    load_pod_lock, parse_pod_package, pod_lock_path, pod_lua_path, render_pod_source,
+    render_shellenv, shellenv, shellenv_with, PodDeclaration, PodPackageSpec, PodShellenv,
+    POD_FILE,
 };
 pub use nau_pod::secrets::SecretSource;
+
+// `pod list` (issue #3): resolution and rendering, moved for size.
+pub mod list_view;
+pub use list_view::{list_packages, print as print_pod_packages};
 
 /// Validate a pod's `loads` BEFORE any mutation (existence + cycles +
 /// the blob-pin refusal). Root wrapper: injects the eval-coupled
@@ -1108,11 +1113,16 @@ pub struct PodListEntry {
     pub spec: String,
     pub name: String,
     pub constraint: Option<String>,
-    /// Resolved version: the lockfile pin when present, else a live
+    /// Resolved version: the installed version when the pod's active
+    /// generation has one, else the lockfile pin, else a live recipe
     /// resolution, else `None` (shown as unresolved).
     pub version: Option<String>,
     /// True when the version came from the lockfile pin.
     pub pinned: bool,
+    /// Which of the three sources [`Self::version`] came from (issue
+    /// #3) — the rendered column that tells a pin from a recipe match
+    /// from an installed record.
+    pub source: list_view::VersionSource,
     /// Float mode (ADR-0017, issue #13): the package opts in via its
     /// declaration or a pod overlay; sync re-resolves its closure.
     pub floating: bool,
@@ -1340,7 +1350,7 @@ fn loaded_contribution(root: &Path, pod_name: &str) -> miette::Result<LoadedCont
     // carries but the declaration no longer mentions (a line/constraint
     // move pending its next sync): the lockfile pin's constraint is what
     // the executing content was selected with.
-    let lock = LockFile::load(&pod_lock_path(root, pod_name))?.unwrap_or_else(LockFile::empty);
+    let lock = load_pod_lock(root, pod_name)?.unwrap_or_else(LockFile::empty);
     // Union (issue #103): what the pod EXECUTES (its active generation)
     // is the base and wins every name clash; its declaration folds in
     // beneath with `or_insert` so declaration-only names — resolved
@@ -1490,7 +1500,7 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
         load_spec_meta(&spec).map_err(|e| miette::miette!("cannot add '{}': {e}", spec.name))?;
 
     let mut decl = load_declaration_or_default(root, pod_name)?;
-    let lock = LockFile::load(&pod_lock_path(root, pod_name))?;
+    let lock = load_pod_lock(root, pod_name)?;
     for existing in &decl.packages {
         let parsed = parse_pod_package(existing)?;
         if parsed.name == spec.name {
@@ -1563,7 +1573,7 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
     write_pod_declaration(&decl_path, &render_pod_source(&decl))?;
 
     let lock_path = pod_lock_path(root, pod_name);
-    let mut lock = LockFile::load(&lock_path)?.unwrap_or_else(LockFile::empty);
+    let mut lock = load_pod_lock(root, pod_name)?.unwrap_or_else(LockFile::empty);
     // Re-adding keeps an existing deps pin (ADR-0017): the closure content
     // did not change — the next sync re-verifies it as usual.
     let existing_deps = lock.packages.get(&spec.name).and_then(|e| e.deps.clone());
@@ -1682,7 +1692,7 @@ pub fn add_snap_pod(
     let dir = pod_dir(root, pod_name);
     let decl = load_declaration_or_default(root, pod_name)?;
     let lock_path = pod_lock_path(root, pod_name);
-    let mut lock = LockFile::load(&lock_path)?.unwrap_or_else(LockFile::empty);
+    let mut lock = load_pod_lock(root, pod_name)?.unwrap_or_else(LockFile::empty);
     // (filename, pinned sha3-384) when the filename names a package the
     // pod already blob-pins — the cheap re-add/divergence probe.
     let pinned_name = crate::oci::parse_artifact_filename(payload)
@@ -2372,7 +2382,7 @@ pub fn remove_package(
     write_pod_declaration(&decl_path, &render_pod_source(&decl))?;
 
     let lock_path = pod_lock_path(root, pod_name);
-    if let Some(mut lock) = LockFile::load(&lock_path)? {
+    if let Some(mut lock) = load_pod_lock(root, pod_name)? {
         lock.packages.remove(&spec.name);
         // A sideloaded package's blob pin goes with it (issue #116): a
         // stale `snaps` entry would hold a future re-add of the same
@@ -2581,7 +2591,7 @@ pub fn rebuild_package(
     // repinned) lockfile pin, else a live resolution. The deps pin
     // beside it names the moved closure (ADR-0017 Decision 5: the
     // lockfile IS the pin record).
-    let lock = LockFile::load(&pod_lock_path(root, pod_name))?.unwrap_or_else(LockFile::empty);
+    let lock = load_pod_lock(root, pod_name)?.unwrap_or_else(LockFile::empty);
     let entry = lock.packages.get(&spec.name);
     let version = entry
         .map(|e| e.version.as_str())
@@ -2743,7 +2753,7 @@ pub fn update_pod(
     }
 
     let lock_path = pod_lock_path(root, pod_name);
-    let mut lock = LockFile::load(&lock_path)?.unwrap_or_else(LockFile::empty);
+    let mut lock = load_pod_lock(root, pod_name)?.unwrap_or_else(LockFile::empty);
     let mut moves = Vec::new();
     let mut skipped = Vec::new();
     for spec_str in &decl.packages {
@@ -2940,7 +2950,7 @@ pub fn rollback_pod_with(
     // so every mutating verb now fails named. Name the stranded pins in
     // the report instead of letting the next verb surprise.
     let mut blob_pins_without_content = Vec::new();
-    if let Some(lock) = LockFile::load(&pod_lock_path(root, pod_name))? {
+    if let Some(lock) = load_pod_lock(root, pod_name)? {
         for (name, pin) in &lock.snaps {
             let carried = gen
                 .packages
@@ -3161,8 +3171,7 @@ pub fn refresh_pod(
         .iter()
         .filter_map(|spec| parse_pod_package(spec).ok().map(|p| p.name))
         .collect();
-    let lock_path = pod_lock_path(root, pod_name);
-    let lock = LockFile::load(&lock_path)?.unwrap_or_else(LockFile::empty);
+    let lock = load_pod_lock(root, pod_name)?.unwrap_or_else(LockFile::empty);
     for member in members {
         if lock.snaps.contains_key(member) {
             miette::bail!(
@@ -3407,7 +3416,7 @@ fn declaring_pod_deps_pin(
     let Some(pod) = source_pod else {
         return Ok(None);
     };
-    let lock = LockFile::load(&pod_lock_path(ctx.root, pod))?;
+    let lock = load_pod_lock(ctx.root, pod)?;
     Ok(lock.and_then(|l| l.packages.get(name).and_then(|e| e.deps.clone())))
 }
 
@@ -4282,7 +4291,7 @@ fn prepare_reconcile(
     // loaded pod.
     let (loaded_versions, loaded_overlays) = loaded_contributions(root, &decl)?;
     let lock_path = pod_lock_path(root, pod_name);
-    let lock = LockFile::load(&lock_path)?.unwrap_or_else(LockFile::empty);
+    let lock = load_pod_lock(root, pod_name)?.unwrap_or_else(LockFile::empty);
     Ok(ReconcileState {
         root: root.to_path_buf(),
         pod_name: pod_name.to_string(),
@@ -5258,7 +5267,7 @@ fn loaded_float_hold_record<'a>(
     // lockfile is an error (the declaring_pod_deps_pin contract): we
     // cannot know whether the inputs moved, so a silent skip could let
     // a drift ride a hold.
-    let lock = match LockFile::load(&pod_lock_path(ctx.root, pod))? {
+    let lock = match load_pod_lock(ctx.root, pod)? {
         Some(lock) => lock,
         None => return Ok(None),
     };
@@ -7028,59 +7037,6 @@ fn build_pending_snap_at(
     }
 }
 
-/// List a pod's packages with resolved versions. Read verbs do not
-/// initialize pods: an unknown pod (no `pod.lua`) is a clear error —
-/// `nau pod add` is what initializes a pod.
-pub fn list_packages(root: &Path, pod_name: &str) -> miette::Result<Vec<PodListEntry>> {
-    validate_pod_name(pod_name)?;
-    let decl_path = pod_lua_path(root, pod_name);
-    if !decl_path.exists() {
-        miette::bail!(
-            "pod '{pod_name}' has no declaration at {} (read verbs do not \
-             initialize pods; `nau pod --name {pod_name} add <package>` does)",
-            decl_path.display()
-        );
-    }
-    let decl = evaluate_pod_file(&decl_path)?;
-    let lock = LockFile::load(&pod_lock_path(root, pod_name))?;
-
-    let mut entries = Vec::new();
-    for spec_str in &decl.packages {
-        let spec = parse_pod_package(spec_str)?;
-        let pin = lock
-            .as_ref()
-            .and_then(|l| l.packages.get(&spec.name))
-            .map(|e| e.version.clone());
-        let (version, pinned) = match pin {
-            Some(v) => (Some(v), true),
-            None => match load_spec_meta(&spec) {
-                Ok(meta) => (Some(meta.version), false),
-                Err(_) => (None, false),
-            },
-        };
-        // Float marking (ADR-0017): the overlay wins, else the
-        // declaration itself. Resolution failure is not a float.
-        let floating = match decl
-            .overlay
-            .get(&spec.name)
-            .and_then(|p| p.get("floating"))
-            .and_then(|v| v.as_bool())
-        {
-            Some(b) => b,
-            None => load_spec_meta(&spec).map(|m| m.floating).unwrap_or(false),
-        };
-        entries.push(PodListEntry {
-            spec: spec_str.clone(),
-            name: spec.name,
-            constraint: spec.constraint,
-            version,
-            pinned,
-            floating,
-        });
-    }
-    Ok(entries)
-}
-
 // ── Dependency fetch (ADR-0017, issue #13) ──
 
 /// One fetched (or verified) dependency closure in a
@@ -7129,7 +7085,7 @@ pub fn fetch_pod_deps(
         .map_err(|e| miette::miette!("failed to create {}: {e}", dir.display()))?;
     let store = pod_store(&dir);
     let lock_path = pod_lock_path(root, pod_name);
-    let mut lock = LockFile::load(&lock_path)?.unwrap_or_else(LockFile::empty);
+    let mut lock = load_pod_lock(root, pod_name)?.unwrap_or_else(LockFile::empty);
 
     let mut report = DepsFetchReport {
         pod: pod_name.to_string(),
