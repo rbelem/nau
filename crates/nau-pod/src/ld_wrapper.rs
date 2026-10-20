@@ -270,12 +270,12 @@ fn namespace_body(
         ns.rootfs.loader_rel,
         shell_quote_str(&format!("/lib64/{}", crate::rootfs::LOADER_NAME))
     ));
-    body.push_str(&format!(
+    body.push_str(
         "  --setenv LD_LIBRARY_PATH \"$libs\" \
          --setenv LIBRARY_PATH \"$libs\" \
          --setenv CPATH \"$cpath\" \
-         --setenv COMPILER_PATH \"$compath\" \\\n"
-    ));
+         --setenv COMPILER_PATH \"$compath\" \\\n",
+    );
     body.push_str(&format!("  -- \"$d/../farm/{real_target}\" \"$@\"\n"));
     body
 }
