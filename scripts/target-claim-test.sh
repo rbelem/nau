@@ -150,6 +150,12 @@ out=$(bash "$WRITES" "$fixture" 2>&1) || rc=$?
 assert_rc "the guardrail fails on a cleaner outside target-clean.sh" 1 "$rc"
 assert_contains "the guardrail names the offending script" "sneaky-clean.sh" "$out"
 rm "$fixture/sneaky-clean.sh"
+printf '#!/usr/bin/env bash\nCARGO_TARGET_DIR=/tmp cargo clean\n' >"$fixture/env-clean.sh"
+rc=0
+out=$(bash "$WRITES" "$fixture" 2>&1) || rc=$?
+assert_rc "the guardrail fails on an env-prefixed clean" 1 "$rc"
+assert_contains "the guardrail names the env-prefixed cleaner" "env-clean.sh" "$out"
+rm "$fixture/env-clean.sh"
 rc=0
 bash "$WRITES" "$fixture" >/dev/null 2>&1 || rc=$?
 assert_rc "the guardrail passes when only target-clean.sh cleans" 0 "$rc"

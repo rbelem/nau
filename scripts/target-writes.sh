@@ -16,10 +16,15 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 ROOT="${1:-scripts}"
 
+# A cargo clean in command position, with the prefixes a shell script
+# actually uses: an env assignment, `env`, `exec`, `command`. A cleaner
+# that hid behind one of them would otherwise pass the gate.
+CLEAN_RE='^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+[[:space:]]+)*(env[[:space:]]+)?(exec[[:space:]]+|command[[:space:]]+)?cargo[[:space:]]+clean([[:space:]]|$)'
+
 cleaners=$(
     while IFS= read -r -d '' file; do
         if head -1 "$file" | grep -qE '^#!.*(sh|bash)' &&
-            grep -qE '^[[:space:]]*(exec[[:space:]]+)?cargo clean([[:space:]]|$)' "$file"; then
+            grep -qE "$CLEAN_RE" "$file"; then
             printf '%s\n' "$file"
         fi
     done < <(find "$ROOT" -type f -print0)

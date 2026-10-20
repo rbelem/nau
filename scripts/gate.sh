@@ -83,14 +83,13 @@ export CARGO_INCREMENTAL=0
 # under a foreign consumer (a dev-loop sync spawning children from
 # target/debug; a clean mid-flight). The flock is the truth (a dead
 # holder releases it); the advert line is the readable holder name.
-mkdir -p target
 CLAIM_FILE="$(bash scripts/target-claim.sh path)"
 exec 9>>"$CLAIM_FILE"
 if ! flock -n 9; then
     echo "gate: FAIL — target/ is held by:" >&2
     echo "  $(cat "$CLAIM_FILE" 2>/dev/null || echo '(no advert file)')" >&2
-    echo "  wait for the holder; only clear $CLAIM_FILE if it is" \
-         "provably stale (#349)." >&2
+    echo "  wait for the holder; proceed only if it is provably dead" \
+         "(the lock, not the file, decides, #349)." >&2
     exit 2
 fi
 printf '%s gate %s\n' "$$" "$(date -Is)" >"$CLAIM_FILE"
