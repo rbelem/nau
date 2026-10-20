@@ -14,8 +14,8 @@
 //! fast, and only `ETXTBSY` is retried: a missing or non-executable
 //! program will not heal by waiting.
 
-use std::io;
 use std::ffi::OsStr;
+use std::io;
 use std::process::Output;
 use std::time::Duration;
 
@@ -81,7 +81,10 @@ mod tests {
 
     /// A spawn that fails `busy` times with a synthesized `ETXTBSY` and
     /// then answers `Ok("ran")`.
-    fn scripted(busy: u32, calls: &std::cell::Cell<u32>) -> impl FnMut() -> io::Result<&'static str> + '_ {
+    fn scripted(
+        busy: u32,
+        calls: &std::cell::Cell<u32>,
+    ) -> impl FnMut() -> io::Result<&'static str> + '_ {
         move || {
             calls.set(calls.get() + 1);
             if calls.get() <= busy {

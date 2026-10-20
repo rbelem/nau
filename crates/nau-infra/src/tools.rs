@@ -697,29 +697,23 @@ fn stage_verified(spec: &ToolSpec, src: &mut dyn Read, stage_bin: &Path) -> Tool
 /// provision over.
 fn exec_probe(path: &Path, tool: &str) -> ToolsResult<()> {
     match crate::spawn_retry::spawn(|| crate::command::RealRunner::run_path(path, &["--version"])) {
-        Ok(out) if out.code == 0 => return Ok(()),
-        Ok(out) => {
-            return Err(ToolsError::ProbeFailed {
-                tool: tool.into(),
-                detail: match out.code {
-                    code if code >= 0 => format!("`--version` exited with status {code}"),
-                    _ => "`--version` was killed by a signal".into(),
-                },
-            });
-        }
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-            return Err(ToolsError::Noexec {
-                tool: tool.into(),
-                path: path.to_path_buf(),
-                source: e,
-            });
-        }
-        Err(e) => {
-            return Err(io_context(
-                format!("spawn '{tool}' for the exec probe at {}", path.display()),
-                e,
-            ));
-        }
+        Ok(out) if out.code == 0 => Ok(()),
+        Ok(out) => Err(ToolsError::ProbeFailed {
+            tool: tool.into(),
+            detail: match out.code {
+                code if code >= 0 => format!("`--version` exited with status {code}"),
+                _ => "`--version` was killed by a signal".into(),
+            },
+        }),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Err(ToolsError::Noexec {
+            tool: tool.into(),
+            path: path.to_path_buf(),
+            source: e,
+        }),
+        Err(e) => Err(io_context(
+            format!("spawn '{tool}' for the exec probe at {}", path.display()),
+            e,
+        )),
     }
 }
 
