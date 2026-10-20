@@ -47,8 +47,10 @@ pub(super) fn write_tree(
     Ok((copied, packages))
 }
 
-/// Mint + sign one manifest per generation package and copy its blobs.
-/// `keep` narrows the walk to a mission's pinned names (`None` = all).
+/// Mint + sign one manifest per generation package and copy its blobs
+/// (ADR-0033 Decision 2: unsigned store entries are never served — the
+/// signing key is required and its absence is a named error). `keep`
+/// narrows the walk to a mission's pinned names (`None` = all).
 fn export_generation(
     blobs: &BlobStore,
     sinks: &Sinks,

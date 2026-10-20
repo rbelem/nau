@@ -17,7 +17,12 @@ use nau_core::pkg_manifest::{self, PackageManifest};
 use super::layout::IndexPackage;
 use super::write::{copy_blob, Sinks};
 
-/// Copy the inbox-only manifests VERBATIM plus their blobs.
+/// Copy the inbox-only manifests VERBATIM plus their blobs. The stored
+/// manifest is read only to learn the blob set and index row — it is
+/// never altered or re-signed (it arrived signed from a peer). Its
+/// declared blob addresses are still trust-boundary-validated before
+/// anything touches `store.blob_path` — a malformed sha256 in a staged
+/// manifest never becomes a path.
 pub(super) fn export_inbox(
     blobs: &BlobStore,
     sinks: &Sinks,
