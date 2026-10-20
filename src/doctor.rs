@@ -689,7 +689,7 @@ enum ProbeRun {
 }
 
 fn run_probe(bin: &Path, args: &[&str]) -> ProbeRun {
-    match std::process::Command::new(bin).args(args).output() {
+    match nau_infra::spawn_retry::output(bin, args) {
         Ok(out) => ProbeRun::Ran {
             code: out.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),

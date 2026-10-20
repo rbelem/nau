@@ -170,12 +170,10 @@ fn resolve_exec(pod_dir: &Path, key: &str, command: &[String]) -> miette::Result
         .first()
         .ok_or_else(|| miette::miette!("secret '{key}' (source 'exec'): command array is empty"))?;
     let resolved = resolve_exec_program(pod_dir, key, "exec", program)?;
-    let output = std::process::Command::new(resolved)
-        .args(&command[1..])
-        .output()
-        .map_err(|e| {
-            miette::miette!("secret '{key}' (source 'exec'): could not run '{program}': {e}")
-        })?;
+    // ETXTBSY: see spawn_retry (issue #8).
+    let output = nau_infra::spawn_retry::output(&resolved, &command[1..]).map_err(|e| {
+        miette::miette!("secret '{key}' (source 'exec'): could not run '{program}': {e}")
+    })?;
     if !output.status.success() {
         miette::bail!(
             "secret '{key}' (source 'exec'): program '{program}' exited with {} \

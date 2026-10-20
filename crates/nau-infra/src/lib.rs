@@ -21,6 +21,7 @@ pub mod governor;
 pub mod output;
 pub mod pathsearch;
 pub mod pgp;
+pub mod spawn_retry;
 pub mod ssh_ca;
 pub mod store;
 pub mod tools;
