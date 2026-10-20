@@ -27,8 +27,8 @@
 //! the whole set.
 //!
 //! The stale pre-rename file is left in place, and a removal retires it
-//! (see [`remove_legacy_pod_lock`]): a merge-on-read resolver would
-//! otherwise hand the removed package's pin back.
+//! (see [`remove_pod_pins`]): a merge-on-read resolver would otherwise
+//! hand the removed package's pin back.
 
 use std::path::{Path, PathBuf};
 
@@ -163,6 +163,13 @@ mod tests {
                 sha3_384: "abc".into(),
             },
         );
+        legacy_lock.build_deps.insert(
+            "bison".into(),
+            nau_core::lock::BuildDepsLockEntry {
+                pin: Some("3.8.2".into()),
+                hash: None,
+            },
+        );
         legacy_lock.save(&legacy).unwrap();
 
         let loaded = load_pod_lock(tmp.path(), "gate").unwrap().unwrap();
@@ -172,6 +179,7 @@ mod tests {
         assert_eq!(loaded.packages["rust"].version, "1.97.1");
         assert_eq!(loaded.packages["ripgrep"].version, "15.2.0");
         assert_eq!(loaded.snaps["toolchain"].sha3_384, "abc");
+        assert_eq!(loaded.build_deps["bison"].pin.as_deref(), Some("3.8.2"));
     }
 
     #[test]

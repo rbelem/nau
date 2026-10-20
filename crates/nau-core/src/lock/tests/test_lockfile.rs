@@ -534,6 +534,22 @@ fn test_merge_missing_from_fills_gaps_and_keeps_the_target() {
             validated_at: None,
         },
     );
+    other.inputs.insert(
+        "https://example.com/input".to_string(),
+        InputLockEntry {
+            revision: Some("cafe".into()),
+            sha256: Some("beef".into()),
+            local: false,
+            submodules: None,
+        },
+    );
+    other.build_deps.insert(
+        "bison".into(),
+        BuildDepsLockEntry {
+            pin: Some("3.8.2".into()),
+            hash: None,
+        },
+    );
 
     target.merge_missing_from(&other);
 
@@ -548,4 +564,11 @@ fn test_merge_missing_from_fills_gaps_and_keeps_the_target() {
     assert_eq!(target.snaps["core22"].revision, 1847);
     assert_eq!(target.snaps["other"].revision, 1);
     assert_eq!(target.sources.len(), 1);
+    assert_eq!(
+        target.inputs["https://example.com/input"]
+            .revision
+            .as_deref(),
+        Some("cafe")
+    );
+    assert_eq!(target.build_deps["bison"].pin.as_deref(), Some("3.8.2"));
 }

@@ -310,6 +310,10 @@ impl LockFile {
     /// but still read the old one started from an empty lock and saved
     /// only the packages it had touched. Taking either file whole drops
     /// the pins the other one holds (issue #20).
+    ///
+    /// Every map in [`LockFile`] is merged here. A map added to the
+    /// struct later must be added here too, or its entries are dropped
+    /// silently.
     pub fn merge_missing_from(&mut self, other: &LockFile) {
         fill_gaps(&mut self.sources, &other.sources);
         fill_gaps(&mut self.snaps, &other.snaps);
