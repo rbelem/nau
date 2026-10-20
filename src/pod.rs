@@ -3660,7 +3660,7 @@ fn detect_recipe_drift(
         entries.push((name, bytes));
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
-    let digest = recipe_closure_hash(&entries);
+    let digest = crate::pod_content::recipe_closure_hash(&entries);
     build
         .recipe_digests
         .push((spec.name.clone(), digest.clone()));
@@ -3695,10 +3695,7 @@ fn detect_recipe_drift(
             .recipe_stamps_pending
             .push((spec.name.clone(), digest));
         if build.rebuild_unstamped {
-            build.recipe_drift.insert(spec.name.clone());
-            build
-                .recipe_drift_members
-                .extend(entries.iter().map(|(name, _)| name.clone()));
+            mark_drifted(build, &spec.name, &meta.name, &entries);
             crate::output::status(format!(
                 "recipe drift: {} (no current-scheme recipe digest — rebuilding)",
                 spec.name
@@ -3714,9 +3711,34 @@ fn detect_recipe_drift(
     } else if entry.recipe_sha256.as_deref() == Some(digest.as_str()) {
         // Equal: today's behavior — the sync proceeds normally.
     } else {
-        record_recipe_drift(spec, digest, &entries, build);
+        record_recipe_drift(spec, &meta.name, digest, &entries, build);
     }
     Ok(())
+}
+
+/// Mark `spec.name` and the meta's CANONICAL name as drifted (issue #5).
+///
+/// The probe runs per DECLARED spec, and a spec may name a package
+/// through an alias (`toolchain` → `toolchain-gcc-gnu-x86_64`); the
+/// reconcile and the generation, however, ask every downstream question
+/// by canonical name (`Build`'s `meta.name`, the runtime closure's
+/// member names). Recording only the spelling the declaration used let
+/// the probe print "recipe drift: toolchain" and then have the
+/// canonical member hold its stale payload — a report nobody acted on.
+/// Both spellings go in, so the drift the probe NAMED is the drift the
+/// reconcile BUILDS.
+fn mark_drifted(
+    build: &mut ReconcileBuild,
+    declared: &str,
+    canonical: &str,
+    entries: &[(String, Vec<u8>)],
+) {
+    build.recipe_drift.insert(declared.to_string());
+    build.recipe_drift.insert(canonical.to_string());
+    build
+        .recipe_drift_members
+        .extend(entries.iter().map(|(name, _)| name.clone()));
+    build.recipe_drift_members.insert(canonical.to_string());
 }
 
 /// The recorded-digest MISMATCH arm of [`detect_recipe_drift`] (issue
@@ -3731,6 +3753,7 @@ fn detect_recipe_drift(
 /// refresh summary.
 fn record_recipe_drift(
     spec: &PodPackageSpec,
+    canonical: &str,
     digest: String,
     entries: &[(String, Vec<u8>)],
     build: &mut ReconcileBuild,
@@ -3738,7 +3761,12 @@ fn record_recipe_drift(
     build
         .recipe_stamps_pending
         .push((spec.name.clone(), digest));
-    if !build.refresh_members.is_empty() && !build.refresh_members.contains(&spec.name) {
+    // A refresh names its targets by CANONICAL name; a declaration may
+    // have reached the package through an alias, so "named" means
+    // either spelling (issue #5).
+    let named =
+        build.refresh_members.contains(&spec.name) || build.refresh_members.contains(canonical);
+    if !build.refresh_members.is_empty() && !named {
         build.recipe_baselined.push(spec.name.clone());
         crate::output::status(format!(
             "baselined '{}': drift pre-dating this refresh — recipe hash \
@@ -3747,36 +3775,8 @@ fn record_recipe_drift(
         ));
         return;
     }
-    build.recipe_drift.insert(spec.name.clone());
-    build
-        .recipe_drift_members
-        .extend(entries.iter().map(|(name, _)| name.clone()));
+    mark_drifted(build, &spec.name, canonical, entries);
     crate::output::status(format!("recipe drift: {} (recipe changed)", spec.name));
-}
-
-/// SHA-256 over the canonical listing the caller feeds (issues #142 +
-/// #172): entries sorted by member name (sorted by the caller), each
-/// fed into one running hash as `name \0 <length> \0 bytes` — the
-/// NAR-style convention of [`crate::pkg_source::content_hash`] (sorted
-/// paths + contents), lifted one level: the members are the paths, the
-/// recipe bytes the contents. The length prefix keeps adjacent entries
-/// unambiguous. Under the v2 scheme the listing leads with the
-/// package's own `(name, recipe_bytes)` entry, so an own-recipe edit
-/// moves the digest exactly like a member edit.
-fn recipe_closure_hash(entries: &[(String, Vec<u8>)]) -> String {
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    for (name, bytes) in entries {
-        hasher.update(name.as_bytes());
-        hasher.update([0]);
-        hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(bytes);
-    }
-    hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 /// Decide what one own package does in a scoped reconcile BEFORE any
@@ -4700,11 +4700,14 @@ fn collect_own_packages(
             // `pod refresh` (issue #142): an explicitly named declared
             // member rebuilds from its CURRENT recipes at its pin even
             // when the closure digest matches — the churn guard keeps a
-            // byte-identical rebuild store-stable.
+            // byte-identical rebuild store-stable. A refresh names
+            // canonical members while a declaration may spell an alias,
+            // so both spellings count (issue #5).
             if build.refresh_members.contains(&spec.name)
-                && !build.recipe_drift.contains(&spec.name)
+                || build.refresh_members.contains(&meta.name)
             {
                 build.recipe_drift.insert(spec.name.clone());
+                build.recipe_drift.insert(meta.name.clone());
             }
         }
         let scope = scope_own_package(
@@ -5503,12 +5506,12 @@ fn install_requires_closure(
             &dep_meta,
             &mut building,
             drifted || refresh,
-            // Runtime requires members: drift stamps + refresh own their
-            // freshness — a refresh must never churn an unnamed member.
-            // `Off` is integrity-only HERE; the transitive build prefix
-            // inside the ensure still upgrades to Report (the prefix
-            // lane never runs fully silent).
-            PodContentCheck::Off,
+            // Runtime requires members: the content key is consulted with
+            // the refresh scoping (#177) — a normal sync rebuilds a
+            // payload whose recipe closure moved, a refresh reconcile
+            // names the mismatch and reuses it (#5). The transitive
+            // build prefix inside the ensure inherits the same lane.
+            crate::pod_content::ContentCheck::for_lane(build.refresh_members.is_empty()),
         )?;
         // Memo hit: the ensure above already hashed this payload (its
         // verify or fresh-build record) — the per-sync memo makes the
@@ -6614,10 +6617,10 @@ fn deps_gate_error(name: &str, source_pod: Option<&str>) -> miette::Error {
 /// runs no build or declares neither list — nothing to bind.
 ///
 /// `content_check` carries the caller's lane scoping as a bool and maps
-/// `true` → [`PodContentCheck::Strict`], `false` →
-/// [`PodContentCheck::Report`]: the prefix lane never goes fully `Off` —
-/// even a lane that must not churn (refresh reconciles) still names a
-/// stale build-dep payload instead of consuming it silently (#344).
+/// through [`crate::pod_content::ContentCheck::for_lane`]: `true` →
+/// `Strict`, `false` → `Report`. The prefix lane never runs silent — a
+/// refresh reconcile that must not churn still names a stale build-dep
+/// payload instead of consuming it silently (#344).
 ///
 /// The returned [`MergedPrefix`] owns its tempdir — the caller must keep
 /// it alive for as long as the build runs.
@@ -6643,11 +6646,7 @@ fn pod_build_prefix(
     // The bool's lane mapping: strict on normal syncs (mismatch →
     // rebuild), Report on refresh reconciles (mismatch → loud line +
     // reuse, #177 — a refresh never churns an unnamed member).
-    let check = if content_check {
-        PodContentCheck::Strict
-    } else {
-        PodContentCheck::Report
-    };
+    let check = crate::pod_content::ContentCheck::for_lane(content_check);
     let mut payloads = Vec::new();
     for member in closure {
         let dep_meta = load_meta_memoized(&member.name, member.constraint.as_deref())?;
@@ -6667,27 +6666,6 @@ fn pod_build_prefix(
         ));
     }
     Ok(Some(merged))
-}
-
-/// How the #344 content-key half of a cached dep payload's reuse check
-/// runs ([`ensure_pod_dep_payload`]):
-///
-/// - `Strict`: a present key that differs → loud status + REBUILD (the
-///   build-prefix lane on a normal sync — drift stamps don't cover a
-///   build-dep payload's recipe).
-/// - `Report`: a present key that differs → loud status + REUSE (refresh
-///   reconciles, issue #177 — a refresh never churns an unnamed member;
-///   the rebuild happens on the next normal sync's `Strict` check). A
-///   missing key stays silent: the baseline belongs to the next normal
-///   sync, per-refresh noise is unwanted.
-/// - `Off`: integrity-only reuse, no key computation (the runtime
-///   `requires` lane — the drift detector's `recipe_sha256` stamps +
-///   refresh semantics own its freshness).
-#[derive(Clone, Copy)]
-enum PodContentCheck {
-    Strict,
-    Report,
-    Off,
 }
 
 /// Ensure one requires/build_deps member's built payload is available for
@@ -6711,16 +6689,16 @@ enum PodContentCheck {
 /// so a payload this sync already hashed costs nothing. Own fail-closed
 /// check — deliberately NOT folded into the #125 deps-blob story.
 /// `check` scopes the #344 freshness half of the reuse check
-/// ([`PodContentCheck`]). A missing content key BASELINES (loud, no
-/// rebuild) under `Strict` instead of forcing a rebuild — dead sources
-/// make forced rebuilds unbounded damage.
+/// ([`crate::pod_content::ContentCheck`]). A missing content key BASELINES
+/// (loud, no rebuild) under `Strict` instead of forcing a rebuild — dead
+/// sources make forced rebuilds unbounded damage.
 fn ensure_pod_dep_payload(
     store: &crate::runtime::RuntimeStore,
     name: &str,
     dep_meta: &crate::snap::SnapMeta,
     building: &mut Vec<String>,
     force_build: bool,
-    check: PodContentCheck,
+    check: crate::pod_content::ContentCheck,
 ) -> miette::Result<std::path::PathBuf> {
     set_pod_build_epoch();
     let downloads = store.downloads_dir();
@@ -6734,12 +6712,12 @@ fn ensure_pod_dep_payload(
     ));
     if existing.exists() && !force_build {
         verify_cached_dep_payload(&existing, name)?;
-        if dep_content_reuse_ok(&existing, name, dep_meta, check)? {
+        if crate::pod_content::reuse_ok(&existing, name, dep_meta, check)? {
             return Ok(existing);
         }
         // Stale (present key, changed recipes): fall through to the
-        // rebuild, which re-records both sidecars. Only `Strict` ever
-        // reaches this — `Report` and `Off` reuse.
+        // rebuild, which re-records both sidecars. Only `Strict` reaches
+        // this — `Report` names the mismatch and reuses (#177).
     }
 
     if building.iter().any(|n| n == name) {
@@ -6752,15 +6730,10 @@ fn ensure_pod_dep_payload(
 
     // The dependency's own build prefix (its requires ∪ build_deps,
     // transitively — a dep build is a build like any other, ADR-0018).
-    // The prefix lane never goes fully `Off`: even this lane's `Off`
-    // hands down `false` → `Report` below, so a build-dep payload's
-    // staleness is at least named, never silently consumed.
-    let dep_prefix = pod_build_prefix(
-        store,
-        dep_meta,
-        building,
-        !matches!(check, PodContentCheck::Strict),
-    )?;
+    // The prefix lane keeps the caller's scoping: a strict caller stays
+    // strict, a refresh reconcile stays report-only, so a build-dep
+    // payload's staleness is at least named, never silently consumed.
+    let dep_prefix = pod_build_prefix(store, dep_meta, building, check.is_strict())?;
     let scan_listings = match &dep_prefix {
         Some(p) => Some(crate::leak_scan::listings_for_build(dep_meta, p)?),
         None => Some(crate::leak_scan::PayloadListings::default()),
@@ -6804,92 +6777,6 @@ fn ensure_pod_dep_payload(
     Ok(fresh)
 }
 
-/// The reuse decision shared by the checked arms ([`PodContentCheck`]):
-/// `true` reuses the cached payload, `false` falls through to a rebuild.
-/// Only `Strict` can answer `false` — `Report` and `Off` always reuse
-/// (`Off` never even computes the key). Split out of
-/// [`ensure_pod_dep_payload`] so the three-way match lives in one small
-/// function instead of growing the ensure's cyclomatic load.
-fn dep_content_reuse_ok(
-    existing: &Path,
-    name: &str,
-    dep_meta: &crate::snap::SnapMeta,
-    check: PodContentCheck,
-) -> miette::Result<bool> {
-    match check {
-        PodContentCheck::Off => Ok(true),
-        PodContentCheck::Report => {
-            report_stale_dep_payload(existing, name, dep_meta)?;
-            Ok(true)
-        }
-        PodContentCheck::Strict => cached_dep_content_ok(existing, name, dep_meta),
-    }
-}
-
-/// The #344 refresh-side report (the council finding): the drift probe
-/// walks `requires` only, while the content key covers
-/// `requires` ∪ `build_deps` — so a build_deps-only recipe edit moved
-/// the key without moving the stamp, and a refresh reconcile consumed
-/// the stale payload SILENTLY (integrity-only reuse, #177's scoping).
-/// Here the mismatch is named loudly: member + version + the remedy.
-/// The payload is still REUSED — a refresh must not churn an unnamed
-/// member (#177); the next normal sync's `Strict` check rebuilds it. A
-/// missing content key stays silent — the baseline line is the normal
-/// sync's job.
-fn report_stale_dep_payload(
-    existing: &Path,
-    name: &str,
-    dep_meta: &crate::snap::SnapMeta,
-) -> miette::Result<()> {
-    let key = dep_content_key(name, dep_meta)?;
-    if let Some(recorded) = read_dep_content_key(existing) {
-        if recorded != key {
-            crate::output::status(format!(
-                "dep payload {name} {} is stale (recipe or closure content changed) — \
-                 reusing cached payload; run `nau pod refresh {name}` to rebuild it \
-                 from its current recipe",
-                dep_meta.version
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// The #344 freshness decision for a cached build-prefix payload under
-/// `Strict`: `true` reuses the cache, `false` falls through to a rebuild.
-/// A present key that differs means the recipes moved since the build —
-/// rebuild. An ABSENT key (a pre-#344 payload) BASELINES loudly and
-/// reuses — the drift detector's migration contract (issues #142 +
-/// #172): stamp what the current recipes hash to, name the limit, point
-/// at `nau pod refresh` as the escape hatch. Forcing a rebuild there
-/// would break dead-source members on every sync.
-fn cached_dep_content_ok(
-    existing: &Path,
-    name: &str,
-    dep_meta: &crate::snap::SnapMeta,
-) -> miette::Result<bool> {
-    let key = dep_content_key(name, dep_meta)?;
-    match read_dep_content_key(existing) {
-        Some(recorded) if recorded == key => Ok(true),
-        Some(_) => {
-            crate::output::status(format!(
-                "dep payload {name} {} is stale (recipe or closure content changed) — rebuilding",
-                dep_meta.version
-            ));
-            Ok(false)
-        }
-        None => {
-            record_dep_content_key(existing, &key)?;
-            crate::output::status(format!(
-                "baseline recorded for '{name}': pre-#344 payload carries no content key — \
-                 a recipe edit predating it is unrecoverable from the cache; run \
-                 `nau pod refresh {name}` to rebuild from its current recipe"
-            ));
-            Ok(true)
-        }
-    }
-}
-
 /// The provenance a (re)build must leave beside its payload before the
 /// caller can trust the bytes on the next sync (shared by the dep-ensure
 /// and top-level build paths): invalidate the stale memo entry, hash the
@@ -6903,7 +6790,7 @@ fn record_built_payload_provenance(
     nau_core::blob_memo::invalidate(payload);
     let sha3_384 = sha3_384_file_memoized(payload)?;
     record_dep_payload_digest(payload, &sha3_384)?;
-    record_dep_content_key(payload, &dep_content_key(name, meta)?)?;
+    crate::pod_content::record_content_key(payload, name, meta)?;
     Ok(sha3_384)
 }
 
@@ -6933,83 +6820,6 @@ fn dep_payload_digest_path(payload: &Path) -> PathBuf {
     let mut name = payload.as_os_str().to_os_string();
     name.push(".sha3-384");
     PathBuf::from(name)
-}
-
-/// The sidecar carrying a built dep payload's CONTENT KEY (issue #344):
-/// `<payload>.content-key` beside the payload. The key is the drift
-/// detector's recipe-closure hash over the dep's own recipe bytes plus
-/// its `build_deps` members' — everything that determines the payload
-/// bytes — so a recipe-content fix (python 3.14.7 r2's shim) or a member
-/// edit mints a new key and invalidates the cache with no operator rm.
-fn dep_content_key_path(payload: &Path) -> PathBuf {
-    let mut name = payload.as_os_str().to_os_string();
-    name.push(".content-key");
-    PathBuf::from(name)
-}
-
-/// Compute a dep payload's content key: [`recipe_closure_hash`] (the
-/// drift scheme — one canonicalization, not two) over the dep's own
-/// recipe bytes followed by its `build_deps` members'. Same recipes →
-/// same key; any content edit → a different key.
-fn dep_content_key(name: &str, dep_meta: &crate::snap::SnapMeta) -> miette::Result<String> {
-    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
-    entries.push((name.to_string(), own_recipe_bytes(name)?));
-    let seeds = crate::deps::build_dep_seeds(dep_meta);
-    if !seeds.is_empty() {
-        for member in crate::deps::resolve_dep_specs(&seeds, true)? {
-            if let Some(bytes) = recipe_bytes(&member.name) {
-                entries.push((member.name, bytes));
-            }
-        }
-    }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(recipe_closure_hash(&entries))
-}
-
-/// One recipe's bytes, resolved the way the drift probe resolves them:
-/// file path or collection content. `None` when unresolvable — the
-/// caller skips such members (the drift probe's behavior too).
-fn recipe_bytes(name: &str) -> Option<Vec<u8>> {
-    match crate::pkg_source::resolve_pkg(name) {
-        crate::pkg_source::PkgResult::File(path) => std::fs::read(&path).ok(),
-        crate::pkg_source::PkgResult::Found { content, .. } => Some(content.into_bytes()),
-        crate::pkg_source::PkgResult::NotFound => None,
-    }
-}
-
-/// The dep's OWN recipe bytes — a dep without a resolvable recipe cannot
-/// have a content key at all.
-fn own_recipe_bytes(name: &str) -> miette::Result<Vec<u8>> {
-    recipe_bytes(name)
-        .ok_or_else(|| miette::miette!("recipe of '{name}' not found for the content-key probe"))
-}
-
-/// Read a payload's recorded content key; `None` when absent or empty
-/// (payloads written before content keys existed — those REBUILD, never
-/// adopt: re-adopting possibly-stale bytes is the bug this fixes).
-fn read_dep_content_key(payload: &Path) -> Option<String> {
-    std::fs::read_to_string(dep_content_key_path(payload))
-        .ok()
-        .map(|recorded| recorded.trim().to_string())
-        .filter(|recorded| !recorded.is_empty())
-}
-
-/// Record a dep payload's content key into its sidecar (same atomic
-/// temp-file + rename pattern as [`record_dep_payload_digest`]).
-fn record_dep_content_key(payload: &Path, key: &str) -> miette::Result<()> {
-    let key_path = dep_content_key_path(payload);
-    let tmp = payload.with_file_name(format!(
-        ".{}.tmp-{}",
-        key_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("payload.content-key"),
-        std::process::id()
-    ));
-    std::fs::write(&tmp, key).map_err(|e| miette::miette!("writing {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &key_path)
-        .map_err(|e| miette::miette!("finalizing {}: {e}", key_path.display()))?;
-    Ok(())
 }
 
 /// Verify a cached dep payload against its recorded digest before a
@@ -7437,40 +7247,6 @@ mod tests {
             verify_cached_dep_payload(&payload, "pkg").is_err(),
             "a sidecar-less payload must refuse, not adopt"
         );
-    }
-
-    /// Issue #344: the content-key sidecar is file-level: absent/empty
-    /// reads as None, recording is atomic, and a recorded key reads back.
-    #[test]
-    fn content_key_sidecar_roundtrip() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let payload = dir.path().join("dep_1.0.0_amd64.snap");
-        std::fs::write(&payload, b"content").expect("write");
-
-        assert!(read_dep_content_key(&payload).is_none(), "absent → None");
-        record_dep_content_key(&payload, "abc123").expect("record");
-        assert_eq!(
-            read_dep_content_key(&payload).as_deref(),
-            Some("abc123"),
-            "a recorded key reads back"
-        );
-    }
-
-    /// Issue #344: a cached payload whose content-key sidecar is absent
-    /// (pre-#344 payload) or names a different key is STALE — the reuse
-    /// comparison rebuilds, never adopts.
-    #[test]
-    fn content_key_mismatch_reads_stale() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let payload = dir.path().join("dep_1.0.0_amd64.snap");
-        std::fs::write(&payload, b"content").expect("write");
-
-        // Absent key: not a match (stale → rebuild).
-        assert_ne!(read_dep_content_key(&payload).as_deref(), Some("k1"));
-
-        // A recorded key that still matches reads fresh.
-        record_dep_content_key(&payload, "k1").expect("record");
-        assert_eq!(read_dep_content_key(&payload).as_deref(), Some("k1"));
     }
 
     /// The reconcile-lifetime eval memo (sync-speed plan item 5): a
