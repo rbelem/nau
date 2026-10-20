@@ -163,25 +163,26 @@ pub(crate) fn write(
     Ok(format!("../{LD_WRAPPERS_DIR}/{app}"))
 }
 
-/// The compiler-facing paths every wrapper exports (issue #164):
+/// The compiler-facing search paths every wrapper computes (issue #164):
 /// `LIBRARY_PATH` (the gcc/clang drivers map it onto `-L` AND startfile
 /// search), `CPATH` (every extension's `usr/usr/include`), and
 /// `COMPILER_PATH` (where the driver and collect2 find `as`/`ld`).
-fn env_lines(lib_list: &str) -> String {
+/// Values stay in `libs`/`cpath`/`compath`: the plain wrapper exports
+/// them, while the namespace wrapper hands them to bwrap so bwrap's OWN
+/// process never loads the pod's libc.
+fn search_paths(lib_list: &str) -> String {
     format!(
-        "LD_LIBRARY_PATH=\"{lib_list}\"\n\
-         LIBRARY_PATH=\"$LD_LIBRARY_PATH\"\n\
-         CPATH=\n\
-         COMPILER_PATH=\n\
+        "libs=\"{lib_list}\"\n\
+         cpath=\n\
+         compath=\n\
          for i in \"$d\"/../extensions/*/usr/usr/include; do\n\
-         \x20 [ -d \"$i\" ] && CPATH=\"$CPATH$i:\"\n\
+         \x20 [ -d \"$i\" ] && cpath=\"$cpath$i:\"\n\
          done\n\
-         CPATH=\"${{CPATH%:}}\"\n\
+         cpath=\"${{cpath%:}}\"\n\
          for i in \"$d\"/../extensions/*/usr/usr/bin; do\n\
-         \x20 [ -d \"$i\" ] && COMPILER_PATH=\"$COMPILER_PATH$i:\"\n\
+         \x20 [ -d \"$i\" ] && compath=\"$compath$i:\"\n\
          done\n\
-         COMPILER_PATH=\"${{COMPILER_PATH%:}}\"\n\
-         export LD_LIBRARY_PATH LIBRARY_PATH CPATH COMPILER_PATH\n"
+         compath=\"${{compath%:}}\"\n"
     )
 }
 
@@ -202,8 +203,14 @@ const LOCATE: &str = "case $0 in\n\
 /// generations with no loader/libc pair.
 fn plain_body(real_target: &str, lib_list: &str) -> String {
     format!(
-        "#!/bin/sh\n{LOCATE}{}exec \"$d/../farm/{real_target}\" \"$@\"\n",
-        env_lines(lib_list)
+        "#!/bin/sh\n{LOCATE}{}\
+         LD_LIBRARY_PATH=\"$libs\"\n\
+         LIBRARY_PATH=\"$libs\"\n\
+         CPATH=\"$cpath\"\n\
+         COMPILER_PATH=\"$compath\"\n\
+         export LD_LIBRARY_PATH LIBRARY_PATH CPATH COMPILER_PATH\n\
+         exec \"$d/../farm/{real_target}\" \"$@\"\n",
+        search_paths(lib_list)
     )
 }
 
@@ -217,11 +224,17 @@ fn namespace_body(
     ns: &Namespace<'_>,
     bwrap: &Path,
 ) -> String {
-    let mut body = format!("#!/bin/sh\n{LOCATE}{}", env_lines(lib_list));
+    let mut body = format!("#!/bin/sh\n{LOCATE}{}", search_paths(lib_list));
     body.push_str(&format!(
         "# Pod rootfs namespace (crate::rootfs): '{}'.\n",
         app
     ));
+    // bwrap's own process must start WITHOUT the pod's libc on its
+    // loader path: the loader that starts bwrap is the host's, and it
+    // may predate the pod's glibc (the __pointer_chk_guard class). The
+    // app gets the pod's paths through --setenv, applied inside the
+    // namespace.
+    body.push_str("unset LD_LIBRARY_PATH LIBRARY_PATH CPATH COMPILER_PATH\n");
     body.push_str(&format!(
         "exec {} --bind / / --tmpfs /usr",
         shell_quote(bwrap)
@@ -256,6 +269,12 @@ fn namespace_body(
         " \\\n  --ro-bind \"$d/../{}\" {} \\\n",
         ns.rootfs.loader_rel,
         shell_quote_str(&format!("/lib64/{}", crate::rootfs::LOADER_NAME))
+    ));
+    body.push_str(&format!(
+        "  --setenv LD_LIBRARY_PATH \"$libs\" \
+         --setenv LIBRARY_PATH \"$libs\" \
+         --setenv CPATH \"$cpath\" \
+         --setenv COMPILER_PATH \"$compath\" \\\n"
     ));
     body.push_str(&format!("  -- \"$d/../farm/{real_target}\" \"$@\"\n"));
     body
@@ -368,6 +387,14 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("--tmpfs '/lib64'"), "{body}");
+        assert!(
+            body.contains("--setenv LD_LIBRARY_PATH \"$libs\""),
+            "the app gets the loader path inside the namespace: {body}"
+        );
+        assert!(
+            body.contains("unset LD_LIBRARY_PATH LIBRARY_PATH CPATH COMPILER_PATH"),
+            "bwrap's own process must start without the pod's libc: {body}"
+        );
         assert!(!body.contains("readlink") && !body.contains("dirname"));
     }
 
