@@ -29,6 +29,9 @@ _Avoid_: destdir, install prefix, output dir
 **Build sandbox**: A bubblewrap-isolated environment where source builds execute. Provides read-only system paths, private `/tmp`, and `$STAGE`/`$SRC` env vars.
 _Avoid_: container, chroot, jail
 
+**Resource limit**: A CPU cap expressed as a percentage of one machine's online CPUs. `--resource-limit` defaults to 50; `off` leaves build children uncapped. A value is not a systemd `CPUQuota` value. The cap does not limit memory or I/O.
+_Avoid_: systemd `CPUQuota` percentage, per-CPU percentage
+
 **Bootstrap**: The 3-stage process of building a compiler toolchain from a host compiler: stage0 (minimal C-only cross-compiler) → stage1 (full C/C++ cross-compiler) → stage2 (verification rebuild).
 _Avoid_: cross-compile setup, toolchain init
 

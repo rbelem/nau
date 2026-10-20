@@ -63,7 +63,6 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -493,8 +492,8 @@ pub fn discover_version(path: &Path) -> Option<String> {
 }
 
 fn version_from_probe(path: &Path, flag: &str) -> Option<String> {
-    let out = Command::new(path).arg(flag).output().ok()?;
-    if !out.status.success() {
+    let out = crate::command::RealRunner::run_path(path, &[flag]).ok()?;
+    if out.code != 0 {
         return None;
     }
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -703,14 +702,14 @@ fn exec_probe(path: &Path, tool: &str) -> ToolsResult<()> {
     let mut attempts = 0;
     loop {
         attempts += 1;
-        match Command::new(path).arg("--version").output() {
-            Ok(out) if out.status.success() => return Ok(()),
+        match crate::command::RealRunner::run_path(path, &["--version"]) {
+            Ok(out) if out.code == 0 => return Ok(()),
             Ok(out) => {
                 return Err(ToolsError::ProbeFailed {
                     tool: tool.into(),
-                    detail: match out.status.code() {
-                        Some(code) => format!("`--version` exited with status {code}"),
-                        None => "`--version` was killed by a signal".into(),
+                    detail: match out.code {
+                        code if code >= 0 => format!("`--version` exited with status {code}"),
+                        _ => "`--version` was killed by a signal".into(),
                     },
                 });
             }

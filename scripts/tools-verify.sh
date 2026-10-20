@@ -47,7 +47,9 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # TOOLS_RECIPE_DIR is a test seam: tests point it at a fixture pins.conf.
 RECIPE_DIR=${TOOLS_RECIPE_DIR:-"$SCRIPT_DIR/../recipes/tools"}
-# shellcheck source-path=SCRIPTDIR
+# The sourced path is a runtime variable, so shellcheck cannot resolve it
+# statically; the source-path directive covers the default location only.
+# shellcheck disable=SC1091
 source "$RECIPE_DIR/pins.conf"
 
 DOWNLOADS="${TMPDIR:-/tmp}/nau-tools-verify/downloads"

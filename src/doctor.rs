@@ -211,6 +211,11 @@ fn run_scoped(scope: Scope) -> Vec<Check> {
     // package on different lines across pods, named instead of folklore.
     // Hint-only — see [`check_pod_version_lines`].
     checks.push(check_pod_version_lines());
+    let governor = match nau_infra::governor::degrade_reason() {
+        Some(reason) => format!("unavailable ({reason:?}); builds run uncapped"),
+        None => "cgroup placement available; build claim setup is checked at launch".to_string(),
+    };
+    crate::output::info(format!("resource governor: {governor}"));
     checks
 }
 

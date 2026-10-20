@@ -20,6 +20,15 @@ Autoconf and other GNU build tools depend on M4 for macro expansion.]],
         -- and this rebuild (recipe drift swept by `pod refresh automake`,
         -- issue #211) proved configure finds no compiler without the decl.
         build_deps = { "gcc", "make" },
+        -- The build's compiler bakes RUNPATH entries for the merged build
+        -- prefix into the produced binaries — the nix gcc wrapper's
+        -- documented case (leak_scan: "the nix gcc wrapper bakes
+        -- RUNPATH=/nau-build-prefix/usr/lib into produced binaries"). The
+        -- path does not exist at pod runtime, so the entry is inert there;
+        -- inside a build sandbox it is exactly where the prefix is bound.
+        -- Both spellings are listed, the autoconf/automake/binutils/make
+        -- precedent.
+        leaks_ok = { "/nau-build-prefix/usr/lib64", "/nau-build-prefix/usr/lib" },
         -- Hand-written build (not the autotools plugin) so the payload can
         -- strip the generated share/info/dir index: it differs per package
         -- (m4 vs gmp), and a merged build prefix requires identical content

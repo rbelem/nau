@@ -234,7 +234,7 @@ for name in "${CFG_NAMES[@]}"; do
     mv "$IMG" "$img1"
     run_cfg "$name" "${args[@]}" || ok=0
     if [ "$ok" = 1 ]; then
-      rt2="$RT"; rb2="$RB"; rh2="$RH"
+      rt2="$RT"; rh2="$RH"
       if [ "$rh1" = "$rh2" ]; then
         rep="yes"
       else

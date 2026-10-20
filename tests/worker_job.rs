@@ -71,6 +71,7 @@ fn hello_manifest() -> JobManifest {
     recipes.insert("pkgs/w/worker-job-hello.lua".to_string(), hello_recipe());
     JobManifest {
         protocol_version: WORKER_PROTOCOL_VERSION,
+        resource_limit: nau_core::resource_limit::ResourceLimit::DEFAULT,
         target: host_arch().to_string(),
         cross_target: None,
         source_date_epoch: Some(1700000000),
@@ -455,6 +456,7 @@ return {{
     recipes.insert("pkgs/w/worker-src-job.lua".to_string(), recipe);
     JobManifest {
         protocol_version: WORKER_PROTOCOL_VERSION,
+        resource_limit: nau_core::resource_limit::ResourceLimit::DEFAULT,
         target: host_arch().to_string(),
         cross_target: None,
         source_date_epoch: None,
@@ -707,6 +709,7 @@ return {
     recipes.insert("pkgs/w/worker-job-doomed.lua".to_string(), recipe);
     let manifest = JobManifest {
         protocol_version: WORKER_PROTOCOL_VERSION,
+        resource_limit: nau_core::resource_limit::ResourceLimit::DEFAULT,
         target: host_arch().to_string(),
         cross_target: None,
         source_date_epoch: None,

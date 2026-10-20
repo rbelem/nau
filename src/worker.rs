@@ -171,6 +171,7 @@ pub fn job_main(job_file: &str) -> miette::Result<()> {
         ));
     }
     unsafe { libc::dup2(2, 1) };
+    nau_infra::governor::enter_worker_job();
     let result = execute_job_manifest(PathBuf::from(job_file))?;
     let json = serde_json::to_string_pretty(&result)
         .map_err(|e| miette::miette!("worker-job: cannot serialize result document: {e}"))?;
@@ -254,6 +255,7 @@ pub fn execute_job(
     validate_manifest(manifest)?;
     let payloads = verify_payloads(manifest, payload_dir)?;
 
+    let _governor = nau_infra::governor::configure(manifest.resource_limit);
     let _state = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _guard = JobStateGuard::capture()?;
     run_job(manifest, &payloads, out_dir)
@@ -422,6 +424,7 @@ fn job_result(
         error: None,
         stderr: None,
         build_ms,
+        resource_degrade: nau_infra::governor::degrade_reason(),
     };
     match build {
         Ok(_) => {

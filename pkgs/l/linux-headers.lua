@@ -1,4 +1,4 @@
--- linux-headers: Linux kernel uapi headers (Debian linux-libc-dev 6.12.38)
+-- linux-headers: Linux kernel uapi headers (Debian linux-libc-dev 7.2.8)
 --
 -- FETCH strategy, the same trade gcc.lua made (#164/#24): the previous
 -- recipe ran kernel.org 7.0 `make headers_install` from source, which
@@ -17,8 +17,8 @@
 return {
     default = snap {
         name = "linux-headers",
-        version = "6.12.38",
-        summary = "Kernel uapi headers for Linux 6.12 (Debian linux-libc-dev)",
+        version = "7.2.8",
+        summary = "Kernel uapi headers for Linux 7.2 (Debian linux-libc-dev)",
         description = [[Linux kernel uapi headers as shipped in Debian's
 linux-libc-dev — the interface between the Linux kernel and userspace.
 Consumed by glibc and every gcc consumer in merged build prefixes; sole
@@ -29,8 +29,8 @@ owner of the uapi subtrees per the #174 rule.]],
         requires = {},
         sources = {
             ["linux-libc-dev"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/l/linux/linux-libc-dev_6.12.38-1_all.deb",
-                sha256 = "85b85662ef28e31364d6b00b041fade0ebcf649a368cc3e7899c2e2b87b77a46",
+                url = "https://snapshot.debian.org/archive/debian/20261001T000000Z/pool/main/l/linux/linux-libc-dev_7.2.8-1_all.deb",
+                sha256 = "4d218af167cb5cfc687b1a8945ea4592274dab593ffd8c205ceca27eb73c59f3",
             },
         },
         build = table.concat({

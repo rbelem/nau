@@ -71,15 +71,15 @@ return {
             "set -x",
             -- Sandbox wiring (issue #44): the pool toolchain and
             -- pkg-config shadow the host; CC/CXX name the pool driver.
-            "test \"$(command -v gcc)\" = /nau-build-prefix/usr/bin/gcc",
-            "test \"$(command -v pkg-config)\" = /nau-build-prefix/usr/bin/pkg-config",
+            'test "$(command -v gcc)" = /nau-build-prefix/usr/bin/gcc',
+            'test "$(command -v pkg-config)" = /nau-build-prefix/usr/bin/pkg-config',
             -- Go env (cgo side of the contract): the sandbox exports
             -- CGO_ENABLED=1 (this recipe's declaration) and CC resolves
             -- to the pool gcc for the C half of the build.
             "export GOCACHE=/tmp/go-build-cache GOMODCACHE=/tmp/go-mod-cache GOPATH=/tmp/go-path",
             "export CGO_ENABLED=1 GOPROXY=off GOFLAGS=-mod=mod",
-            "test \"$(go env CC)\" = gcc",
-            "test \"$(go env CGO_ENABLED)\" = 1",
+            'test "$(go env CC)" = gcc',
+            'test "$(go env CGO_ENABLED)" = 1',
             -- pkg-config resolves the sibling build_dep through the
             -- sysroot-rewritten .pc paths. Note --cflags is EMPTY by
             -- design: pkg-config filters default include dirs

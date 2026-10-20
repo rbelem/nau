@@ -101,8 +101,9 @@ jobs:
       # The nix-store closure (~1.5 GiB, qemu included) is cached by
       # hand instead of via devbox-install-action's enable-cache for
       # two upstream reasons: its cache key hashes devbox.lock, which
-      # `devbox run` rewrites mid-job, so restore and save hash
-      # differently and the cache can never hit
+      # `devbox run` rewrote mid-job while the committed lock carried a
+      # stale plugin_version, so restore and save hash differently and
+      # the cache can never hit
       # (jetify-com/devbox-install-action#28); and the action's inner
       # nix-installer v16 carries its own /nix/store cache against the
       # decommissioned GH cache service — 400s every run, no knob to
@@ -112,6 +113,12 @@ jobs:
       # devbox.json with a prefix fallback: after a devbox.json bump
       # the exact key misses but restore-keys still seeds from the old
       # closure, and nix fills the delta from cache.nixos.org.
+      #
+      # The lock rewrite itself stopped on 2026-10-19 (the plugin_version
+      # bump landed in devbox.lock), so the cache key would now be
+      # stable too. The hand-rolled cache stays: the other upstream
+      # reason above is unchanged, and changing the cache strategy on a
+      # guess is not worth a red job.
       - name: Install nix
         uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
         with:
@@ -187,10 +194,23 @@ jobs:
         run: devbox run -- clippy
 
       - name: Lua lint (luacheck)
-        run: devbox run -- luacheck pkgs/
+        run: devbox run -- luacheck
 
       - name: Lua style (stylua)
-        run: devbox run -- stylua --check pkgs/
+        run: devbox run -- stylua
+
+      - name: Shell scripts (shellcheck)
+        run: devbox run -- shellcheck
+
+      # devbox.lock must be committed. `devbox run` rewrote it on every
+      # invocation while the committed lock carried an older
+      # plugin_version than the installed devbox writes; the bump landed
+      # on 2026-10-19 and both devbox 0.18.3 (this job) and 0.18.4 (the
+      # workstation) leave the file byte-identical now. A stray rewrite
+      # lands in whatever commit follows, so the guard lives here and in
+      # the pre-commit hook.
+      - name: Devbox lockfile must be committed
+        run: git diff --exit-code devbox.lock
 
       # Seeds the closure for the next run. Main-only: PR runs restore
       # from main's cache but never race it — concurrent reserves of the

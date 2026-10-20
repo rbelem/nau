@@ -88,7 +88,14 @@ pub fn build_command(args: BuildArgs) -> miette::Result<()> {
         update,
         offline,
         json,
+        resource_limit,
     } = args;
+    let env_limit = std::env::var("NAU_RESOURCE_LIMIT").ok();
+    let limit = nau_core::resource_limit::ResourceLimit::resolve(
+        resource_limit.as_deref(),
+        env_limit.as_deref(),
+    )?;
+    let _governor = nau_infra::governor::configure(limit);
     crate::output::set_mode(json);
     // The eval worker reads this to refuse fetch() (ADR: eval-time
     // network is opt-in and never survives --offline).
@@ -365,7 +372,14 @@ pub fn cmd_image(
     release: Option<String>,
     lockfile_path: String,
     json: bool,
+    resource_limit: Option<String>,
 ) -> miette::Result<()> {
+    let env_limit = std::env::var("NAU_RESOURCE_LIMIT").ok();
+    let limit = nau_core::resource_limit::ResourceLimit::resolve(
+        resource_limit.as_deref(),
+        env_limit.as_deref(),
+    )?;
+    let _governor = nau_infra::governor::configure(limit);
     crate::pkg_source::init_global_inputs(&HashMap::new())?;
     let file = resolve_file(&file)?;
 

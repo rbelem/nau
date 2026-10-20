@@ -57,7 +57,27 @@ impl CommandRunner for RealRunner {
         let (program, args) = argv.split_first().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command argv")
         })?;
-        let out = std::process::Command::new(program).args(args).output()?;
+        let mut command = std::process::Command::new(program);
+        command.args(args);
+        Self::run_command(command)
+    }
+}
+
+impl RealRunner {
+    pub(crate) fn run_path(path: &std::path::Path, args: &[&str]) -> std::io::Result<RunnerOutput> {
+        let mut command = std::process::Command::new(path);
+        command.args(args);
+        Self::run_command(command)
+    }
+
+    fn run_command(mut command: std::process::Command) -> std::io::Result<RunnerOutput> {
+        let joined = crate::governor::attach_if_configured(&mut command);
+        let output = command.output();
+        drop(command);
+        let out = output?;
+        if let Some(joined) = joined {
+            joined.finish();
+        }
         Ok(RunnerOutput {
             code: out.status.code().unwrap_or(-1),
             stdout: out.stdout,

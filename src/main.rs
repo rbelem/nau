@@ -35,6 +35,7 @@ fn main() -> miette::Result<()> {
                     source_date_epoch,
                     release,
                     lockfile: lockfile_path,
+                    resource_limit,
                     json,
                 },
             ..
@@ -52,6 +53,7 @@ fn main() -> miette::Result<()> {
                 release,
                 lockfile_path,
                 json,
+                resource_limit,
             );
             nau::output::flush_json("image");
             r

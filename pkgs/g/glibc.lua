@@ -6,7 +6,7 @@
 return {
     default = snap {
         name = "glibc",
-        version = "2.43",
+        version = "2.44",
         summary = "GNU C Library",
         description = [[
             glibc is the GNU Project's implementation of the C standard
@@ -30,15 +30,17 @@ return {
         -- same window. A scoped build-sandbox resolution (build_deps
         -- edges outside the runtime closure graph) is the real fix.
         source = {
-            url = "https://ftp.gnu.org/gnu/glibc/glibc-2.43.tar.xz",
+            url = "https://ftp.gnu.org/gnu/glibc/glibc-2.44.tar.xz",
+            sha256 = "37f600f2bef3c5e8300147059568b2a2e40a7ad6ccc65ce942556d49429cc667",
         },
-        -- glibc's sys/mount.h unconditionally redefines OPEN_TREE_CLONE /
-        -- OPEN_TREE_CLOEXEC after including <linux/mount.h> when it is
-        -- visible. The pool linux-headers <linux/mount.h> (the kernel UAPI
-        -- authority) already defines OPEN_TREE_CLONE, so glibc's own
-        -- definition triggers `-Werror` "redefined". Guard glibc's
-        -- definitions to yield to the kernel header — the same pattern the
-        -- header already applies to MOUNT_ATTR_SIZE_VER0 / FSOPEN_CLOEXEC.
+        -- glibc 2.43's sys/mount.h unconditionally redefined OPEN_TREE_CLONE
+        -- / OPEN_TREE_CLOEXEC after including <linux/mount.h>, which the pool
+        -- linux-headers payload (the kernel UAPI authority) also defines, so
+        -- `-Werror` killed the build on "redefined". 2.44 upstreamed the
+        -- guard (verified against the 2.44 tree: both definitions sit behind
+        -- #ifndef), so this sed is now a no-op. It stays as a guard: a
+        -- backport or a downgrade that drops the guard must not resurrect a
+        -- silent -Werror failure, and the pattern is idempotent.
         build = table.concat({
             -- The stage dir must exist before glibc's mkinstalldirs runs:
             -- its plain `mkdir` does not -p the install root (issue #164

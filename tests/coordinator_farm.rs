@@ -1141,6 +1141,7 @@ impl LoopbackWorker {
         std::fs::write(&out_path, &bytes)?;
         let result = JobResult {
             protocol_version: WORKER_PROTOCOL_VERSION,
+            resource_degrade: None,
             package: manifest.package,
             target: manifest.target,
             ok: true,
@@ -1226,6 +1227,7 @@ impl ManifestSource for FakeSource {
         );
         Ok(JobManifest {
             protocol_version: WORKER_PROTOCOL_VERSION,
+            resource_limit: nau_core::resource_limit::ResourceLimit::DEFAULT,
             target: host_arch(),
             cross_target: None,
             source_date_epoch: Some(1700000000),
@@ -1800,6 +1802,7 @@ fn farm_ingest_builds_the_json_event_shape() {
         collect: std::time::Duration::ZERO,
         result: JobResult {
             protocol_version: WORKER_PROTOCOL_VERSION,
+            resource_degrade: None,
             package: "app".into(),
             target: "amd64".into(),
             ok: true,

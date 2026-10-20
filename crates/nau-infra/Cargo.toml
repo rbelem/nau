@@ -7,6 +7,7 @@ license = "GPL-3.0-only"
 publish = false
 
 [dependencies]
+libc = "0.2"
 # R1/R5 (issue #326 PR 3): the store client and the assertion gate name
 # spine vocabulary (`SnapRef`) — the mechanism leaf consumes the spine,
 # never the reverse.
