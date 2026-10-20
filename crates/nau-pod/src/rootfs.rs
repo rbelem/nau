@@ -90,7 +90,11 @@ impl Placed {
 /// every emit, so a generation that loses its loader also loses a stale
 /// tree.
 pub fn prepare(store: &StoreView, gen: &Generation) -> miette::Result<Option<PodRootfs>> {
-    let gen_dir = store.generation_dir(gen.n);
+    // Absolute source paths: the gather is bound at /usr/lib and /lib64
+    // inside the namespace, where a relative `../../../extensions/...`
+    // would resolve against the mounted position, not the generation.
+    let gen_dir = std::fs::canonicalize(store.generation_dir(gen.n))
+        .unwrap_or_else(|_| store.generation_dir(gen.n));
     let rootfs = gen_dir.join(ROOTFS_DIR);
     let libs = loader_lib_entries(store, gen);
     let Some(loader) = libs
@@ -234,9 +238,28 @@ fn place_leaf(
         std::fs::create_dir_all(parent)
             .map_err(|e| miette::miette!("creating rootfs dir {}: {e}", parent.display()))?;
     }
-    let target = leaf_target(position, child_sub, lib);
-    std::os::unix::fs::symlink(&target, &dst)
-        .map_err(|e| miette::miette!("linking rootfs {} -> {target}: {e}", dst.display()))?;
+    if is_interpreter(child_sub) {
+        // The interpreter slot is a mount DESTINATION for the wrapper's
+        // loader bind, and bwrap refuses a symlink destination. A
+        // hardlink keeps the gather cheap while giving bwrap a regular
+        // file to mount on.
+        let real = std::fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
+        std::fs::hard_link(&real, &dst).map_err(|e| {
+            miette::miette!(
+                "hardlinking rootfs interpreter {} -> {}: {e}",
+                real.display(),
+                dst.display()
+            )
+        })?;
+    } else {
+        // Absolute, because the gather is mounted at the FHS position
+        // inside the namespace: a relative target's depth would have to
+        // change with the mount. The host root stays bound at `/`, so
+        // the absolute path resolves in both views.
+        let target = src.to_string_lossy().into_owned();
+        std::os::unix::fs::symlink(&target, &dst)
+            .map_err(|e| miette::miette!("linking rootfs {} -> {target}: {e}", dst.display()))?;
+    }
     let placed = if symlink {
         Placed::Symlink(lib.pkg.clone(), src.to_path_buf())
     } else {
@@ -246,13 +269,10 @@ fn place_leaf(
     Ok(())
 }
 
-/// The relative symlink target from a gather leaf back to its source
-/// entry. The target is relative, so it resolves inside the namespace
-/// through the host root bind and survives a moved pod directory.
-fn leaf_target(position: &str, child_sub: &str, lib: &LoaderLibDir) -> String {
-    let parent_depth = child_sub.split('/').count().saturating_sub(1);
-    let depth = 1 + position.split('/').count() + parent_depth;
-    format!("{}{}/{}", "../".repeat(depth), lib.rel, child_sub)
+/// Whether a gather leaf is the dynamic loader, the one path bwrap
+/// mounts over and therefore the one that cannot be a symlink.
+fn is_interpreter(child_sub: &str) -> bool {
+    child_sub.rsplit('/').next() == Some(LOADER_NAME)
 }
 
 /// Whether an incumbent and an incoming leaf carry the same content, by
@@ -405,9 +425,15 @@ mod tests {
         );
         let gather = gen_dir.join(ROOTFS_DIR);
         let link = std::fs::read_link(gather.join("lib64/libc.so.6")).unwrap();
-        assert_eq!(
-            link.to_string_lossy(),
-            "../../extensions/glibc/usr/lib64/libc.so.6"
+        assert!(
+            link.is_absolute() && link.ends_with("extensions/glibc/usr/lib64/libc.so.6"),
+            "gather links are absolute so they resolve inside the namespace: {}",
+            link.display()
+        );
+        let loader = std::fs::symlink_metadata(gather.join("lib64/ld-linux-x86-64.so.2")).unwrap();
+        assert!(
+            loader.file_type().is_file(),
+            "the interpreter slot must be a regular file: bwrap refuses a symlink mount destination"
         );
         assert!(gather
             .join("usr/lib/x86_64-linux-gnu/libisl.so.23")
