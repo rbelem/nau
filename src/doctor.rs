@@ -691,9 +691,9 @@ enum ProbeRun {
 fn run_probe(bin: &Path, args: &[&str]) -> ProbeRun {
     match nau_infra::spawn_retry::output(bin, args) {
         Ok(out) => ProbeRun::Ran {
-            code: out.status.code().unwrap_or(-1),
+            code: out.code,
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            stderr: out.stderr,
         },
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => ProbeRun::Noexec(e),
         Err(e) => ProbeRun::Spawn(e),

@@ -16,8 +16,9 @@
 
 use std::ffi::OsStr;
 use std::io;
-use std::process::Output;
 use std::time::Duration;
+
+use crate::command::{RealRunner, RunnerOutput};
 
 /// Exec-probe budget: three tries with a short gap covers the
 /// write/chmod/exec race window without hiding a real failure.
@@ -44,8 +45,17 @@ pub fn spawn<T>(spawn: impl FnMut() -> io::Result<T>) -> io::Result<T> {
 
 /// [`spawn`] for a program plus its argv — the shape both production call
 /// sites (the doctor's probe, the secret `exec` source) take.
-pub fn output<S: AsRef<OsStr>>(program: impl AsRef<OsStr>, args: &[S]) -> io::Result<Output> {
-    spawn(|| std::process::Command::new(&program).args(args).output())
+///
+/// It spawns through the [`RealRunner`] seam instead of reaching for
+/// [`std::process::Command`] here, so the child joins the resource
+/// governor's cgroup exactly like every other host tool nau runs
+/// ([`crate::governor`]), and the seam test that bans raw process calls
+/// outside `RealRunner` holds by construction rather than by exemption.
+///
+/// [`RunnerOutput`] carries what both call sites need: the exit code (`-1`
+/// when signal-terminated), stdout bytes, and stderr already lossy-decoded.
+pub fn output<S: AsRef<OsStr>>(program: impl AsRef<OsStr>, args: &[S]) -> io::Result<RunnerOutput> {
+    spawn(|| RealRunner::run_path(program.as_ref(), args))
 }
 
 /// [`spawn`] with the budget and backoff open: the shape a test can pin
@@ -145,7 +155,9 @@ mod tests {
         let mut writer = Some(writer);
         let errnos = std::cell::RefCell::new(Vec::new());
         let out = retry(3, Duration::ZERO, || {
-            let run = std::process::Command::new(&script).output();
+            // The seam path the production callers take, not a bare
+            // `Command`: the errno has to survive the governor attach.
+            let run = RealRunner::run_path(&script, &[] as &[&str]);
             if let Err(e) = &run {
                 errnos.borrow_mut().push(e.raw_os_error());
             }
