@@ -110,6 +110,36 @@ mod tests {
     }
 
     #[test]
+    fn both_names_merge_with_the_canonical_winning_per_entry() {
+        // The measured shape (issue #20): the canonical file is a strict
+        // subset, so taking it whole drops the pins the legacy file holds.
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = seed(tmp.path(), "gate");
+        let legacy = canonical.with_file_name("shuttle.lock");
+
+        lock_with("16.2.0").save(&canonical).unwrap();
+
+        let mut legacy_lock = lock_with("14.2.0");
+        legacy_lock.packages.insert(
+            "ripgrep".into(),
+            nau_core::lock::PodPackageLockEntry {
+                version: "15.2.0".into(),
+                constraint: None,
+                deps: None,
+                recipe_sha256: None,
+                recipe_digest_scheme: None,
+            },
+        );
+        legacy_lock.save(&legacy).unwrap();
+
+        let loaded = load_pod_lock(tmp.path(), "gate").unwrap().unwrap();
+        // The canonical entry wins where both files have one.
+        assert_eq!(loaded.packages["gcc"].version, "16.2.0");
+        // The legacy file's other pins are not dropped.
+        assert_eq!(loaded.packages["ripgrep"].version, "15.2.0");
+    }
+
+    #[test]
     fn no_lockfile_under_either_name_is_none() {
         let tmp = tempfile::tempdir().unwrap();
         let canonical = seed(tmp.path(), "gate");
