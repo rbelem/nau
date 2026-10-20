@@ -170,17 +170,15 @@ fn resolve_exec(pod_dir: &Path, key: &str, command: &[String]) -> miette::Result
         .first()
         .ok_or_else(|| miette::miette!("secret '{key}' (source 'exec'): command array is empty"))?;
     let resolved = resolve_exec_program(pod_dir, key, "exec", program)?;
-    let output = std::process::Command::new(resolved)
-        .args(&command[1..])
-        .output()
-        .map_err(|e| {
-            miette::miette!("secret '{key}' (source 'exec'): could not run '{program}': {e}")
-        })?;
-    if !output.status.success() {
+    // ETXTBSY: see spawn_retry (issue #8).
+    let output = nau_infra::spawn_retry::output(&resolved, &command[1..]).map_err(|e| {
+        miette::miette!("secret '{key}' (source 'exec'): could not run '{program}': {e}")
+    })?;
+    if output.code != 0 {
         miette::bail!(
-            "secret '{key}' (source 'exec'): program '{program}' exited with {} \
+            "secret '{key}' (source 'exec'): program '{program}' exited with code {} \
              — provider stderr suppressed (ADR-0042 D8 masking)",
-            output.status
+            output.code
         );
     }
     let text = String::from_utf8(output.stdout).map_err(|_| {

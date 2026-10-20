@@ -89,10 +89,6 @@ pub const FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The fetch total-timeout twin of [`FETCH_CONNECT_TIMEOUT`] (see the
 /// note there — shared with the root crate's vault source).
 pub const FETCH_TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
-/// Exec-probe budget: three tries with a short gap covers the flaky
-/// ETXTBSY a heavily forking host can return for a just-closed file.
-const PROBE_ATTEMPTS: u32 = 3;
-const PROBE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Result alias for the tools module.
 pub type ToolsResult<T> = std::result::Result<T, ToolsError>;
@@ -695,46 +691,30 @@ fn stage_verified(spec: &ToolSpec, src: &mut dyn Read, stage_bin: &Path) -> Tool
 /// `NAU_TOOLS_DIR` workaround, so `doctor --fix` fails closed now
 /// instead of the first build failing later.
 ///
-/// ETXTBSY is retried briefly: the writable handle is long closed by then,
-/// and a spuriously busy reply can come from concurrent fork/exec activity
-/// on the host — never worth failing a provision over.
+/// ETXTBSY is retried by [`crate::spawn_retry`]: the writable handle is
+/// long closed by then, and a spuriously busy reply can come from
+/// concurrent fork/exec activity on the host — never worth failing a
+/// provision over.
 fn exec_probe(path: &Path, tool: &str) -> ToolsResult<()> {
-    let mut attempts = 0;
-    loop {
-        attempts += 1;
-        match crate::command::RealRunner::run_path(path, &["--version"]) {
-            Ok(out) if out.code == 0 => return Ok(()),
-            Ok(out) => {
-                return Err(ToolsError::ProbeFailed {
-                    tool: tool.into(),
-                    detail: match out.code {
-                        code if code >= 0 => format!("`--version` exited with status {code}"),
-                        _ => "`--version` was killed by a signal".into(),
-                    },
-                });
-            }
-            Err(e) if is_text_file_busy(&e) && attempts < PROBE_ATTEMPTS => {
-                std::thread::sleep(PROBE_RETRY_DELAY);
-            }
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                return Err(ToolsError::Noexec {
-                    tool: tool.into(),
-                    path: path.to_path_buf(),
-                    source: e,
-                });
-            }
-            Err(e) => {
-                return Err(io_context(
-                    format!("spawn '{tool}' for the exec probe at {}", path.display()),
-                    e,
-                ));
-            }
-        }
+    match crate::spawn_retry::spawn(|| crate::command::RealRunner::run_path(path, &["--version"])) {
+        Ok(out) if out.code == 0 => Ok(()),
+        Ok(out) => Err(ToolsError::ProbeFailed {
+            tool: tool.into(),
+            detail: match out.code {
+                code if code >= 0 => format!("`--version` exited with status {code}"),
+                _ => "`--version` was killed by a signal".into(),
+            },
+        }),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Err(ToolsError::Noexec {
+            tool: tool.into(),
+            path: path.to_path_buf(),
+            source: e,
+        }),
+        Err(e) => Err(io_context(
+            format!("spawn '{tool}' for the exec probe at {}", path.display()),
+            e,
+        )),
     }
-}
-
-fn is_text_file_busy(e: &io::Error) -> bool {
-    e.kind() == io::ErrorKind::ExecutableFileBusy || e.raw_os_error() == Some(26 /* ETXTBSY */)
 }
 
 /// A versioned directory counts as installed only when every manifest tool

@@ -64,8 +64,15 @@ impl CommandRunner for RealRunner {
 }
 
 impl RealRunner {
-    pub(crate) fn run_path(path: &std::path::Path, args: &[&str]) -> std::io::Result<RunnerOutput> {
-        let mut command = std::process::Command::new(path);
+    /// Run `path` with `args` through the seam. Widened over `AsRef` for the
+    /// retry helper's shape, which takes a program plus its argv as
+    /// `AsRef<OsStr>`; the governor attach lives in [`Self::run_command`],
+    /// so every path through here is covered.
+    pub(crate) fn run_path<S: AsRef<std::ffi::OsStr>>(
+        path: impl AsRef<std::path::Path>,
+        args: &[S],
+    ) -> std::io::Result<RunnerOutput> {
+        let mut command = std::process::Command::new(path.as_ref());
         command.args(args);
         Self::run_command(command)
     }
