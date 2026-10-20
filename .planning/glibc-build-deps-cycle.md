@@ -21,7 +21,9 @@ the toolchain pod's sync refuses:
 Error: × circular dependency while building 'gawk': toolchain-gcc-gnu-x86_64 → gawk → glibc → libgcc → gawk
 ```
 
-The stack reads bottom-up.
+The chain is the building stack, outermost first: the toolchain meta is the
+outer build, glibc and libgcc are in the middle, and gawk is the package
+that was already being built when the walk came back to it.
 
 - The toolchain meta's closure reaches gawk through glibc, because glibc's
   own `build_deps` are walked with the runtime closure.
