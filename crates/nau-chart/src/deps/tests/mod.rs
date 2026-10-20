@@ -56,4 +56,5 @@ fn init_local_input_source(root: &Path) {
     .unwrap();
 }
 
+mod test_build_view;
 mod test_topological;

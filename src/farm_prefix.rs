@@ -568,7 +568,7 @@ pub(crate) fn farm_build_prefix<T: TreeSource>(
     }
     // Constraint-aware closure (ADR-0047): members load with the line
     // their edge selected, exactly like the pod path.
-    let closure = crate::deps::resolve_dep_specs(&seeds, true)?;
+    let closure = crate::deps::resolve_build_dep_specs(meta)?;
     let mut payloads = Vec::new();
     for member in closure {
         let dep_meta = crate::deps::load_meta_for(&member.name, member.constraint.as_deref())?;

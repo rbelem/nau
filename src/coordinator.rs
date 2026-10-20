@@ -841,7 +841,7 @@ pub fn build_closure(meta: &SnapMeta, lockfile: &LockFile) -> crate::cache::Buil
     let mut names: Vec<String> = if seeds.is_empty() {
         Vec::new()
     } else {
-        crate::deps::resolve_dep_names(&seeds, true).unwrap_or_default()
+        crate::deps::resolve_build_dep_names(meta).unwrap_or_default()
     };
     names.sort();
     names.dedup();

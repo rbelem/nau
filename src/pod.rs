@@ -6651,7 +6651,7 @@ fn pod_build_prefix(
     // Constraint-aware closure (ADR-0047): build-payload members load
     // with the line their edge selected (`node@22` in a consumer's
     // requires), so the merged prefix stages the declared line.
-    let closure = crate::deps::resolve_dep_specs(&seeds, true)?;
+    let closure = crate::deps::resolve_build_dep_specs(meta)?;
     // The bool's lane mapping: strict on normal syncs (mismatch →
     // rebuild), Report on refresh reconciles (mismatch → loud line +
     // reuse, #177 — a refresh never churns an unnamed member).

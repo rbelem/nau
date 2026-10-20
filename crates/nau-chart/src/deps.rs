@@ -116,7 +116,27 @@ fn effective_constraints(
 /// `requires` ∪ `build_deps` transitively when `recursive`, and returns
 /// nodes in topological build order. Constraints merge through
 /// [`effective_constraints`].
-fn resolve_walk(seeds: &[String], recursive: bool) -> miette::Result<Vec<WalkNode>> {
+///
+/// `host` scopes the walk to a package under construction (the
+/// build-time view, [`build_view`]): an edge naming it is not followed,
+/// at any depth. Runtime callers pass `None` and keep every edge.
+fn resolve_walk(
+    seeds: &[String],
+    recursive: bool,
+    host: Option<&str>,
+) -> miette::Result<Vec<WalkNode>> {
+    resolve_walk_with(seeds, recursive, host, &load_meta_for)
+}
+
+/// [`resolve_walk`] with the recipe loader injected: the unit-test seam
+/// (recipes cannot be evaluated under the test harness — the eval worker
+/// re-executes `argv[0]`) and the one place the host rule lives.
+fn resolve_walk_with(
+    seeds: &[String],
+    recursive: bool,
+    host: Option<&str>,
+    load: &dyn Fn(&str, Option<&str>) -> miette::Result<SnapMeta>,
+) -> miette::Result<Vec<WalkNode>> {
     let mut nodes: Vec<WalkNode> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
     // name → every constraint any edge used to reach it (deduped).
@@ -128,7 +148,7 @@ fn resolve_walk(seeds: &[String], recursive: bool) -> miette::Result<Vec<WalkNod
     }
 
     while let Some((seed, constraint)) = pending.pop() {
-        let meta = load_meta_for(&seed, constraint.as_deref())?;
+        let meta = load(&seed, constraint.as_deref())?;
         // Canonical identity: a seed may name a package through an alias
         // (e.g. "toolchain" → toolchain-gcc-gnu-x86_64). Every downstream
         // consumer — payload naming, cache keys, build order — keys on the
@@ -173,6 +193,14 @@ fn resolve_walk(seeds: &[String], recursive: bool) -> miette::Result<Vec<WalkNod
         if recursive {
             for dep in requires.iter().chain(&build_deps) {
                 let (base, c) = split_dep_spec(dep)?;
+                // Transitive self-host rule (issue #4): the package under
+                // construction supplies its own payload, so an edge back
+                // to it is not walked. Scoped to the host name alone —
+                // every other edge, including the member's own runtime
+                // `requires`, still resolves.
+                if host == Some(base) {
+                    continue;
+                }
                 if !visited.contains(base) {
                     pending.push((base.to_string(), c.map(str::to_string)));
                 } else {
@@ -223,7 +251,7 @@ fn resolve_walk(seeds: &[String], recursive: bool) -> miette::Result<Vec<WalkNod
 /// (ADR-0047). Returns packages in topological build order (leaf
 /// dependencies first).
 pub fn resolve_deps(seeds: &[String], recursive: bool) -> miette::Result<Vec<DepNode>> {
-    Ok(resolve_walk(seeds, recursive)?
+    Ok(resolve_walk(seeds, recursive, None)?
         .into_iter()
         .map(|n| DepNode {
             name: n.name,
@@ -237,7 +265,7 @@ pub fn resolve_deps(seeds: &[String], recursive: bool) -> miette::Result<Vec<Dep
 /// edges selected — the load-with-constraint input for closure members
 /// (ADR-0047).
 pub fn resolve_dep_specs(seeds: &[String], recursive: bool) -> miette::Result<Vec<DepSpec>> {
-    Ok(resolve_walk(seeds, recursive)?
+    Ok(resolve_walk(seeds, recursive, None)?
         .into_iter()
         .map(|n| DepSpec {
             name: n.name,
@@ -461,6 +489,10 @@ pub fn recipe_dir(name_or_path: &str) -> Option<PathBuf> {
     };
     Path::new(&path).parent().map(Path::to_path_buf)
 }
+
+mod build_view;
+
+pub use build_view::{resolve_build_dep_names, resolve_build_dep_nodes, resolve_build_dep_specs};
 
 #[cfg(test)]
 mod tests;
