@@ -21,18 +21,14 @@ return {
         architectures = { "amd64", "arm64", "armhf" },
         type = "source",
         requires = { "linux-headers" },
-        -- The build tools the sandbox stages for configure/make (the
-        -- build/link split, ADR-0018): glibc's configure demands bison and
-        -- awk unconditionally (config.status runs awk even with
-        -- pre-generated parsers in the tarball), and it needs a compiler
-        -- and make to do anything at all. Every one of them requires
-        -- glibc back, which used to make this declaration a hard cycle
-        -- (glibc → gawk → glibc refused every daily sync, 2026-10-03). The
-        -- resolver's host-scoped build view now drops an edge naming the
-        -- package under construction (crates/nau-chart/src/deps/build_view.rs,
-        -- issue #4), so the tools ride THIS closure without dragging the
-        -- pool glibc payload into glibc's own build prefix.
-        build_deps = { "gcc", "make", "bison", "gawk" },
+        -- NOTE (2026-10-03): glibc cannot declare its own build_deps —
+        -- every build tool requires glibc, and the resolver walks
+        -- build_deps edges with the runtime closure, so glibc → gawk →
+        -- glibc is a hard cycle (live: every daily sync refused after
+        -- the attempt). The build tools ride the ambient build-deps
+        -- floor instead; bison+gawk joined that floor's requires in the
+        -- same window. A scoped build-sandbox resolution (build_deps
+        -- edges outside the runtime closure graph) is the real fix.
         source = {
             url = "https://ftp.gnu.org/gnu/glibc/glibc-2.44.tar.xz",
             sha256 = "37f600f2bef3c5e8300147059568b2a2e40a7ad6ccc65ce942556d49429cc667",
