@@ -154,6 +154,12 @@ fi
 echo "gate: dep-direction (ADR-0051 R1): checking workspace edges"
 bash scripts/dep-direction.sh
 
+# Only target-clean.sh may invoke cargo clean, and it must hold the
+# claim. A new cleaner that bypasses the channel would delete artifacts
+# under a live run, so this check fails the gate instead.
+echo "gate: target-writes: only the claim holder cleans"
+bash scripts/target-writes.sh
+
 # ── luau dup-dep tripwire (luau-dedupe lane, 2026-10-03): the vendored
 # analyzer build resolves Ast/Config/VM against mlua's luau0-src objects
 # (40476e0), so the crate graph must carry exactly ONE luau/mlua source —
