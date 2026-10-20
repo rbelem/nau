@@ -35,6 +35,27 @@ as errors. The two pod-gate rows are the ratified substitute for the lint
 axes — same verdicts as the devbox pin (evidence in the endgame section
 below).
 
+### The `target/` claim channel
+
+The gate, a dev-loop sync, and the disk-reclaim sweep all write to the same
+`target/` tree, so they share one claim. `scripts/target-claim.sh` takes a
+flock on a file that sits BESIDE the tree (`target.claim`), never inside it:
+`cargo clean` removes `target/` outright, and a claim file that goes with it
+takes the flock's inode with it, so the next holder locks a fresh inode and
+the channel stops excluding anyone (issue #14). The flock is the truth; the
+file holds a readable holder line.
+
+```bash
+bash scripts/target-claim.sh check   # exit 0 when free, 2 + holder when held
+bash scripts/target-claim.sh holder  # print the holder line
+bash scripts/target-clean.sh         # clean target/ behind the claim
+bash scripts/target-claim-test.sh    # the suite that pins the channel
+```
+
+Only `scripts/target-clean.sh` may run `cargo clean`, and it must go through
+the claim. `scripts/target-writes.sh` fails the gate when another script
+cleans outside it.
+
 ### Why the gate script pins gcc14 (2026-09-26 incident)
 
 The host toolchain floats: `nix shell nixpkgs#gcc` resolved gcc 14.x one
