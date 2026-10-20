@@ -84,16 +84,17 @@ export CARGO_INCREMENTAL=0
 # target/debug; a clean mid-flight). The flock is the truth (a dead
 # holder releases it); the advert line is the readable holder name.
 mkdir -p target
-exec 9>>target/.claim
+CLAIM_FILE="$(bash scripts/target-claim.sh path)"
+exec 9>>"$CLAIM_FILE"
 if ! flock -n 9; then
     echo "gate: FAIL — target/ is held by:" >&2
-    echo "  $(cat target/.claim 2>/dev/null || echo '(no advert file)')" >&2
-    echo "  wait for the holder; only clear target/.claim if it is" \
+    echo "  $(cat "$CLAIM_FILE" 2>/dev/null || echo '(no advert file)')" >&2
+    echo "  wait for the holder; only clear $CLAIM_FILE if it is" \
          "provably stale (#349)." >&2
     exit 2
 fi
-printf '%s gate %s\n' "$$" "$(date -Is)" >target/.claim
-trap 'flock -u 9; : > target/.claim' EXIT
+printf '%s gate %s\n' "$$" "$(date -Is)" >"$CLAIM_FILE"
+trap 'flock -u 9; : > "$CLAIM_FILE" 2>/dev/null || true' EXIT
 echo "gate: claim axis: target/ claimed (pid $$)"
 
 # ── Gated-suite tool preflight (#291): a tool absent in the gate is a

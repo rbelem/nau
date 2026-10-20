@@ -47,5 +47,8 @@ graphify-out/
 .opencode/skills/
 .impeccable/
 
+# The target/ claim file sits beside the build tree (scripts/target-claim.sh)
+/target.claim
+
 # Python bytecode from repo scripts
 __pycache__/
