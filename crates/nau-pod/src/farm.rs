@@ -514,7 +514,6 @@ pub fn emit(store: &StoreView, gen: &Generation) -> miette::Result<PathBuf> {
                 gen.n,
                 pkg,
                 asm,
-                ships_libs,
                 &lib_list,
                 namespace.as_ref(),
                 &mut seen,
@@ -558,12 +557,12 @@ fn emit_cargo_subcommand_shims<'a>(
     n: u64,
     pkg: &'a InstalledPackage,
     asm: &'a AppAssembly,
-    ships_libs: bool,
     lib_list: &str,
     namespace: Option<&crate::ld_wrapper::Namespace<'_>>,
     seen: &mut std::collections::BTreeMap<&'a str, (&'a str, ClaimLayer)>,
 ) -> miette::Result<()> {
     let farm = farm_dir(store, n);
+    let ships_libs = !lib_list.is_empty();
     for rel in asm.files.keys() {
         if rel.contains('/') {
             continue;
