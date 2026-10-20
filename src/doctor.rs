@@ -1115,9 +1115,7 @@ pub(crate) fn check_pod_version_lines_with(root: &Path) -> Check {
     // package → [(pod, line)], pods in sorted order.
     let mut lines: std::collections::BTreeMap<String, Vec<(String, String)>> = Default::default();
     for pod in pods {
-        let lock =
-            crate::lock::LockFile::load(&root.join(&pod).join(crate::lock::LockFile::FILENAME));
-        let Ok(Some(lock)) = lock else {
+        let Ok(Some(lock)) = crate::pod::load_pod_lock(&root, &pod) else {
             continue;
         };
         for (pkg, entry) in lock.packages {

@@ -495,3 +495,57 @@ fn test_source_entry_validator_fields_roundtrip_verbatim() {
     assert_eq!(validators.etag, "\"33a64df551425fcc\"");
     assert_eq!(validators.recorded_sha256, "abc123");
 }
+
+#[test]
+fn test_merge_missing_from_fills_gaps_and_keeps_the_target() {
+    let package = |version: &str| PodPackageLockEntry {
+        version: version.to_string(),
+        constraint: None,
+        deps: None,
+        recipe_sha256: None,
+        recipe_digest_scheme: None,
+    };
+
+    let mut target = LockFile::empty();
+    target.packages.insert("gcc".into(), package("16.2.0"));
+    target.snaps.insert(
+        "core22".into(),
+        SnapLockEntry {
+            revision: 1847,
+            sha3_384: "aa".into(),
+        },
+    );
+
+    let mut other = LockFile::empty();
+    other.packages.insert("gcc".into(), package("14.2.0"));
+    other.packages.insert("ripgrep".into(), package("15.2.0"));
+    other.snaps.insert(
+        "other".into(),
+        SnapLockEntry {
+            revision: 1,
+            sha3_384: "bb".into(),
+        },
+    );
+    other.sources.insert(
+        "https://example.com/src.tar.gz".to_string(),
+        SourceLockEntry {
+            sha256: "abc".into(),
+            etag: None,
+            validated_at: None,
+        },
+    );
+
+    target.merge_missing_from(&other);
+
+    assert_eq!(
+        target.packages["gcc"].version, "16.2.0",
+        "the target's own entry wins"
+    );
+    assert_eq!(
+        target.packages["ripgrep"].version, "15.2.0",
+        "the gap is filled from the other file"
+    );
+    assert_eq!(target.snaps["core22"].revision, 1847);
+    assert_eq!(target.snaps["other"].revision, 1);
+    assert_eq!(target.sources.len(), 1);
+}
