@@ -28,8 +28,10 @@ pub mod confine;
 pub mod desktop;
 pub mod farm;
 pub mod fonts;
+pub mod ld_wrapper;
 pub mod loader_libs;
 pub mod pod;
+pub mod rootfs;
 pub mod secrets;
 
 #[cfg(test)]

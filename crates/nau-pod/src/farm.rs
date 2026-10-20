@@ -85,15 +85,15 @@ pub const CURRENT_LINK: &str = "current";
 /// the generation dir, so `current` swaps it atomically on rollback.
 pub const ASSEMBLY_DIR: &str = "apps";
 
-/// The per-generation LD-wrapper area (issue #110, ADR-0034):
-/// `generations/<n>/ld-wrappers/<app>`. For every app of a package that
-/// ships loader-lib dirs, the emit writes a two-line sh script that
-/// sets `LD_LIBRARY_PATH` to the generation's recorded dirs (resolved
-/// generation-relative through the wrapper's own location) and execs
-/// the app's normal entry target. The farm entry for such an app points
-/// here instead of at the binary, so the pod's libraries ride only the
-/// processes the pod launches — never the ambient shell (#110).
-pub const LD_WRAPPERS_DIR: &str = "ld-wrappers";
+/// The per-generation LD-wrapper area (issue #110, ADR-0034) lives in
+/// [`crate::ld_wrapper`]; the constant is re-exported here because the
+/// confinement launcher resolves it through the farm namespace.
+pub use crate::ld_wrapper::LD_WRAPPERS_DIR;
+
+/// Generation-relative LD-wrapper directory helper, kept importable by
+/// this module's tests.
+#[cfg(test)]
+use crate::ld_wrapper::dir as ld_wrappers_dir;
 
 /// The generation's recorded loader-lib dirs (issue #89):
 /// `generations/<n>/loader-libs` — one generation-relative directory per
@@ -407,7 +407,7 @@ pub fn emit(store: &StoreView, gen: &Generation) -> miette::Result<PathBuf> {
     std::fs::create_dir_all(&farm)
         .map_err(|e| miette::miette!("creating farm {}: {e}", farm.display()))?;
     reset_assembly(store, gen.n)?;
-    reset_ld_wrappers(store, gen.n)?;
+    crate::ld_wrapper::reset(store, gen.n)?;
     // Issue #110 (ADR-0034): the generation's loader-lib dirs, rendered
     // as wrapper-relative `$d/../…` paths once — every LD wrapper for
     // this generation embeds the same list, in the record's layer-first
@@ -419,6 +419,25 @@ pub fn emit(store: &StoreView, gen: &Generation) -> miette::Result<PathBuf> {
         .map(|rel| format!("$d/../{rel}"))
         .collect::<Vec<_>>()
         .join(":");
+    // The pod rootfs (crate::rootfs): a loader-carrying generation gets
+    // a mount namespace whose interpreter slot is the pod's own loader,
+    // and the gather that gives the pod its /usr/lib. bwrap resolves at
+    // emit time and is baked into each wrapper; the wrapper fails loudly
+    // if it was absent here.
+    let rootfs = crate::rootfs::prepare(store, gen)?;
+    let host_usr_children = if rootfs.is_some() {
+        crate::ld_wrapper::host_usr_children()
+    } else {
+        Vec::new()
+    };
+    let bwrap = rootfs
+        .as_ref()
+        .and_then(|_| crate::ld_wrapper::resolve_bwrap());
+    let namespace = rootfs.as_ref().map(|rootfs| crate::ld_wrapper::Namespace {
+        bwrap: bwrap.as_deref(),
+        rootfs,
+        host_usr_children: &host_usr_children,
+    });
     // ADR-0028 semantics, verbatim: when the generation ships ANY
     // loader-lib dirs, every farm app gets the full layer-first list —
     // a binary's libs live in its requires closure's extension dirs
@@ -446,7 +465,7 @@ pub fn emit(store: &StoreView, gen: &Generation) -> miette::Result<PathBuf> {
             let _ = std::fs::remove_file(&link);
             let target = if ships_libs {
                 let real = entry_target_rel(store, gen.n, pkg, app, hash)?;
-                write_ld_wrapper(store, gen.n, app, &real, &lib_list)?
+                crate::ld_wrapper::write(store, gen.n, app, &real, &lib_list, namespace.as_ref())?
             } else {
                 entry_target_rel(store, gen.n, pkg, app, hash)?
             };
@@ -472,7 +491,7 @@ pub fn emit(store: &StoreView, gen: &Generation) -> miette::Result<PathBuf> {
             let _ = std::fs::remove_file(&link);
             let target = if ships_libs {
                 let real = entry_target_rel(store, gen.n, pkg, svc, hash)?;
-                write_ld_wrapper(store, gen.n, svc, &real, &lib_list)?
+                crate::ld_wrapper::write(store, gen.n, svc, &real, &lib_list, namespace.as_ref())?
             } else {
                 entry_target_rel(store, gen.n, pkg, svc, hash)?
             };
@@ -490,7 +509,16 @@ pub fn emit(store: &StoreView, gen: &Generation) -> miette::Result<PathBuf> {
         // that app. Same layer precedence as apps via `seen`; a name
         // the package already declares as an app stays untouched.
         if let Some(asm) = pkg.assembly.get("cargo") {
-            emit_cargo_subcommand_shims(store, gen.n, pkg, asm, ships_libs, &lib_list, &mut seen)?;
+            emit_cargo_subcommand_shims(
+                store,
+                gen.n,
+                pkg,
+                asm,
+                ships_libs,
+                &lib_list,
+                namespace.as_ref(),
+                &mut seen,
+            )?;
         }
     }
     // The Freedesktop launcher set is part of the generation (issue #7):
@@ -532,6 +560,7 @@ fn emit_cargo_subcommand_shims<'a>(
     asm: &'a AppAssembly,
     ships_libs: bool,
     lib_list: &str,
+    namespace: Option<&crate::ld_wrapper::Namespace<'_>>,
     seen: &mut std::collections::BTreeMap<&'a str, (&'a str, ClaimLayer)>,
 ) -> miette::Result<()> {
     let farm = farm_dir(store, n);
@@ -560,7 +589,7 @@ fn emit_cargo_subcommand_shims<'a>(
         let _ = std::fs::remove_file(&link);
         let target = shim_target_rel(store, n, &pkg.name, asm, rel);
         let target = if ships_libs {
-            write_ld_wrapper(store, n, name, &target, lib_list)?
+            crate::ld_wrapper::write(store, n, name, &target, lib_list, namespace)?
         } else {
             target
         };
@@ -608,93 +637,6 @@ fn reset_assembly(store: &StoreView, n: u64) -> miette::Result<()> {
             .map_err(|e| miette::miette!("clearing stale assembly {}: {e}", dir.display()))?;
     }
     Ok(())
-}
-
-/// Path of generation `n`'s LD-wrapper area (issue #110):
-/// `generations/<n>/ld-wrappers`.
-fn ld_wrappers_dir(store: &StoreView, n: u64) -> PathBuf {
-    store.generation_dir(n).join(LD_WRAPPERS_DIR)
-}
-
-/// Clear and recreate the LD-wrapper area. Runs on every emit — the
-/// same full-rebuild rule as [`reset_assembly`], so a generation that
-/// lost its lib payloads (or an older emit's wrappers for renamed
-/// apps) never leaves stale wrappers behind.
-fn reset_ld_wrappers(store: &StoreView, n: u64) -> miette::Result<()> {
-    let dir = ld_wrappers_dir(store, n);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir)
-            .map_err(|e| miette::miette!("clearing stale ld-wrappers {}: {e}", dir.display()))?;
-    }
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| miette::miette!("creating ld-wrappers {}: {e}", dir.display()))
-}
-
-/// Write one app's LD wrapper (issue #110, ADR-0034) and return the
-/// farm-relative symlink target for it. The script resolves its own
-/// location (the wrapper file under `generations/<n>/ld-wrappers/`),
-/// sets `LD_LIBRARY_PATH` to the generation's recorded loader-lib dirs
-/// resolved generation-relative (`$d/../extensions/...` — the same
-/// through-the-generation trick the shellenv entries used, so the
-/// `current` flip re-scopes it atomically on rollback), and execs the
-/// app's normal entry target. Every path in the script is prefixed with
-/// the resolved `$d` — relative targets would resolve against the
-/// caller's CWD, not the script's, and break from any other directory.
-/// SET, never compose-prepend: the pod's libraries ride only this
-/// process, and whatever ambient `LD_LIBRARY_PATH` the caller carried
-/// stops at the wrapper (#110).
-/// Self-location uses shell builtins only (`${0%/*}` plus a symlink
-/// test): farm entries are links into `ld-wrappers`, so no `readlink`
-/// or `dirname` binary is needed. That keeps wrappers working on hosts
-/// without system coreutils, and unique PATH names are unnecessary.
-fn write_ld_wrapper(
-    store: &StoreView,
-    n: u64,
-    app: &str,
-    real_target: &str,
-    lib_list: &str,
-) -> miette::Result<String> {
-    let path = ld_wrappers_dir(store, n).join(app);
-    // The lib dirs ride THREE loader/search variables, not one (issue
-    // #164): LD_LIBRARY_PATH (runtime loader, the original contract),
-    // LIBRARY_PATH (gcc/clang drivers map it onto -L AND startfile
-    // search — a C driver in a toolchain payload must find the pod's
-    // Scrt1.o/-lc at link time; they live in the same recorded dirs) and
-    // CPATH (every extensions package's usr/usr/include, so the driver's
-    // preprocessor resolves the pod's libc/kernel headers instead of the
-    // host's — the wrapper is generation-relative, so the glob re-scopes
-    // atomically on rollback like every other $d path).
-    //
-    // COMPILER_PATH (issue #164): where the driver — and collect2, which
-    // inherits the same env — searches for its SUBPROGRAMS (as, ld, ar)
-    // before falling back to PATH. The deb payload ships them at
-    // usr/usr/bin; without this the driver dies at posix_spawnp on a
-    // caller whose PATH has no binutils. Inert for non-compiler apps.
-    let body = format!(
-        "#!/bin/sh\n\
-         d=${{0%/*}}\n\
-         [ -L \"$0\" ] && d=$d/../ld-wrappers\n\
-         LD_LIBRARY_PATH=\"{lib_list}\"\n\
-         LIBRARY_PATH=\"$LD_LIBRARY_PATH\"\n\
-         CPATH=\n\
-         COMPILER_PATH=\n\
-         for i in \"$d\"/../extensions/*/usr/usr/include; do\n\
-         \x20 [ -d \"$i\" ] && CPATH=\"$CPATH$i:\"\n\
-         done\n\
-         CPATH=\"${{CPATH%:}}\"\n\
-         for i in \"$d\"/../extensions/*/usr/usr/bin; do\n\
-         \x20 [ -d \"$i\" ] && COMPILER_PATH=\"$COMPILER_PATH$i:\"\n\
-         done\n\
-         COMPILER_PATH=\"${{COMPILER_PATH%:}}\"\n\
-         export LD_LIBRARY_PATH LIBRARY_PATH CPATH COMPILER_PATH\n\
-         exec \"$d/../farm/{real_target}\" \"$@\"\n"
-    );
-    std::fs::write(&path, &body)
-        .map_err(|e| miette::miette!("writing ld-wrapper {}: {e}", path.display()))?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| miette::miette!("chmod {}: {e}", path.display()))?;
-    Ok(format!("../{LD_WRAPPERS_DIR}/{app}"))
 }
 
 /// The relative symlink target for one farm entry, building the

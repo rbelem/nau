@@ -30,12 +30,15 @@ pub const LOADER_LIB_SUBDIRS: [&str; 4] = [
 ];
 
 /// One loader-lib dir of the generation, in loader search order, with
-/// the package that ships it. The package name is what the namespace
-/// gather's fail-closed conflict error names.
+/// the package that ships it and the payload-relative subdirectory it
+/// came from. The package name is what the namespace gather's
+/// fail-closed conflict error names; the subdirectory is what maps the
+/// dir to an FHS position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoaderLibDir {
     pub rel: String,
     pub pkg: String,
+    pub sub: String,
 }
 
 /// Collect the generation's loader-lib dirs with their owning package,
@@ -48,7 +51,7 @@ pub struct LoaderLibDir {
 /// changes.
 pub fn loader_lib_entries(store: &StoreView, gen: &Generation) -> Vec<LoaderLibDir> {
     let extensions = store.generation_dir(gen.n).join("extensions");
-    let mut dirs: Vec<(ClaimLayer, String, String)> = Vec::new();
+    let mut dirs: Vec<(ClaimLayer, String, String, String)> = Vec::new();
     for pkg in layered_packages(gen) {
         for sub in LOADER_LIB_SUBDIRS {
             let rel = format!("extensions/{}/{}", pkg.name, sub);
@@ -67,12 +70,12 @@ pub fn loader_lib_entries(store: &StoreView, gen: &Generation) -> Vec<LoaderLibD
             // answers /lib64/ld-linux-x86-64.so.2 (crate::rootfs), and
             // this list supplies the pod's libc from the loader path —
             // the matched pair decision one encodes.
-            dirs.push((pkg.layer, pkg.name.clone(), rel));
+            dirs.push((pkg.layer, pkg.name.clone(), rel, sub.to_string()));
         }
     }
     dirs.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     dirs.into_iter()
-        .map(|(_, pkg, rel)| LoaderLibDir { rel, pkg })
+        .map(|(_, pkg, rel, sub)| LoaderLibDir { rel, pkg, sub })
         .collect()
 }
 
