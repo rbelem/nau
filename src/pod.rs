@@ -99,9 +99,9 @@ pub use nau_core::paths::{pod_dir, resolve_pod_dir_under, validate_pod_name, DEF
 // parameter there (eval stays root, mlua-direct); the wrappers below
 // keep the original signatures, injecting [`load_declaration`].
 pub use nau_pod::pod::{
-    load_pod_lock, parse_pod_package, pod_lock_path, pod_lua_path, render_pod_source,
-    render_shellenv, shellenv, shellenv_with, PodDeclaration, PodPackageSpec, PodShellenv,
-    POD_FILE,
+    load_pod_lock, parse_pod_package, pod_lock_path, pod_lua_path, remove_pod_pins,
+    render_pod_source, render_shellenv, shellenv, shellenv_with, PodDeclaration, PodPackageSpec,
+    PodShellenv, POD_FILE,
 };
 pub use nau_pod::secrets::SecretSource;
 
@@ -2381,15 +2381,7 @@ pub fn remove_package(
     let decl_path = pod_lua_path(root, pod_name);
     write_pod_declaration(&decl_path, &render_pod_source(&decl))?;
 
-    let lock_path = pod_lock_path(root, pod_name);
-    if let Some(mut lock) = load_pod_lock(root, pod_name)? {
-        lock.packages.remove(&spec.name);
-        // A sideloaded package's blob pin goes with it (issue #116): a
-        // stale `snaps` entry would hold a future re-add of the same
-        // name from the collection at phantom content.
-        lock.snaps.remove(&spec.name);
-        lock.save(&lock_path)?;
-    }
+    remove_pod_pins(root, pod_name, &spec.name)?;
 
     // Degraded-safe (issue #16): removals never unpack, so the
     // reconcile proceeds without the squashfs pair — and its declared

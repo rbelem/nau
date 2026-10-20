@@ -41,9 +41,8 @@ pub fn pod_lua_path(root: &Path, pod_name: &str) -> PathBuf {
     nau_core::paths::pod_dir(root, pod_name).join(POD_FILE)
 }
 
-// Lockfile discovery (issue #3): `nau.lock` writes, either name reads.
 pub mod lockfile;
-pub use lockfile::{load_pod_lock, pod_lock_path};
+pub use lockfile::{load_pod_lock, pod_lock_path, remove_pod_pins};
 
 // ── Package specs ──
 

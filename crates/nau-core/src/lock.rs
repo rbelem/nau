@@ -174,6 +174,18 @@ fn is_empty_build_deps(m: &HashMap<String, BuildDepsLockEntry>) -> bool {
     m.is_empty()
 }
 
+/// Copy the entries `other` holds and `target` lacks. The target's own
+/// entry wins where both have one.
+fn fill_gaps<K, V>(target: &mut HashMap<K, V>, other: &HashMap<K, V>)
+where
+    K: Clone + Eq + std::hash::Hash,
+    V: Clone,
+{
+    for (key, value) in other {
+        target.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+}
+
 /// A single build-dependency pin (ADR-0018 Decision 4, issue #22): the
 /// resolved version observed when the dependency first entered the build
 /// closure, plus the optional content hash when the lockfile has it.
@@ -286,6 +298,28 @@ impl LockFile {
             packages: HashMap::new(),
             build_deps: HashMap::new(),
         }
+    }
+
+    /// Fill this lockfile's gaps from `other`: every map keeps this
+    /// file's entry when it has one and takes `other`'s entry when it
+    /// does not. The caller decides which file is which.
+    ///
+    /// A pod can carry two lockfiles, the canonical name and the
+    /// pre-rename one, and the canonical file is not necessarily the
+    /// complete record: a writer that had already learned the new name
+    /// but still read the old one started from an empty lock and saved
+    /// only the packages it had touched. Taking either file whole drops
+    /// the pins the other one holds (issue #20).
+    ///
+    /// Every map in [`LockFile`] is merged here. A map added to the
+    /// struct later must be added here too, or its entries are dropped
+    /// silently.
+    pub fn merge_missing_from(&mut self, other: &LockFile) {
+        fill_gaps(&mut self.sources, &other.sources);
+        fill_gaps(&mut self.snaps, &other.snaps);
+        fill_gaps(&mut self.inputs, &other.inputs);
+        fill_gaps(&mut self.packages, &other.packages);
+        fill_gaps(&mut self.build_deps, &other.build_deps);
     }
 
     /// Load lockfile from disk. Returns `None` if the file doesn't exist.
