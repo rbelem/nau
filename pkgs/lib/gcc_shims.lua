@@ -24,6 +24,16 @@ local M = {}
 -- The loader ships beside the libc it matches, so the pair is what the
 -- search looks for; a pod with no glibc extension finds none and the
 -- binary starts normally.
+--
+-- Since the pod rootfs landed (crates/nau-pod/src/rootfs.rs) this is a
+-- FALLBACK, not the primary mechanism. The farm wrapper and the pod's
+-- systemd units enter a mount namespace in which the pod's loader
+-- answers /lib64/ld-linux-x86-64.so.2, so the kernel starts the driver
+-- AND its children on the matching loader. The search stays for
+-- contexts with no namespace: a directly invoked payload tool with the
+-- pair on LD_LIBRARY_PATH. In the build sandbox the prefix's loader
+-- list omits the root slibdir (crates/nau-build/src/prefix_paths.rs),
+-- so it finds nothing and execs directly, exactly as before.
 local LOADER_SEARCH = [[
 ld=
 ifs=\$IFS; IFS=:
