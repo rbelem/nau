@@ -61,7 +61,8 @@ pub fn load_pod_lock(root: &Path, pod_name: &str) -> miette::Result<Option<LockF
 mod tests {
     use super::*;
 
-    fn seed(root: &Path, pod: &str, lock: &LockFile) -> PathBuf {
+    /// The pod directory plus its canonical lockfile path (unwritten).
+    fn seed(root: &Path, pod: &str) -> PathBuf {
         let dir = nau_core::paths::pod_dir(root, pod);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(LockFile::FILENAME)
@@ -85,7 +86,7 @@ mod tests {
     #[test]
     fn legacy_shuttle_lock_is_read_when_canonical_is_absent() {
         let tmp = tempfile::tempdir().unwrap();
-        let canonical = seed(tmp.path(), "gate", &lock_with("14.2.0"));
+        let canonical = seed(tmp.path(), "gate");
         let legacy = canonical.with_file_name(LEGACY_LOCK_FILE);
         lock_with("14.2.0").save(&legacy).unwrap();
 
@@ -97,7 +98,7 @@ mod tests {
     #[test]
     fn canonical_wins_when_both_names_exist() {
         let tmp = tempfile::tempdir().unwrap();
-        let canonical = seed(tmp.path(), "gate", &lock_with("16.2.0"));
+        let canonical = seed(tmp.path(), "gate");
         lock_with("16.2.0").save(&canonical).unwrap();
         lock_with("14.2.0")
             .save(&canonical.with_file_name(LEGACY_LOCK_FILE))
@@ -111,7 +112,7 @@ mod tests {
     #[test]
     fn no_lockfile_under_either_name_is_none() {
         let tmp = tempfile::tempdir().unwrap();
-        let canonical = seed(tmp.path(), "gate", &lock_with("14.2.0"));
+        let canonical = seed(tmp.path(), "gate");
         assert!(!canonical.exists());
         assert_eq!(pod_lock_read_path(tmp.path(), "gate"), canonical);
         assert!(load_pod_lock(tmp.path(), "gate").unwrap().is_none());
@@ -122,7 +123,7 @@ mod tests {
         // The migration is the next write: load through the resolver,
         // save to the canonical path, and the pin set is preserved.
         let tmp = tempfile::tempdir().unwrap();
-        let canonical = seed(tmp.path(), "gate", &lock_with("14.2.0"));
+        let canonical = seed(tmp.path(), "gate");
         lock_with("14.2.0")
             .save(&canonical.with_file_name(LEGACY_LOCK_FILE))
             .unwrap();

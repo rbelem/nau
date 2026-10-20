@@ -100,12 +100,12 @@ pub use nau_core::paths::{pod_dir, resolve_pod_dir_under, validate_pod_name, DEF
 // keep the original signatures, injecting [`load_declaration`].
 pub use nau_pod::pod::{
     load_pod_lock, parse_pod_package, pod_lock_path, pod_lua_path, render_pod_source,
-    render_shellenv, shellenv, shellenv_with, PodDeclaration, PodPackageSpec, PodShellenv, POD_FILE,
+    render_shellenv, shellenv, shellenv_with, PodDeclaration, PodPackageSpec, PodShellenv,
+    POD_FILE,
 };
 pub use nau_pod::secrets::SecretSource;
 
-// `pod list` (issue #3): version-source resolution, `list_packages`,
-// and its rendering — moved out of this file byte-budget-wise.
+// `pod list` (issue #3): resolution and rendering, moved for size.
 pub mod list_view;
 pub use list_view::{list_packages, print as print_pod_packages};
 

@@ -162,7 +162,6 @@ pub fn list_packages(root: &Path, pod_name: &str) -> miette::Result<Vec<PodListE
     Ok(entries)
 }
 
-
 /// Render `nau pod list`: one `spec  version  source` row per package,
 /// with the ADR-0017 float marking kept as the trailing `(float)`.
 /// Columns are space-separated and the source word is drawn from a

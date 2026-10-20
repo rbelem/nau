@@ -221,7 +221,10 @@ fn no_generation_no_lock_reports_the_recipe() {
     assert_eq!(code, Some(0), "stderr: {stderr}");
     let cells = row(&stderr, "jq");
     assert_eq!(cells[1], "1.7.1", "{stderr}");
-    assert_eq!(cells[2], "recipe", "a recipe match must not look pinned: {stderr}");
+    assert_eq!(
+        cells[2], "recipe",
+        "a recipe match must not look pinned: {stderr}"
+    );
 }
 
 #[test]
@@ -257,5 +260,8 @@ fn float_marking_survives_beside_the_source() {
     assert_eq!(code, Some(0), "stderr: {stderr}");
     let cells = row(&stderr, "gcc");
     assert_eq!(cells[2], "recipe", "{stderr}");
-    assert_eq!(cells[3], "(float)", "the ADR-0017 float tag survives: {stderr}");
+    assert_eq!(
+        cells[3], "(float)",
+        "the ADR-0017 float tag survives: {stderr}"
+    );
 }
