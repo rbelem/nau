@@ -147,17 +147,22 @@ mod tests {
         let legacy = canonical.with_file_name(LEGACY_LOCK_FILE);
 
         let mut canonical_lock = lock_with("16.2.0");
-        canonical_lock.packages.insert("rust".into(), package("1.97.1"));
+        canonical_lock
+            .packages
+            .insert("rust".into(), package("1.97.1"));
         canonical_lock.save(&canonical).unwrap();
 
         let mut legacy_lock = lock_with("14.2.0");
-        legacy_lock.packages.insert("ripgrep".into(), package("15.2.0"));
         legacy_lock
-            .snaps
-            .insert("toolchain".into(), nau_core::lock::SnapLockEntry {
+            .packages
+            .insert("ripgrep".into(), package("15.2.0"));
+        legacy_lock.snaps.insert(
+            "toolchain".into(),
+            nau_core::lock::SnapLockEntry {
                 revision: 0,
                 sha3_384: "abc".into(),
-            });
+            },
+        );
         legacy_lock.save(&legacy).unwrap();
 
         let loaded = load_pod_lock(tmp.path(), "gate").unwrap().unwrap();
