@@ -90,8 +90,9 @@ pub struct ServiceUnit {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub options: BTreeMap<String, serde_json::Value>,
     /// The service-declared environment literals (the generation's
-    /// recorded env and the loader-lib `LD_LIBRARY_PATH` are composed
-    /// into the rendered `text`, not duplicated here).
+    /// recorded env is composed into the rendered `text`, not duplicated
+    /// here; the pod's loader path never rides the unit — the farm
+    /// wrapper owns it).
     pub environment: BTreeMap<String, String>,
     /// The advisory `after` ordering targets, as declared.
     pub after: Vec<String>,
@@ -218,11 +219,12 @@ pub fn user_systemd_unit_dir() -> PathBuf {
 /// threading there, by intent (see the module docs).
 ///
 /// Must run AFTER `farm::write_generation_env`: the rendered text
-/// composes the generation's recorded env. The loader-lib dirs come from
-/// [`crate::farm::loader_lib_dirs`] — the same computation
-/// `record_loader_libs` writes — so a generation's very first record
-/// already carries `LD_LIBRARY_PATH` with no ordering dependency on the
-/// recorded file.
+/// composes the generation's recorded env. The unit deliberately carries
+/// NO `LD_LIBRARY_PATH`: `ExecStart` is the farm entry, which is the LD
+/// wrapper (crate::ld_wrapper), and that wrapper owns the pod's loader
+/// path inside its mount namespace. An `Environment=` line would inject
+/// the pod's libc into the host `/bin/sh` that starts the wrapper and
+/// into bwrap itself, outside the namespace.
 pub fn record(
     store: &RuntimeStore,
     gen: &Generation,
@@ -247,7 +249,6 @@ pub fn record_in(
         home: &std::env::var("HOME").unwrap_or_else(|_| ".".into()),
         extensions: current.join("../extensions").to_string_lossy().into_owned(),
         gen_env: read_generation_env(&crate::farm::env_path(&store.store_view(), gen.n))?,
-        loader_libs: crate::farm::loader_lib_dirs(&store.store_view(), gen),
         current: current.to_string_lossy().into_owned(),
         // ADR-0042 D3 (issue #184): the pod's 0600 runtime envfile,
         // derived from the references' decl-hash alone — record bakes
@@ -332,9 +333,6 @@ struct ResolveCtx<'a> {
     extensions: String,
     /// The generation's recorded env (ADR-0030), composed into the unit.
     gen_env: BTreeMap<String, String>,
-    /// The generation's loader-lib dirs (generation-relative), composed
-    /// into one `LD_LIBRARY_PATH` line through `current`.
-    loader_libs: Vec<String>,
     /// The absolute `current` path.
     current: String,
     /// The pod's 0600 runtime secrets envfile (ADR-0042 D3, issue
@@ -357,23 +355,15 @@ fn build_unit(
     let args = expand_all_args(svc, &decl.args, &resolved.options, ctx)?;
 
     // Environment composition: service-declared literals first, then the
-    // generation's recorded env pairs, then the loader-lib
-    // LD_LIBRARY_PATH (only when non-empty). Later lines win in systemd,
-    // so the generation env composes OVER the declared literals — the
-    // same pod-beats-package layering as everything else.
+    // generation's recorded env pairs. Later lines win in systemd, so the
+    // generation env composes OVER the declared literals — the same
+    // pod-beats-package layering as everything else. No LD_LIBRARY_PATH:
+    // ExecStart is the farm wrapper, which supplies it inside the pod's
+    // mount namespace.
     let mut environment = decl.environment.clone();
     environment.extend(ctx.gen_env.iter().map(|(k, v)| (k.clone(), v.clone())));
-    let ld_library_path = loader_libs_line(ctx);
 
-    let text = render_unit(
-        ctx,
-        svc,
-        decl,
-        &args,
-        &environment,
-        ld_library_path,
-        nau_services,
-    )?;
+    let text = render_unit(ctx, svc, decl, &args, &environment, nau_services)?;
 
     Ok(ServiceUnit {
         name: svc.to_string(),
@@ -414,7 +404,6 @@ fn render_unit(
     decl: &crate::snap::ServiceDecl,
     args: &[String],
     environment: &BTreeMap<String, String>,
-    ld_library_path: Option<String>,
     nau_services: &BTreeSet<String>,
 ) -> miette::Result<String> {
     let mut out = String::new();
@@ -460,9 +449,6 @@ fn render_unit(
         "Environment=\"PATH={}:/usr/bin:/bin\"\n",
         ctx.current
     ));
-    if let Some(libs) = ld_library_path {
-        out.push_str(&format!("Environment=\"LD_LIBRARY_PATH={libs}\"\n"));
-    }
     out.push_str("Restart=on-failure\n");
     out.push_str("RestartSec=5\n");
     render_backend_passthrough(&mut out, svc, decl)?;
@@ -534,24 +520,6 @@ fn daemon_type(daemon: crate::snap::ServiceDaemon) -> &'static str {
         crate::snap::ServiceDaemon::Notify => "notify",
         crate::snap::ServiceDaemon::Forking => "forking",
     }
-}
-
-/// One `LD_LIBRARY_PATH=` value from the generation's loader-lib dirs,
-/// each resolved through `current` (`current/../<rel>` resolves, by
-/// kernel path resolution, into the generation's own dir — the flip
-/// redirects the whole list on rollback, the same seam as the
-/// shellenv). `None` when the generation ships no lib dirs.
-fn loader_libs_line(ctx: &ResolveCtx) -> Option<String> {
-    if ctx.loader_libs.is_empty() {
-        return None;
-    }
-    let libs = ctx
-        .loader_libs
-        .iter()
-        .map(|rel| format!("{}/../{rel}", ctx.current))
-        .collect::<Vec<_>>()
-        .join(":");
-    Some(libs)
 }
 
 /// POSIX single-quote a resolved argument: every `'` becomes `'\''`
@@ -1671,8 +1639,7 @@ fn pod_endpoint_claims(pod_dir: &std::path::Path) -> miette::Result<Vec<Endpoint
         pod: &pod,
         home: &home,
         extensions: current.join("../extensions").to_string_lossy().into_owned(),
-        gen_env: BTreeMap::new(), // expansion-only: env/loader-libs are render-time inputs
-        loader_libs: Vec::new(),
+        gen_env: BTreeMap::new(), // expansion-only: env is a render-time input
         current: current.to_string_lossy().into_owned(),
         // Expansion-only context (the endpoint scan): the envfile path
         // is a render-time input and never participates in `${ref}`
@@ -1967,9 +1934,10 @@ mod tests {
         )));
         assert!(text.contains("Environment=\"QUIET=yes\"\n"));
         assert!(text.contains("Environment=\"EDITOR=vi\"\n"));
-        assert!(text.contains(&format!(
-            "Environment=\"LD_LIBRARY_PATH={current}/../extensions/valkey/usr/usr/lib\"\n"
-        )));
+        assert!(
+            !text.contains("LD_LIBRARY_PATH"),
+            "the unit must not leak the pod's libc into its host shell: {text}"
+        );
         assert!(text.contains("Restart=on-failure\n"));
         assert!(text.contains("RestartSec=5\n"));
         assert!(text.contains("[Install]\nWantedBy=default.target\n"));
