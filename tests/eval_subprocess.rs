@@ -257,7 +257,7 @@ fn fuzz_busy_loop_hits_wall_clock_deadline() {
     let start = Instant::now();
     let err = eval_err("fuzz-busy-loop", src);
     let elapsed = start.elapsed();
-    // The parent killed the worker at the deadline and reports a clean error.
+    // The VM interrupt hook aborts it inside the budget; the kill backs up.
     assert!(
         elapsed >= Duration::from_millis(4500),
         "deadline fired too early: {elapsed:?}"

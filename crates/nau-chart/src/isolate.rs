@@ -36,6 +36,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const WALL_DEADLINE: Duration = Duration::from_secs(5);
+/// The worker's cooperative-abort budget (ADR-0010 Decision 4): the
+/// parent's [`WALL_DEADLINE`] minus the margin the child needs to turn an
+/// abort into a clean diagnostic (unwind, serialize, write the outcome
+/// line) before the parent's SIGKILL lands. The worker measures it from
+/// its own start, which is LATER than the parent's, so the clean Lua
+/// error normally wins the race against the backstop. If the spawn gap
+/// ever exceeds the margin, the parent's kill wins instead — both
+/// outcomes are clean failures, only the diagnostic differs.
+const WORKER_ABORT_BUDGET: Duration = Duration::from_millis(4600);
+/// How many VM safepoints pass between two clock reads in the interrupt
+/// handler. The handler runs at every loop back edge, so reading the
+/// clock on each one would tax the VM's hot loop for no benefit.
+const INTERRUPT_CLOCK_INTERVAL: u32 = 1024;
 const RLIMIT_AS_BYTES: u64 = 512 * 1024 * 1024;
 const RLIMIT_CPU_SECS: u64 = 5;
 /// VM-level memory limit: the Luau "not enough memory" error must be able to
@@ -912,13 +925,47 @@ fn load_module(
     Ok(v)
 }
 
-/// The child VM: narrowed stdlib, VM memory cap, DSL prelude, data-backed
-/// `index()`, stderr `print`, IPC `require`.
-fn build_worker_lua(req: &EvalRequest) -> miette::Result<mlua::Lua> {
+/// Arm Luau's VM interrupt hook (ADR-0010 Decision 4).
+///
+/// mlua 0.12 exposes the hook as `Lua::set_interrupt`
+/// (`#[cfg(any(feature = "luau", doc))]`): it installs a handler in
+/// `lua_Callbacks::interrupt`, the slot the Luau VM calls at every
+/// safepoint (loop back edges, calls, returns, GC). Luau has no
+/// `lua_setinterrupt` and no `lua_sethook` — the callback slot IS the
+/// mechanism, and mlua's `set_hook` is compiled out under the `luau`
+/// feature. A handler that returns `Err` makes the VM raise a Lua error
+/// at that safepoint, so the chunk unwinds cooperatively instead of the
+/// parent killing the process.
+///
+/// The handler compares the worker's elapsed time against
+/// [`WORKER_ABORT_BUDGET`] and errors out once the budget is spent. The
+/// parent's hard kill stays the backstop.
+fn arm_worker_interrupt(lua: &mlua::Lua, start: Instant) {
+    let safepoints = std::cell::Cell::new(0u32);
+    lua.set_interrupt(move |_| {
+        safepoints.set(safepoints.get().wrapping_add(1));
+        if safepoints.get().is_multiple_of(INTERRUPT_CLOCK_INTERVAL)
+            && start.elapsed() >= WORKER_ABORT_BUDGET
+        {
+            return Err(mlua::Error::runtime(format!(
+                "eval aborted: worker wall-clock deadline of {:.1}s exceeded",
+                WORKER_ABORT_BUDGET.as_secs_f64()
+            )));
+        }
+        Ok(mlua::VmState::Continue)
+    });
+}
+
+/// The child VM: narrowed stdlib, VM memory cap, interrupt hook, DSL
+/// prelude, data-backed `index()`, stderr `print`, IPC `require`.
+fn build_worker_lua(req: &EvalRequest, start: Instant) -> miette::Result<mlua::Lua> {
     let lua = mlua::Lua::new_with(worker_stdlib(), mlua::LuaOptions::default())
         .map_err(|e| miette::miette!("failed to create worker Luau VM: {e}"))?;
     lua.set_memory_limit(VM_MEMORY_LIMIT)
         .map_err(|e| miette::miette!("failed to set VM memory limit: {e}"))?;
+    // Armed before the prelude runs: the hook must cover the whole
+    // evaluation, prelude and require IPC included.
+    arm_worker_interrupt(&lua, start);
 
     // mlua 0.12 unconditionally injects `loadstring` into every Luau VM
     // (configure_luau; changelog "Added loadstring function to Luau") — an
@@ -1045,6 +1092,19 @@ fn build_worker_lua(req: &EvalRequest) -> miette::Result<mlua::Lua> {
     lua.globals()
         .set("constraint", req.constraint.clone())
         .map_err(|e| miette::miette!("failed to set constraint global: {e}"))?;
+
+    // Luau VM sandbox mode (issue #12): the globals table and every
+    // library table become readonly, the thread gets a proxy environment
+    // whose reads fall through to them, and `collectgarbage` is reduced to
+    // its `count` mode — the door a hostile chart opens before it blows
+    // the VM memory cap.
+    //
+    // ORDERING: the switch goes LAST. The sandbox makes the globals
+    // readonly, so every DSL global (index, print, require, fetch,
+    // constraint) and the prelude's own functions must already be in the
+    // globals table when it runs; installing them afterwards would fail.
+    lua.sandbox(true)
+        .map_err(|e| miette::miette!("failed to enable Luau VM sandbox mode: {e}"))?;
 
     Ok(lua)
 }
@@ -1204,7 +1264,11 @@ pub fn lua_to_json(v: &mlua::Value) -> Result<Value, String> {
 fn run_worker(req: &EvalRequest) -> WorkerOutcome {
     let fatal = |diags: Vec<String>| WorkerOutcome::Err(WorkerErr { diagnostics: diags });
 
-    let lua = match build_worker_lua(req) {
+    // The worker's clock starts here: the interrupt hook measures the
+    // budget from this instant, and the parent's clock started earlier
+    // (it includes the spawn).
+    let start = Instant::now();
+    let lua = match build_worker_lua(req, start) {
         Ok(lua) => lua,
         Err(e) => return fatal(vec![e.to_string()]),
     };
@@ -1705,548 +1769,4 @@ pub fn check_worker_main() -> miette::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn vm_memory_limit_stays_128mb_below_rlimit_as() {
-        // Regression: at VM_MEMORY_LIMIT == RLIMIT_AS the Rust/C++ base
-        // memory plus a full VM heap tripped RLIMIT_AS first, so the clean
-        // Luau "not enough memory" error path was dead code. The VM cap
-        // must leave headroom under the rlimit.
-        assert_eq!(VM_MEMORY_LIMIT, 384 * 1024 * 1024);
-        assert_eq!(RLIMIT_AS_BYTES - VM_MEMORY_LIMIT as u64, 128 * 1024 * 1024);
-        // The check worker's wall-clock deadline must sit above the
-        // analyzer's own bound so the clean in-worker timeout normally wins.
-        assert!(
-            CHECK_WALL_DEADLINE
-                > std::time::Duration::from_secs_f64(crate::analysis::ANALYZER_TIME_LIMIT_SECS),
-            "wall-clock killer must be the backstop, not the primary bound"
-        );
-    }
-
-    fn resolver_with_root(dir: &std::path::Path) -> SourceResolver {
-        SourceResolver {
-            roots: vec![dir.canonicalize().unwrap()],
-        }
-    }
-
-    #[test]
-    fn test_resolver_serves_module_inside_root() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("common.lua"), "return {}").unwrap();
-        let resolver = resolver_with_root(dir.path());
-        assert!(resolver.resolve("common").is_ok());
-    }
-
-    #[test]
-    fn test_resolver_serves_init_lua() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("mod")).unwrap();
-        std::fs::write(dir.path().join("mod/init.lua"), "return {}").unwrap();
-        let resolver = resolver_with_root(dir.path());
-        assert!(resolver.resolve("mod").is_ok());
-        assert!(resolver.resolve("mod.init").is_ok());
-    }
-
-    #[test]
-    fn test_resolver_rejects_traversal() {
-        let dir = tempfile::tempdir().unwrap();
-        let resolver = resolver_with_root(dir.path());
-        let err = resolver.resolve("../escape").unwrap_err();
-        assert!(err.contains("rejected"), "got: {err}");
-        assert!(resolver.resolve("a/../../b").is_err());
-    }
-
-    #[test]
-    fn test_resolver_aliases_the_adr_pkgs_prefix() {
-        // Issue #109: the ADR-0032 spelling `require("pkgs.lib.daemon")`
-        // must resolve against an allowlisted pkgs root (which IS the
-        // pkgs dir) instead of doubling to pkgs/pkgs/lib/…, as a
-        // FALLBACK behind the unaliased spelling.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("lib")).unwrap();
-        std::fs::write(dir.path().join("lib/daemon.lua"), "return 'aliased'").unwrap();
-        let resolver = resolver_with_root(dir.path());
-        assert!(resolver.resolve("lib.daemon").is_ok());
-        assert_eq!(
-            resolver.resolve("pkgs.lib.daemon").unwrap(),
-            "return 'aliased'"
-        );
-        // A real pkgs/pkgs/… subtree under the root wins over the alias.
-        std::fs::create_dir_all(dir.path().join("pkgs/lib")).unwrap();
-        std::fs::write(dir.path().join("pkgs/lib/daemon.lua"), "return 'direct'").unwrap();
-        assert_eq!(
-            resolver.resolve("pkgs.lib.daemon").unwrap(),
-            "return 'direct'"
-        );
-        // The alias cannot conjure files that do not exist, and the
-        // safety checks apply to the aliased spelling too.
-        assert!(resolver.resolve("pkgs.lib.nope").is_err());
-        assert!(resolver.resolve("pkgs...").is_err());
-    }
-
-    #[test]
-    fn test_resolver_rejects_absolute_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let resolver = resolver_with_root(dir.path());
-        let err = resolver.resolve("/etc/passwd").unwrap_err();
-        assert!(err.contains("rejected"), "got: {err}");
-    }
-
-    #[test]
-    fn test_resolver_rejects_dot_to_slash_absolute_synthesis() {
-        // Regression: `name.replace('.', "/")` can synthesize an absolute
-        // candidate ("...." → "////"), and `root.join` replaces its base
-        // with an absolute segment. A dot-to-slash result that starts with
-        // '/' must be rejected at the same layer as the explicit '/' check,
-        // not left to the downstream canonicalize+prefix check.
-        let dir = tempfile::tempdir().unwrap();
-        let resolver = resolver_with_root(dir.path());
-        for hostile in ["....", "...", ".", "..hidden"] {
-            let err = resolver.resolve(hostile).unwrap_err();
-            assert!(
-                err.contains("rejected absolute path") && err.contains(hostile),
-                "name {hostile:?}: got: {err}"
-            );
-        }
-        // Normal dotted names still resolve through the same mapping.
-        std::fs::create_dir_all(dir.path().join("foo/bar")).unwrap();
-        std::fs::write(dir.path().join("foo/bar/baz.lua"), "return {}").unwrap();
-        std::fs::write(dir.path().join("top.lua"), "return {}").unwrap();
-        assert!(resolver.resolve("foo.bar.baz").is_ok());
-        assert!(resolver.resolve("top").is_ok());
-    }
-
-    #[test]
-    fn test_resolver_rejects_empty_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let resolver = resolver_with_root(dir.path());
-        assert!(resolver.resolve("").is_err());
-    }
-
-    #[test]
-    fn test_resolver_rejects_oversized_name() {
-        // Regression: a hostile giant require() name must be refused in O(1),
-        // not amplified into parent-side CPU/memory work (wall-clock bounds
-        // the child, not the parent's resolve path).
-        let dir = tempfile::tempdir().unwrap();
-        let resolver = resolver_with_root(dir.path());
-        let giant = "a".repeat(32 * 1024 * 1024);
-        let err = resolver.resolve(&giant).unwrap_err();
-        assert!(err.contains("oversized"), "got: {err}");
-        assert!(err.len() < 200, "error must not embed the name");
-    }
-
-    #[test]
-    fn test_read_line_capped() {
-        let mut r: &[u8] = b"one\ntwo\n\nlast";
-        assert_eq!(read_line_capped(&mut r, 100).unwrap().unwrap(), b"one");
-        assert_eq!(read_line_capped(&mut r, 100).unwrap().unwrap(), b"two");
-        assert_eq!(read_line_capped(&mut r, 100).unwrap().unwrap(), b"");
-        assert_eq!(read_line_capped(&mut r, 100).unwrap().unwrap(), b"last");
-        assert!(read_line_capped(&mut r, 100).unwrap().is_none());
-
-        let mut r: &[u8] = &[b'x'; 64];
-        assert!(
-            read_line_capped(&mut r, 8).is_err(),
-            "over-long line must error"
-        );
-    }
-
-    #[test]
-    fn test_resolver_miss_is_not_found_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let resolver = resolver_with_root(dir.path());
-        let err = resolver.resolve("missing").unwrap_err();
-        assert!(err.contains("not found in allowlisted roots"), "got: {err}");
-    }
-
-    #[test]
-    fn test_lua_to_json_shapes() {
-        let lua = mlua::Lua::new();
-        let v: mlua::Value = lua
-            .load(r#"return { name = "x", tags = { "a", "b" }, n = 1.5, ok = true }"#)
-            .eval()
-            .unwrap();
-        let json = lua_to_json(&v).unwrap();
-        assert_eq!(json["name"], "x");
-        assert_eq!(json["tags"][0], "a");
-        assert_eq!(json["tags"][1], "b");
-        assert_eq!(json["n"], 1.5);
-        assert_eq!(json["ok"], true);
-    }
-
-    #[test]
-    fn test_lua_to_json_rejects_functions_and_cycles() {
-        let lua = mlua::Lua::new();
-        let v: mlua::Value = lua.load(r#"return { f = print }"#).eval().unwrap();
-        assert!(lua_to_json(&v).is_err());
-
-        let v: mlua::Value = lua
-            .load("local t = {} t.self = t return { x = t }")
-            .eval()
-            .unwrap();
-        assert!(lua_to_json(&v).is_err());
-    }
-
-    // ── Versions-mode extraction (ADR-0052 Decision 1) ──
-
-    /// Build a versions-mode request evaluating `entry` through the full
-    /// in-process worker VM (prelude, narrowed stdlib, IPC require).
-    fn versions_worker(entry: &str) -> WorkerOk {
-        let req = EvalRequest {
-            prelude: crate::dsl::prelude(),
-            index_data: serde_json::json!({ "version": 1, "snaps": [] }),
-            arch: "amd64".into(),
-            sources: Default::default(),
-            entry: entry.to_string(),
-            entry_label: "versions-test".into(),
-            allow_fetch: false,
-            constraint: None,
-            versions_mode: true,
-        };
-        match run_worker(&req) {
-            WorkerOutcome::Ok(ok) => ok,
-            WorkerOutcome::Err(e) => panic!("worker failed: {}", e.diagnostics.join("; ")),
-        }
-    }
-
-    #[test]
-    fn versions_mode_extracts_listing_and_resolved() {
-        let ok = versions_worker(
-            r#"
-            return {
-                default = snap {
-                    name = "probe",
-                    version = "2.0.21",
-                    versions = function() return { "2.0.21", "2.0.20", "2.0.19" } end,
-                },
-            }
-            "#,
-        );
-        let l = ok.versions.get("default").expect("listing recorded");
-        assert_eq!(l.resolved, "2.0.21");
-        assert_eq!(
-            l.versions.as_deref().unwrap(),
-            [
-                "2.0.21".to_string(),
-                "2.0.20".to_string(),
-                "2.0.19".to_string()
-            ]
-        );
-        assert!(l.error.is_none());
-        assert_eq!(ok.versions_declared, vec!["default".to_string()]);
-    }
-
-    #[test]
-    fn versions_mode_reports_absent_method_as_null() {
-        let ok = versions_worker(
-            r#"
-            return { default = snap { name = "plain", version = "1.0" } }
-            "#,
-        );
-        let l = ok.versions.get("default").expect("entry recorded for skip");
-        assert_eq!(l.resolved, "1.0");
-        assert!(l.versions.is_none());
-        assert!(l.error.is_none());
-        assert!(ok.versions_declared.is_empty());
-    }
-
-    #[test]
-    fn versions_mode_names_non_snap_outputs_nowhere() {
-        // A raw (non-snap-shaped) output carries no name+version pair and
-        // must not appear in the listing map at all.
-        let ok = versions_worker(r#"return { cfg = { some = "data" } }"#);
-        assert!(ok.versions.is_empty());
-    }
-
-    #[test]
-    fn versions_mode_captures_a_raising_listing() {
-        let ok = versions_worker(
-            r#"
-            return {
-                default = snap {
-                    name = "boom",
-                    version = "1.0",
-                    versions = function() error("upstream gone") end,
-                },
-            }
-            "#,
-        );
-        let l = ok.versions.get("default").unwrap();
-        assert!(l.versions.is_none());
-        let err = l.error.as_deref().expect("the raise must be captured");
-        assert!(err.contains("upstream gone"), "got: {err}");
-    }
-
-    #[test]
-    fn versions_mode_rejects_wrong_shapes_by_name() {
-        // Non-table return.
-        let ok = versions_worker(
-            r#"
-            return { d = snap { name = "x", version = "1",
-                versions = function() return "2.0.0" end } }
-            "#,
-        );
-        let err = ok.versions["d"].error.as_deref().unwrap();
-        assert!(err.contains("must return an array"), "got: {err}");
-
-        // Non-string entries.
-        let ok = versions_worker(
-            r#"
-            return { d = snap { name = "x", version = "1",
-                versions = function() return { "1.0", 42 } end } }
-            "#,
-        );
-        let err = ok.versions["d"].error.as_deref().unwrap();
-        assert!(err.contains("entries must be strings"), "got: {err}");
-
-        // Non-array table (string keys).
-        let ok = versions_worker(
-            r#"
-            return { d = snap { name = "x", version = "1",
-                versions = function() return { latest = "1.0" } end } }
-            "#,
-        );
-        let err = ok.versions["d"].error.as_deref().unwrap();
-        assert!(err.contains("key type"), "got: {err}");
-
-        // Sparse array (a hole breaks the 1..n run).
-        let ok = versions_worker(
-            r#"
-            return { d = snap { name = "x", version = "1",
-                versions = function() local t = {} t[1] = "1.0" t[3] = "0.9" return t end } }
-            "#,
-        );
-        let err = ok.versions["d"].error.as_deref().unwrap();
-        assert!(err.contains("dense 1..n"), "got: {err}");
-    }
-
-    #[test]
-    fn versions_mode_caps_are_errors_not_truncations() {
-        // 1001 entries — one past the cap.
-        let ok = versions_worker(
-            r#"
-            local t = {}
-            for i = 1, 1001 do t[i] = "1.0." .. i end
-            return { d = snap { name = "x", version = "1", versions = function() return t end } }
-            "#,
-        );
-        let err = ok.versions["d"].error.as_deref().unwrap();
-        assert!(err.contains("1001") && err.contains("cap"), "got: {err}");
-
-        // A version string 129 bytes long.
-        let ok = versions_worker(
-            r#"
-            return { d = snap { name = "x", version = "1",
-                versions = function() return { string.rep("v", 129) } end } }
-            "#,
-        );
-        let err = ok.versions["d"].error.as_deref().unwrap();
-        assert!(err.contains("128-char cap"), "got: {err}");
-
-        // Exactly at both caps is still valid.
-        let ok = versions_worker(
-            r#"
-            local t = {}
-            for i = 1, 999 do t[i] = "1.0." .. i end
-            t[1000] = string.rep("v", 128)
-            return { d = snap { name = "x", version = "1", versions = function() return t end } }
-            "#,
-        );
-        let l = ok.versions["d"].clone();
-        assert!(
-            l.error.is_none(),
-            "at-cap listing must be valid: {:?}",
-            l.error
-        );
-        assert_eq!(l.versions.as_ref().map(Vec::len), Some(1000));
-    }
-
-    #[test]
-    fn versions_mode_empty_listing_is_a_valid_answer() {
-        let ok = versions_worker(
-            r#"
-            return { d = snap { name = "x", version = "1", versions = function() return {} end } }
-            "#,
-        );
-        let l = ok.versions["d"].clone();
-        assert_eq!(l.versions.as_deref(), Some(&[][..]));
-        assert!(l.error.is_none());
-    }
-
-    #[test]
-    fn normal_mode_still_ships_outputs_carrying_a_versions_fn() {
-        // Regression guard for the pre-serialization strip: today a
-        // function field makes lua_to_json skip the WHOLE output; the
-        // strip keeps the output flowing instead, with no listing call.
-        let req = EvalRequest {
-            prelude: crate::dsl::prelude(),
-            index_data: serde_json::json!({ "version": 1, "snaps": [] }),
-            arch: "amd64".into(),
-            sources: Default::default(),
-            entry: r#"
-                return {
-                    default = snap {
-                        name = "probe",
-                        version = "2.0.21",
-                        versions = function() error("must never be called") end,
-                    },
-                }
-            "#
-            .into(),
-            entry_label: "normal-mode-test".into(),
-            allow_fetch: false,
-            constraint: None,
-            versions_mode: false,
-        };
-        let ok = match run_worker(&req) {
-            WorkerOutcome::Ok(ok) => ok,
-            WorkerOutcome::Err(e) => panic!("worker failed: {}", e.diagnostics.join("; ")),
-        };
-        assert!(
-            ok.outputs.contains_key("default"),
-            "the output must not be skipped: {:?}",
-            ok.diagnostics
-        );
-        assert!(ok.diagnostics.is_empty(), "{:?}", ok.diagnostics);
-        // The listing was never called and never shipped — listing-only.
-        assert!(ok.versions.is_empty());
-        assert_eq!(ok.versions_declared, vec!["default".to_string()]);
-        // The stripped field must not reach the JSON.
-        assert!(ok.outputs["default"].get("versions").is_none());
-    }
-
-    #[test]
-    fn normal_mode_outcome_line_stays_byte_identical() {
-        // The additive fields must vanish from the serialization when
-        // empty — every recipe shipped today has no versions field, so
-        // the worker's outcome bytes cannot move.
-        let req = EvalRequest {
-            prelude: crate::dsl::INIT_LUA.to_string(),
-            index_data: serde_json::json!({ "version": 1, "snaps": [] }),
-            arch: "amd64".into(),
-            sources: Default::default(),
-            entry: r#"return { default = snap { name = "p", version = "1" } }"#.into(),
-            entry_label: "bytes-test".into(),
-            allow_fetch: false,
-            constraint: None,
-            versions_mode: false,
-        };
-        let ok = match run_worker(&req) {
-            WorkerOutcome::Ok(ok) => ok,
-            WorkerOutcome::Err(e) => panic!("worker failed: {}", e.diagnostics.join("; ")),
-        };
-        let line = serde_json::to_string(&ok).unwrap();
-        assert!(
-            !line.contains("\"versions\""),
-            "empty versions maps must not serialize: {line}"
-        );
-    }
-
-    // ── stderr forwarder: cap + deadline (issue #76) ──
-
-    #[test]
-    fn for_build_allowlists_the_entrys_pkgs_tree() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let entry = dir.path().join("pkgs/v/valkey/init.lua");
-        std::fs::create_dir_all(entry.parent().unwrap()).expect("mkdirs");
-        std::fs::write(&entry, "return {}").expect("write");
-        let r = SourceResolver::for_build(entry.to_str().unwrap());
-        let pkgs = dir.path().join("pkgs").canonicalize().expect("canon");
-        assert!(
-            r.roots.contains(&pkgs),
-            "roots must contain the entry's own pkgs tree, got {:?}",
-            r.roots
-        );
-        // Containment: a sibling tree the entry does not belong to stays out.
-        let other = dir.path().join("other-tree/pkgs");
-        std::fs::create_dir_all(&other).expect("mkdirs");
-        assert!(!r.roots.contains(&other.canonicalize().unwrap()));
-    }
-
-    #[test]
-    fn forward_capped_below_cap_forwards_everything() {
-        let src = b"hello stderr".to_vec();
-        let mut reader = std::io::Cursor::new(src.clone());
-        let mut dst = Vec::new();
-        forward_capped(&mut reader, &mut dst, 1024);
-        assert_eq!(dst, src, "below the cap forwarding must be unchanged");
-        assert_eq!(
-            reader.position(),
-            src.len() as u64,
-            "source must be drained to EOF"
-        );
-    }
-
-    #[test]
-    fn forward_capped_truncates_at_cap_and_drains_rest() {
-        let mut reader = std::io::Cursor::new(vec![b'x'; 3000]);
-        let mut dst = Vec::new();
-        forward_capped(&mut reader, &mut dst, 1000);
-        assert_eq!(dst.len(), 1000, "forwarding must stop at the cap");
-        assert!(dst.iter().all(|&b| b == b'x'));
-        assert_eq!(
-            reader.position(),
-            3000,
-            "past the cap the stream must still drain to EOF (a stopped \
-             drain would fill the child's stderr pipe and stall it)"
-        );
-    }
-
-    /// A sink that always fails, like a closed parent stderr.
-    struct DeadSink;
-    impl Write for DeadSink {
-        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::from_raw_os_error(libc::EPIPE))
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn forward_capped_dead_sink_switches_to_discard_not_early_exit() {
-        let mut reader = std::io::Cursor::new(vec![b'y'; 4096]);
-        let mut dst = DeadSink;
-        forward_capped(&mut reader, &mut dst, 1024);
-        assert_eq!(
-            reader.position(),
-            4096,
-            "a dead sink must not stop the drain; the child's stderr pipe \
-             has to keep emptying"
-        );
-    }
-
-    /// A sink that never accepts a byte: the wedged-sink scenario.
-    struct WedgedSink;
-    impl Write for WedgedSink {
-        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-            std::thread::park(); // never woken
-            unreachable!("park without a token never returns")
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn wait_stderr_forwarder_detaches_a_wedged_sink_at_deadline() {
-        let mut reader = std::io::Cursor::new(vec![0u8; 8192]);
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut sink = WedgedSink;
-            forward_capped(&mut reader, &mut sink, 1024);
-            let _ = done_tx.send(());
-        });
-        let start = Instant::now();
-        wait_stderr_forwarder(&done_rx, start + Duration::from_millis(150));
-        let waited = start.elapsed();
-        assert!(
-            waited >= Duration::from_millis(140) && waited < Duration::from_secs(2),
-            "the wait must be bounded by the deadline, not by the wedged \
-             sink: {waited:?}"
-        );
-    }
-}
+mod tests;
