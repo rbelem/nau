@@ -34,6 +34,26 @@ Accepted trade-offs (from the recorded evidence, `docs/agents/research-scripting
 8. **Spike gates carry over as migration acceptance criteria**, adapted: adversarial suite (thunk, deep recursion, huge literal, contract violation → containment <5s under rlimits), golden parity (all 112 definitions extract identically Luau-vs-current-Lua-5.4 through the dual-eval gate before the old backend is removed), latency (<100ms incl. subprocess), resolver-only imports, JSON diagnostics schema. Port the adversarial sources from `spike/src/gates.rs` as the fuzz corpus seed.
 9. **Archive the Nickel spike** (`spike/`) as research; it is not deleted — the gate harness structure and the IPC/subprocess design (`spike/src/isolate.rs`) are the implementation reference for items 4-5.
 
+### Implementation note (issue #12, 2026-10-20)
+
+Decision 4's open questions are settled. Two of them needed an experiment, not an API reading.
+
+**The VM interrupt hook is reachable, and the eval worker arms it.** Luau has no `lua_setinterrupt` and no `lua_sethook` — neither symbol exists in Luau 0.736, the version this repo builds against (`crates/nau-chart/build.rs` pins 0.736 for the analyzer; the VM comes from the same 0.736 through `luau0-src`). The hook is the `interrupt` slot of `lua_Callbacks` (Luau's `VM/include/lua.h`: "gets called at safepoints (loop back edges, call/ret, gc) if set"), and the VM calls it from `VM_INTERRUPT()` at `LOP_JUMPBACK`, `LOP_FORNLOOP`, `LOP_FORGLOOP`, `LOP_JUMPX`, `LOP_CALL`, `LOP_CALLFB`, `LOP_RETURN`, and `LOP_FASTPCALL`. mlua 0.12.1 exposes exactly that slot as `Lua::set_interrupt` (`#[cfg(any(feature = "luau", doc))]`); its `set_hook` is compiled out under the `luau` feature.
+
+The compile probe settled the question the API reference could not: `set_interrupt` compiles AND links under the `luau` feature against Luau 0.736, and the handler FIRES — `while true do end` ends as a catchable Lua error, not a kill.
+
+The worker arms the hook right after the VM is created (`crates/nau-chart/src/isolate.rs`, `build_worker_lua`). The handler compares the worker's elapsed time against the parent's wall-clock budget minus a margin (4.6s against the parent's 5s kill) and returns `Err` once the budget is spent: the VM raises a Lua error at the safepoint, the chunk unwinds, and the operator gets a diagnosable Lua error instead of a SIGKILL. The parent's hard kill stays the backstop.
+
+What the hook cannot do is reach a chunk that never hits a safepoint. The VM calls the handler at loop back edges, calls, returns, and GC, so a tight pure-Lua loop IS interruptible; a chunk blocked inside a host call (`fetch()`'s curl) is not, because the VM is not running. The parent's wall-clock kill covers that case.
+
+**Luau VM sandbox mode is ON.** mlua's `Lua::sandbox(true)` makes the globals table and every library table readonly, gives the thread a proxy environment whose reads fall through to them, and — in mlua's `collectgarbage` shim — refuses every option but `count`, so a chart can no longer stop the collector before it blows the VM memory cap. The collector itself keeps running; only the Lua-level control is gone. `set_memory_limit` is untouched by the switch: the cap lives in the allocator's userdata, not in the VM's table state.
+
+The ordering is load-bearing. The switch makes the globals readonly, so the DSL globals (`index`, `print`, `require`, `fetch`, `constraint`) and the prelude's own functions are installed BEFORE it runs; the worker installs them first and enables the sandbox last.
+
+The experiment behind the verdict: with the collector stopped and the VM cap reached, the failure is a clean CATCHABLE error (`mlua::Error::MemoryError`) — with and without the sandbox. Luau's out-of-memory error object is a pinned literal, so the error path cannot fail to build its own message. The probe runs in a re-exec'd child process, because the failure mode under test (a hard abort) would take the test binary down with it.
+
+**The subprocess model stays.** The eval worker is SPAWNED (`nau chart eval-worker`), never forked: the parent runs `Command::new(worker_exe()).arg("chart").arg("eval-worker")` and ships the request on the child's stdin. Neither the interrupt hook nor the sandbox changes that. Decision 4's "first line of defense is Luau's reduced stdlib; process bounds are the real guarantee" is unchanged — the hook adds a clean diagnostic ON TOP of those bounds, and the sandbox narrows what a chart can reach inside them.
+
 ### Migration
 
 1. Swap mlua backend `lua54` → `luau` (vendored) behind a feature flag; keep both backends compilable during transition.
