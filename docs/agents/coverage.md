@@ -12,7 +12,7 @@ come from nixpkgs and are passed through the env vars `cargo-llvm-cov`
 documents for exactly this case:
 
 ```bash
-# One-time (session-local): LLVM 21 tools matching rustc 1.97.1's LLVM
+# One-time (session-local): LLVM 21 tools matching rustc 1.99.0's LLVM
 nix build github:NixOS/nixpkgs/nixos-unstable#llvm --out-link /tmp/opencode/llvm-link
 
 # Baseline/after-wave measurement (~12 min cold, ~2 min warm)
