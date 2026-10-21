@@ -11,6 +11,8 @@
 //! Issue #102 adds the arbitrary-command form: `nau run -- <cmd…>`
 //! execs any command with the pod's env overlaid (farm-first PATH +
 //! loader-lib LD_LIBRARY_PATH) and no sandbox — fail-open by design.
+//! That form, and issue #9's path-addressed form, live in
+//! [`command`]: one job, one module.
 //!
 //! Both backends honor the SAME shared grants vocabulary, so they are
 //! interchangeable for anything expressible in it. `backend_options` is
@@ -22,6 +24,10 @@ use std::path::{Path, PathBuf};
 use nau_core::generation_view::StoreView;
 use nau_core::pkg_manifest::{Generation, InstalledPackage};
 use nau_core::snap_types::{BackendKind, Confinement, SANDBOX_RO_ROOTS};
+
+mod command;
+use command::overlay_pod_env_with;
+pub use command::run_command;
 
 /// Run `app` from a pod confined per its declared grants (ticket #11).
 ///
@@ -164,122 +170,6 @@ fn overlay_declared_vars(
     vars: &std::collections::BTreeMap<String, String>,
 ) {
     for (key, value) in vars {
-        cmd.env(key, value);
-    }
-}
-
-// ── Arbitrary-command form (issue #102) ──
-
-/// Run an arbitrary command with the pod's environment overlaid (issue
-/// #102): the farm-first PATH and loader-lib LD_LIBRARY_PATH of
-/// [`crate::pod::shellenv`] — the SAME env contract the shell export
-/// uses, never a second one. No confinement, no sandbox (fail-open by
-/// design). Transparent exec: the command replaces this process, so its
-/// exit status is `nau run`'s.
-///
-/// Trust: the command runs with the caller's full privileges, and a
-/// farm name resolves BEFORE the caller's PATH — the pod's active
-/// generation is trusted like the caller's own bin directory.
-pub fn run_command(pod_dir: &Path, pod_name: &str, command: &[String]) -> miette::Result<()> {
-    // `pod_dir` is `<root>/<pod>` (the store lives under the pod), while
-    // the shellenv contract is rooted at the pod state root one level up.
-    let root = pod_dir.parent().unwrap_or(pod_dir);
-    let env = crate::pod::shellenv(root, pod_name)?;
-    let farm = PathBuf::from(&env.farm);
-    let Some(prog) = command.first() else {
-        miette::bail!("nau run: empty command — nothing to exec");
-    };
-    let program = resolve_command(prog, &farm)?;
-    let mut cmd = std::process::Command::new(program);
-    for a in &command[1..] {
-        cmd.arg(a);
-    }
-    overlay_pod_env(&mut cmd, &env);
-    exec_cmd(cmd)
-}
-
-/// Resolve the command's program: a name containing `/` is an explicit
-/// path taken verbatim (like sh, no resolution); otherwise the pod's
-/// farm is searched before the caller's PATH, because the pod's active
-/// generation is the provider seam this command form is about.
-fn resolve_command(name: &str, farm: &Path) -> miette::Result<PathBuf> {
-    let mut entries = vec![farm.to_path_buf()];
-    if let Some(path) = std::env::var_os("PATH") {
-        entries.extend(std::env::split_paths(&path));
-    }
-    resolve_command_in(name, &entries)
-}
-
-/// The resolution proper, over explicit entries — split out so tests can
-/// pin lookup order without mutating the process PATH (the suite runs
-/// tests in parallel).
-fn resolve_command_in(name: &str, entries: &[PathBuf]) -> miette::Result<PathBuf> {
-    if name.contains('/') {
-        return Ok(PathBuf::from(name));
-    }
-    nau_infra::pathsearch::resolve_in_path(name, entries).ok_or_else(|| {
-        miette::miette!(
-            "command '{name}' not found in the pod's farm ({}), or PATH — \
-             add the package that provides it to the pod \
-             (`nau pod add <package>`) or install it on the host PATH",
-            entries
-                .first()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default()
-        )
-    })
-}
-
-/// Overlay the pod env onto `cmd`, mirroring
-/// [`crate::pod::render_shellenv`]'s semantics: PATH is the farm
-/// prepended to the caller's existing PATH (the farm alone when the
-/// caller has none), plus the declared env vars (ADR-0030). No
-/// `LD_LIBRARY_PATH` is ever set here (issue #110, ADR-0034): farm
-/// apps carry their own emit-time LD wrappers, and an arbitrary
-/// command is not a pod process.
-fn overlay_pod_env(cmd: &mut std::process::Command, env: &crate::pod::PodShellenv) {
-    overlay_pod_env_with(cmd, env, std::env::var_os("PATH").as_deref())
-}
-
-/// The overlay proper, over explicit existing values — split out so
-/// tests can pin the semantics (including unset/empty) without mutating
-/// the process environment.
-fn overlay_pod_env_with(
-    cmd: &mut std::process::Command,
-    env: &crate::pod::PodShellenv,
-    existing_path: Option<&std::ffi::OsStr>,
-) {
-    // split_paths of an unset PATH yields nothing, and an EMPTY string
-    // would yield one empty entry (a trailing empty element the loader
-    // reads as the current directory) — so empty is filtered explicitly:
-    // the farm alone is exported either way.
-    let mut entries = vec![PathBuf::from(&env.farm)];
-    if let Some(existing) = existing_path {
-        if !existing.is_empty() {
-            entries.extend(std::env::split_paths(existing));
-        }
-    }
-    // join_paths only fails when an entry contains the separator; fall
-    // back to the bare farm rather than silently dropping the seam.
-    let path = std::env::join_paths(&entries).unwrap_or_else(|_| env.farm.as_str().into());
-    cmd.env("PATH", path);
-
-    // No LD_LIBRARY_PATH here (issue #110, ADR-0034): farm apps carry
-    // their own emit-time LD wrappers, and an arbitrary command is not a
-    // pod process — it runs with the caller's environment, minus this
-    // overlay's PATH prepend. Exporting the pod's lib dirs here was the
-    // leak this issue closed.
-
-    // ADR-0030: the generation's declared env replaces inherited values
-    // (the devbox `env:` semantics) — declared beats ambient by design.
-    for (key, value) in &env.vars {
-        cmd.env(key, value);
-    }
-    // ADR-0042 D3 (issue #184): the resolved secrets ride the SAME
-    // overlay with the SAME rule — declared replaces inherited. The
-    // values were resolved (all-or-nothing, D7) inside `shellenv`'
-    // serve step before this overlay ever ran.
-    for (key, value) in &env.secret_vars {
         cmd.env(key, value);
     }
 }
@@ -604,7 +494,7 @@ fn userns_available() -> bool {
 /// aa-exec), which in turn launches the app — so the app is the direct
 /// child of the caller, transparent to the user. `exec` only returns on
 /// failure.
-fn exec_cmd(mut cmd: std::process::Command) -> miette::Result<()> {
+pub(crate) fn exec_cmd(mut cmd: std::process::Command) -> miette::Result<()> {
     use std::os::unix::process::CommandExt;
     let prog = cmd.get_program().to_string_lossy().into_owned();
     let err = cmd.exec();
@@ -892,231 +782,12 @@ mod tests {
 
     // ── Issue #102: the arbitrary-command form ──
 
-    /// Seed a pod with an active generation the way the production
-    /// mechanisms do: a manifest-bearing generation dir (the store's
-    /// `active` source of truth) plus a farm and the `current` link
-    /// (the pod flip), as pod.rs's `seed_active_pod` does. Returns the
-    /// pod dir. Executables are added by each test.
-    fn seed_command_pod(root: &Path, pod: &str, generation: u64) -> PathBuf {
-        let dir = root.join(pod);
-        let gen_dir = dir.join("generations").join(generation.to_string());
-        let farm = gen_dir.join("farm");
-        std::fs::create_dir_all(&farm).unwrap();
-        let gen = Generation {
-            n: generation,
-            base_version: "24.04".into(),
-            packages: BTreeMap::new(),
-            created_epoch: 0,
-            boot_entry: None,
-        };
-        std::fs::write(
-            gen_dir.join("manifest.json"),
-            serde_json::to_vec(&gen).unwrap(),
-        )
-        .unwrap();
-        std::os::unix::fs::symlink(format!("generations/{generation}"), dir.join("active"))
-            .unwrap();
-        crate::farm::flip_current(&dir, generation).unwrap();
-        dir
-    }
-
-    fn make_executable(path: &Path) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(path, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    fn sample_command_env(farm: &Path) -> crate::pod::PodShellenv {
-        crate::pod::PodShellenv {
-            pod: "work".into(),
-            farm: farm.display().to_string(),
-            generation: Some(1),
-            vars: Default::default(),
-            secret_vars: Default::default(),
-            secrets: Default::default(),
-        }
-    }
-
     /// The env overlay result as seen through the built command.
     fn env_of(cmd: &std::process::Command, key: &str) -> Option<String> {
         cmd.get_envs()
             .find(|(k, _)| *k == key)
             .and_then(|(_, v)| v)
             .map(|v| v.to_string_lossy().into_owned())
-    }
-
-    #[test]
-    fn resolve_command_prefers_the_farm_over_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let farm = tmp.path().join("farm");
-        std::fs::create_dir_all(&farm).unwrap();
-        make_executable(&farm.join("tool"));
-        let pathdir = tmp.path().join("onpath");
-        std::fs::create_dir_all(&pathdir).unwrap();
-        make_executable(&pathdir.join("tool"));
-        let entries = vec![farm.clone(), pathdir.clone()];
-        assert_eq!(
-            resolve_command_in("tool", &entries).unwrap(),
-            farm.join("tool")
-        );
-    }
-
-    #[test]
-    fn resolve_command_falls_through_to_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let farm = tmp.path().join("farm"); // exists, lacks the name
-        std::fs::create_dir_all(&farm).unwrap();
-        let pathdir = tmp.path().join("onpath");
-        std::fs::create_dir_all(&pathdir).unwrap();
-        make_executable(&pathdir.join("tool"));
-        let entries = vec![farm, pathdir.clone()];
-        assert_eq!(
-            resolve_command_in("tool", &entries).unwrap(),
-            pathdir.join("tool")
-        );
-    }
-
-    #[test]
-    fn resolve_command_passes_explicit_paths_through_verbatim() {
-        // A name containing '/' is a path, not a lookup — no entries
-        // consulted (even bogus ones, proving no resolution ran).
-        let entries = vec![PathBuf::from("/nonexistent-farm")];
-        assert_eq!(
-            resolve_command_in("./scripts/deploy.sh", &entries).unwrap(),
-            PathBuf::from("./scripts/deploy.sh")
-        );
-        assert_eq!(
-            resolve_command_in("/usr/bin/env", &entries).unwrap(),
-            PathBuf::from("/usr/bin/env")
-        );
-    }
-
-    #[test]
-    fn resolve_command_miss_names_the_command_and_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let farm = tmp.path().join("farm");
-        std::fs::create_dir_all(&farm).unwrap();
-        let pathdir = tmp.path().join("onpath");
-        std::fs::create_dir_all(&pathdir).unwrap();
-        let entries = vec![farm.clone(), pathdir];
-        let err = resolve_command_in("nosuchcmd", &entries)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("nosuchcmd") && err.contains("PATH"),
-            "error must name the command and the fix surface: {err}"
-        );
-        assert!(
-            err.contains(&farm.display().to_string()),
-            "error must name the farm searched: {err}"
-        );
-    }
-
-    #[test]
-    fn overlay_pod_env_is_farm_first_and_never_touches_the_loader_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let farm = tmp.path().join("current");
-        let env = sample_command_env(&farm);
-        let mut cmd = std::process::Command::new("true");
-        overlay_pod_env_with(&mut cmd, &env, Some(std::ffi::OsStr::new("/usr/bin:/bin")));
-        assert_eq!(
-            env_of(&cmd, "PATH").unwrap(),
-            format!("{}:/usr/bin:/bin", farm.display()),
-            "farm must precede the caller's PATH"
-        );
-        assert!(
-            env_of(&cmd, "LD_LIBRARY_PATH").is_none(),
-            "the pod must never export loader libs into a child (issue #110)"
-        );
-    }
-
-    #[test]
-    fn overlay_pod_env_exports_the_farm_alone_for_unset_or_empty_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let farm = tmp.path().join("current");
-        let env = sample_command_env(&farm);
-        for existing in [None, Some(std::ffi::OsStr::new(""))] {
-            let mut cmd = std::process::Command::new("true");
-            overlay_pod_env_with(&mut cmd, &env, existing);
-            assert_eq!(
-                env_of(&cmd, "PATH").unwrap(),
-                farm.display().to_string(),
-                "unset/empty caller PATH must export just the farm (input: {existing:?})"
-            );
-        }
-    }
-
-    #[test]
-    fn overlay_pod_env_does_not_wipe_an_inherited_loader_path() {
-        // The overlay never SETS LD_LIBRARY_PATH — but it also never
-        // wipes the caller's own value: the wrapper (not this overlay)
-        // owns the loader path inside pod processes (#110).
-        let tmp = tempfile::tempdir().unwrap();
-        let farm = tmp.path().join("current");
-        let env = sample_command_env(&farm);
-        let mut cmd = std::process::Command::new("true");
-        cmd.env("LD_LIBRARY_PATH", "/opt/legacy");
-        overlay_pod_env_with(&mut cmd, &env, Some(std::ffi::OsStr::new("/bin")));
-        assert_eq!(
-            env_of(&cmd, "LD_LIBRARY_PATH").unwrap(),
-            "/opt/legacy",
-            "an inherited LD_LIBRARY_PATH passes through untouched"
-        );
-    }
-
-    #[test]
-    fn overlay_pod_env_declared_vars_replace_inherited_values() {
-        let tmp = tempfile::tempdir().unwrap();
-        let farm = tmp.path().join("current");
-        let mut env = sample_command_env(&farm);
-        env.vars.insert("EDITOR".to_string(), "vi".to_string());
-        env.vars.insert("MODE".to_string(), "pod".to_string());
-        let mut cmd = std::process::Command::new("true");
-        cmd.env("MODE", "inherited");
-        cmd.env("HOME", "/home/user");
-        overlay_pod_env_with(&mut cmd, &env, Some(std::ffi::OsStr::new("/bin")));
-        assert_eq!(
-            env_of(&cmd, "EDITOR").unwrap(),
-            "vi",
-            "a declared var is set even when the caller has none"
-        );
-        assert_eq!(
-            env_of(&cmd, "MODE").unwrap(),
-            "pod",
-            "a declared var replaces the inherited value (devbox env: semantics)"
-        );
-        assert_eq!(
-            env_of(&cmd, "HOME").unwrap(),
-            "/home/user",
-            "undeclared vars pass through untouched"
-        );
-    }
-
-    #[test]
-    fn overlay_pod_env_applies_secret_vars_with_the_declared_rule() {
-        // ADR-0042 D3 (issue #184): resolved secrets ride the SAME
-        // overlay as declared env — declared replaces inherited, the
-        // caller's ambient value never wins.
-        let tmp = tempfile::tempdir().unwrap();
-        let mut env = sample_command_env(&tmp.path().join("current"));
-        env.secret_vars.insert(
-            "API_TOKEN".to_string(),
-            "s3cr3t with spaces and 'quotes'".to_string(),
-        );
-        let mut cmd = std::process::Command::new("true");
-        cmd.env("API_TOKEN", "ambient-must-lose");
-        cmd.env("UNRELATED", "keep");
-        overlay_pod_env_with(&mut cmd, &env, Some(std::ffi::OsStr::new("/bin")));
-        assert_eq!(
-            env_of(&cmd, "API_TOKEN").unwrap(),
-            "s3cr3t with spaces and 'quotes'",
-            "the secret value replaces the inherited one, verbatim"
-        );
-        assert_eq!(
-            env_of(&cmd, "UNRELATED").unwrap(),
-            "keep",
-            "undeclared vars still pass through"
-        );
     }
 
     #[test]
@@ -1132,54 +803,12 @@ mod tests {
     }
 
     #[test]
-    fn run_falls_through_to_the_command_form_for_undeclared_apps() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = seed_command_pod(tmp.path(), "default", 1);
-        // The farm lacks the name and no package provides it: the
-        // failure must be the command-form resolution miss (against the
-        // caller's real PATH too — the name is unique enough to miss
-        // everywhere), proving the command form was entered, not the old
-        // "not provided by any package" error.
-        let missing = "nau-102-definitely-missing-zz7f3a9b";
-        let err = run(&dir, "default", missing, &[]).unwrap_err().to_string();
-        assert!(
-            err.contains(missing) && err.contains("PATH"),
-            "expected the command-form resolution miss: {err}"
-        );
-        assert!(
-            !err.contains("not provided by any package"),
-            "the old declared-app error must be gone: {err}"
-        );
-    }
-
-    #[test]
     fn run_refuses_a_pod_without_an_active_generation() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("empty-pod");
         std::fs::create_dir_all(&dir).unwrap();
         let err = run(&dir, "empty-pod", "app", &[]).unwrap_err().to_string();
         assert!(err.contains("no active generation"), "{err}");
-    }
-
-    #[test]
-    fn run_command_rejects_an_empty_command_vector() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = seed_command_pod(tmp.path(), "default", 1);
-        let err = run_command(&dir, "default", &[]).unwrap_err().to_string();
-        assert!(err.contains("empty command"), "{err}");
-    }
-
-    #[test]
-    fn overlay_pod_env_prepends_the_farm_to_the_caller_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let env = sample_command_env(&tmp.path().join("farm"));
-        let mut cmd = std::process::Command::new("true");
-        overlay_pod_env(&mut cmd, &env);
-        let path = env_of(&cmd, "PATH").unwrap();
-        assert!(
-            path.starts_with(&format!("{}", tmp.path().join("farm").display())),
-            "farm must lead the exported PATH: {path}"
-        );
     }
 
     #[test]

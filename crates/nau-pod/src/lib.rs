@@ -30,6 +30,7 @@ pub mod farm;
 pub mod fonts;
 pub mod ld_wrapper;
 pub mod loader_libs;
+pub(crate) mod namespace;
 pub mod pod;
 pub mod rootfs;
 pub mod secrets;
