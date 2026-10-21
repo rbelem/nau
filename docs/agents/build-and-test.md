@@ -2,7 +2,7 @@
 
 ## Environment
 
-The toolchain is pinned in `devbox.json` — rustc, clippy, and rustfmt 1.97.1,
+The toolchain is pinned in `devbox.json` — rustc, clippy, and rustfmt 1.99.0,
 cargo, plus the Linux tools the build and test suite exercise (`squashfs-tools`,
 `bubblewrap`, `patchelf`, `gnumake`, `flex`/`bison`, `lua54`, …).
 

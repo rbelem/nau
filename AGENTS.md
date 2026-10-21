@@ -7,14 +7,14 @@ through devbox (not npm).
 
 ## Build, test, lint
 
-The gate pod carries the pinned 1.97.1 toolchain (cargo 1.97.1, rustc
-1.97.1) and the pod gate is the contract for the clippy and fmt axes. Devbox
-resolves 1.98.x — `devbox.json` pins nixpkgs `c59305bb` — so the
-devbox-served test axis compiles with a different compiler than the pod gate,
-and the two verdicts are comparable only when the versions match; #23 tracks
-closing that gap. To compile with the pod's compiler locally, use the host's
-pinned rustc: `PATH="/nix/store/cqlx62f919g8xf2f39bmykslpjdh9z0j-rustc-1.97.1/bin:$PATH"`.
-The pod env leaks `LD_LIBRARY_PATH` into the shell (breaks devbox's node), and
+The pinned toolchain is 1.99.0. `devbox.json` pins rustc, cargo, clippy and
+rustfmt at 1.99.0, and `devbox.lock` records the nixpkgs revision they resolve
+from. The gate pod still carries 1.97.1 — its rust payload is sideloaded, so
+its version moves only when a new payload replaces it — which means the pod
+gate and CI compile with different compilers until that happens; #23 tracks
+closing that gap. Until it does, CI's clippy and fmt verdicts are the
+authority and the pod gate is a 1.97.1 approximation of them, not a
+substitute. The pod env leaks `LD_LIBRARY_PATH` into the shell (breaks devbox's node), and
 `COMPILER_PATH`/`LIBRARY_PATH` redirect every gcc driver's subprogram search
 into pod store blobs (libbfd load deaths), so strip all three and pin CC/CXX:
 
