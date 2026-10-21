@@ -26,7 +26,8 @@ use std::path::{Path, PathBuf};
 
 use nau_core::generation_view::StoreView;
 
-use crate::rootfs::{PodRootfs, ROOTFS_DIR};
+use crate::namespace::{shell_plan, shell_quote};
+use crate::rootfs::PodRootfs;
 
 /// The per-generation LD-wrapper area (issue #110, ADR-0034):
 /// `generations/<n>/ld-wrappers/<app>`.
@@ -91,38 +92,6 @@ pub(crate) fn host_usr_children() -> Vec<String> {
         .collect();
     names.sort();
     names
-}
-
-/// The mount roots the gather exposes under `/usr` (`usr/lib`,
-/// `usr/lib64`, ...), collapsed to the first component so a nested
-/// position rides its parent's bind.
-fn usr_mount_roots(rootfs: &PodRootfs) -> Vec<String> {
-    let mut roots: Vec<String> = rootfs
-        .positions
-        .iter()
-        .filter_map(|position| {
-            let rest = position.strip_prefix("usr/")?;
-            let top = rest.split('/').next()?;
-            Some(format!("usr/{top}"))
-        })
-        .collect();
-    roots.sort();
-    roots.dedup();
-    roots
-}
-
-/// Top-level FHS positions outside `/usr` (`lib64`): each gets a tmpfs
-/// at its root, then the gather bound over it.
-fn top_level_roots(rootfs: &PodRootfs) -> Vec<String> {
-    let mut roots: Vec<String> = rootfs
-        .positions
-        .iter()
-        .filter(|position| !position.starts_with("usr/"))
-        .map(|position| position.split('/').next().unwrap_or(position).to_string())
-        .collect();
-    roots.sort();
-    roots.dedup();
-    roots
 }
 
 /// Write one app's LD wrapper and return the farm-relative symlink
@@ -235,41 +204,10 @@ fn namespace_body(
     // app gets the pod's paths through --setenv, applied inside the
     // namespace.
     body.push_str("unset LD_LIBRARY_PATH LIBRARY_PATH CPATH COMPILER_PATH\n");
-    body.push_str(&format!(
-        "exec {} --bind / / --tmpfs /usr",
-        shell_quote(bwrap)
-    ));
-    for child in ns.host_usr_children {
-        body.push_str(&format!(
-            " \\\n  --ro-bind {} {}",
-            shell_quote_str(&format!("/usr/{child}")),
-            shell_quote_str(&format!("/usr/{child}"))
-        ));
-    }
-    for root in usr_mount_roots(ns.rootfs) {
-        body.push_str(&format!(
-            " \\\n  --ro-bind \"$d/../{ROOTFS_DIR}/{root}\" {}",
-            shell_quote_str(&format!("/{root}"))
-        ));
-    }
-    for root in top_level_roots(ns.rootfs) {
-        body.push_str(&format!(
-            " \\\n  --tmpfs {} \\\n  --ro-bind \"$d/../{ROOTFS_DIR}/{root}\" {}",
-            shell_quote_str(&format!("/{root}")),
-            shell_quote_str(&format!("/{root}"))
-        ));
-    }
-    if top_level_roots(ns.rootfs)
-        .iter()
-        .all(|root| root != "lib64")
-    {
-        body.push_str(" \\\n  --tmpfs /lib64");
-    }
-    body.push_str(&format!(
-        " \\\n  --ro-bind \"$d/../{}\" {} \\\n",
-        ns.rootfs.loader_rel,
-        shell_quote_str(&format!("/lib64/{}", crate::rootfs::LOADER_NAME))
-    ));
+    body.push_str(&format!("exec {}", shell_quote(bwrap)));
+    // The mount list is the shared shape (crate::namespace): the direct
+    // `nau pod run` path renders the SAME list into an argv.
+    body.push_str(&shell_plan(ns.rootfs, ns.host_usr_children));
     body.push_str(
         "  --setenv LD_LIBRARY_PATH \"$libs\" \
          --setenv LIBRARY_PATH \"$libs\" \
@@ -292,15 +230,6 @@ fn missing_bwrap_body(app: &str) -> String {
          'nau doctor --fix' to provision bubblewrap, then re-emit the pod.\" >&2\n\
          exit 127\n"
     )
-}
-
-/// POSIX single-quote a path for the baked bwrap command.
-fn shell_quote(path: &Path) -> String {
-    shell_quote_str(&path.to_string_lossy())
-}
-
-fn shell_quote_str(value: &str) -> String {
-    format!("'{}'", value.replace('\'', r"'\''"))
 }
 
 #[cfg(test)]
@@ -396,6 +325,41 @@ mod tests {
             "bwrap's own process must start without the pod's libc: {body}"
         );
         assert!(!body.contains("readlink") && !body.contains("dirname"));
+    }
+
+    #[test]
+    fn the_wrapper_and_the_direct_path_carry_the_same_mounts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_fixture(tmp.path());
+        let fake = tmp.path().join("bwrap");
+        std::fs::write(&fake, "#!/bin/sh\n").unwrap();
+        let children = vec!["bin".to_string()];
+        let ns = Namespace {
+            bwrap: Some(&fake),
+            rootfs: &rootfs(),
+            host_usr_children: &children,
+        };
+        write(&store, 1, "gcc", "../../../store/ab/blob", "", Some(&ns)).unwrap();
+        let body = std::fs::read_to_string(dir(&store, 1).join("gcc")).unwrap();
+        // The same mount list, rendered twice: the wrapper's shell
+        // command line and the direct path's argv (issue #9).
+        let args = crate::namespace::args(&rootfs(), &store.generation_dir(1), &children);
+        let argv: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for dest in [
+            "/usr/bin",
+            "/usr/lib",
+            "/lib64",
+            "/lib64/ld-linux-x86-64.so.2",
+        ] {
+            assert!(body.contains(dest), "the wrapper must bind {dest}: {body}");
+            assert!(
+                argv.iter().any(|a| a == dest),
+                "the direct path must bind {dest}: {argv:?}"
+            );
+        }
     }
 
     #[test]

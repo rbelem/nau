@@ -82,6 +82,43 @@ impl Placed {
     }
 }
 
+/// The namespace plan for one generation: the FHS positions the gather
+/// carries and the pod's loader. `None` when no loader/libc pair is on
+/// the loader path — such a pod needs no namespace.
+///
+/// The plan is WHAT the pod owns; [`crate::namespace`] is HOW it is
+/// mounted. The emit builds the gather from the plan and bakes it into
+/// the farm's LD wrappers; the direct `nau pod run` path (issue #9)
+/// reads it back to enter the same namespace for a pod-owned path. One
+/// computation, one shape.
+pub fn plan(store: &StoreView, gen: &Generation) -> Option<PodRootfs> {
+    // Absolute source paths: the gather is bound at /usr/lib and /lib64
+    // inside the namespace, where a relative `../../../extensions/...`
+    // would resolve against the mounted position, not the generation.
+    let gen_dir = std::fs::canonicalize(store.generation_dir(gen.n))
+        .unwrap_or_else(|_| store.generation_dir(gen.n));
+    plan_from(&gen_dir, &loader_lib_entries(store, gen))
+}
+
+/// The plan proper, over the generation's loader-lib dirs.
+fn plan_from(gen_dir: &Path, libs: &[LoaderLibDir]) -> Option<PodRootfs> {
+    let loader = libs
+        .iter()
+        .find(|lib| has_loader_pair(&gen_dir.join(&lib.rel)))?;
+    let mut positions: Vec<String> = Vec::new();
+    for lib in libs {
+        let position = fhs_position(&lib.sub).to_string();
+        if !positions.contains(&position) {
+            positions.push(position);
+        }
+    }
+    positions.sort();
+    Some(PodRootfs {
+        positions,
+        loader_rel: format!("{}/{}", loader.rel, LOADER_NAME),
+    })
+}
+
 /// Build (or clear) the generation's rootfs gather.
 ///
 /// Returns `None` when no loader/libc pair is on the loader path: such
@@ -90,17 +127,11 @@ impl Placed {
 /// every emit, so a generation that loses its loader also loses a stale
 /// tree.
 pub fn prepare(store: &StoreView, gen: &Generation) -> miette::Result<Option<PodRootfs>> {
-    // Absolute source paths: the gather is bound at /usr/lib and /lib64
-    // inside the namespace, where a relative `../../../extensions/...`
-    // would resolve against the mounted position, not the generation.
     let gen_dir = std::fs::canonicalize(store.generation_dir(gen.n))
         .unwrap_or_else(|_| store.generation_dir(gen.n));
     let rootfs = gen_dir.join(ROOTFS_DIR);
     let libs = loader_lib_entries(store, gen);
-    let Some(loader) = libs
-        .iter()
-        .find(|lib| has_loader_pair(&gen_dir.join(&lib.rel)))
-    else {
+    let Some(plan) = plan_from(&gen_dir, &libs) else {
         withdraw(&rootfs)?;
         return Ok(None);
     };
@@ -112,23 +143,15 @@ pub fn prepare(store: &StoreView, gen: &Generation) -> miette::Result<Option<Pod
         .map_err(|e| miette::miette!("creating rootfs {}: {e}", rootfs.display()))?;
 
     let mut owners: BTreeMap<String, Placed> = BTreeMap::new();
-    let mut positions: Vec<String> = Vec::new();
     for lib in &libs {
-        let position = fhs_position(&lib.sub).to_string();
-        if !positions.contains(&position) {
-            positions.push(position.clone());
-        }
-        let dst = rootfs.join(&position);
+        let position = fhs_position(&lib.sub);
+        let dst = rootfs.join(position);
         std::fs::create_dir_all(&dst)
             .map_err(|e| miette::miette!("creating rootfs position {}: {e}", dst.display()))?;
-        gather_dir(&gen_dir, &rootfs, lib, &position, "", &mut owners)?;
+        gather_dir(&gen_dir, &rootfs, lib, position, "", &mut owners)?;
     }
-    positions.sort();
 
-    Ok(Some(PodRootfs {
-        positions,
-        loader_rel: format!("{}/{}", loader.rel, LOADER_NAME),
-    }))
+    Ok(Some(plan))
 }
 
 /// Withdraw a gather an earlier emit left behind, so a re-emit without
