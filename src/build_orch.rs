@@ -409,7 +409,7 @@ pub(crate) fn collect_dep_graph(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for (_name, meta) in iter {
-        if let Ok(deps) = crate::deps::resolve_build_dep_nodes(meta) {
+        if let Ok(deps) = crate::deps::resolve_build_dep_nodes(meta, &[]) {
             for node in deps {
                 if seen.insert(node.name.clone()) {
                     nodes.push(node);
@@ -421,12 +421,12 @@ pub(crate) fn collect_dep_graph(
 }
 
 /// Resolve `meta`'s build-time dependency closure (`requires` ∪
-/// `build_deps`, transitively), ensure every member's built payload is
-/// available, and materialize the merged `/usr`-like build prefix
+/// `build_deps`, transitively), ensure every member's payload exists,
+/// and materialize the merged `/usr`-like build prefix
 /// (ADR-0018 Decision 2, issue #17). Returns `None` when the package runs
 /// no build or declares neither list — nothing to bind into the sandbox.
 ///
-/// Unknown dependency names reject exactly like unknown `requires` names:
+/// Unknown dependency names reject like unknown `requires` names:
 /// the resolver's "package 'x' not found" error propagates.
 ///
 /// `quiet` suppresses the progress line (parallel dep builds, issue #55 —
@@ -453,7 +453,7 @@ fn ensure_build_prefix(
     if seeds.is_empty() {
         return Ok(None);
     }
-    let closure_names = crate::deps::resolve_build_dep_names(meta)?;
+    let closure_names = crate::deps::resolve_build_dep_names(meta, building)?;
     let mut payloads = Vec::new();
     for name in closure_names {
         let dep_meta = crate::deps::load_meta(&name)?;

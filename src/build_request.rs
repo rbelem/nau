@@ -430,11 +430,11 @@ impl BuildStep for PoolBuild {
         let arch = std::env::var("NAU_ARCH").unwrap_or_else(|_| "amd64".into());
 
         // The bd closure stages BEFORE the scheduler: the merged prefix
-        // owns its tempdir and must outlive the build it feeds. Payloads
+        // owns its tempdir and outlives the build. Payloads
         // come from the released tree first, local builds only for tree
         // misses (#338).
         let cache = output_dir.join(".dep-cache");
-        let mut building = Vec::new();
+        let mut building = vec![meta.name.clone()];
         let prefix =
             crate::farm_prefix::farm_build_prefix(&self.tree, &cache, meta, &arch, &mut building)?;
         // Empty listings when the build materializes no prefix — the scan

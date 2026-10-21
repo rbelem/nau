@@ -547,9 +547,9 @@ fn build_farm_dep_payload<T: TreeSource>(
 }
 
 /// The farm twin of `pod_build_prefix`: the request meta's `requires` ∪
-/// `build_deps` closure, each member ensured against the tree first.
-/// `None` for fetch-only metas and empty closures — the same early-outs
-/// the pod path runs.
+/// `build_deps` closure, each member ensured against the tree.
+/// `None` for fetch-only metas and empty closures — the pod path's
+/// early-outs.
 pub(crate) fn farm_build_prefix<T: TreeSource>(
     tree: &T,
     cache: &Path,
@@ -568,7 +568,7 @@ pub(crate) fn farm_build_prefix<T: TreeSource>(
     }
     // Constraint-aware closure (ADR-0047): members load with the line
     // their edge selected, exactly like the pod path.
-    let closure = crate::deps::resolve_build_dep_specs(meta)?;
+    let closure = crate::deps::resolve_build_dep_specs(meta, building)?;
     let mut payloads = Vec::new();
     for member in closure {
         let dep_meta = crate::deps::load_meta_for(&member.name, member.constraint.as_deref())?;

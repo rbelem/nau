@@ -828,7 +828,7 @@ pub fn plan_node_job(
 }
 
 /// The binary-cache closure key of one snap: the parts spec + cross-
-/// compilation target + resolved requires closure (gap-analysis §4.3).
+/// compilation target + requires closure (gap-analysis §4.3).
 /// Computed once per snap per build, after requires resolution; every
 /// cache lookup/store uses the key derived from it.
 ///
@@ -841,7 +841,7 @@ pub fn build_closure(meta: &SnapMeta, lockfile: &LockFile) -> crate::cache::Buil
     let mut names: Vec<String> = if seeds.is_empty() {
         Vec::new()
     } else {
-        crate::deps::resolve_build_dep_names(meta).unwrap_or_default()
+        crate::deps::resolve_build_dep_names(meta, &[]).unwrap_or_default()
     };
     names.sort();
     names.dedup();
