@@ -7,9 +7,14 @@ through devbox (not npm).
 
 ## Build, test, lint
 
-Use the pinned 1.97.1 toolchain — devbox and the gate pod both carry it, and
-the pod payload follows the devbox pin (the pin is the contract). The pod env
-leaks `LD_LIBRARY_PATH` into the shell (breaks devbox's node), and
+The gate pod carries the pinned 1.97.1 toolchain (cargo 1.97.1, rustc
+1.97.1) and the pod gate is the contract for the clippy and fmt axes. Devbox
+resolves 1.98.x — `devbox.json` pins nixpkgs `c59305bb` — so the
+devbox-served test axis compiles with a different compiler than the pod gate,
+and the two verdicts are comparable only when the versions match; #23 tracks
+closing that gap. To compile with the pod's compiler locally, use the host's
+pinned rustc: `PATH="/nix/store/cqlx62f919g8xf2f39bmykslpjdh9z0j-rustc-1.97.1/bin:$PATH"`.
+The pod env leaks `LD_LIBRARY_PATH` into the shell (breaks devbox's node), and
 `COMPILER_PATH`/`LIBRARY_PATH` redirect every gcc driver's subprogram search
 into pod store blobs (libbfd load deaths), so strip all three and pin CC/CXX:
 
@@ -33,8 +38,8 @@ prepend plus `CC=gcc` keeps every compiler invocation off the pod blobs.
 
 Run the corrected full-gate invocation above before committing or pushing.
 Clippy warnings are errors. Ratified: the pod gate is the verified substitute
-for the clippy/fmt axes (verdicts matched the devbox pin on the daily-host
-reruns — see Build & test); the
+for the clippy/fmt axes (the verdicts matched on the daily-host reruns, when
+both lanes carried the same compiler — see Build & test); the
 test axis stays devbox until the gate pod also carries the build-host tools
 the suite spawns — see [Build & test](docs/agents/build-and-test.md).
 
@@ -57,9 +62,20 @@ report it that way rather than as done.
 
 ## Detail docs
 
-- [Build & test](docs/agents/build-and-test.md) — commands, test layout, gates
-- [Verb → state map](docs/agents/verb-state-map.md) — what each verb touches; where live state actually lives (systemd, not nau)
-- [Git workflow](docs/agents/git-workflow.md) — commits, generated files
-- [Planning & docs](docs/agents/planning-and-docs.md) — grill-with-docs, CONTEXT.md, ADRs
-- [Project context](docs/agents/project-context.md) — constraints, stack, where things live
-- [Domain model](docs/agents/domain.md) · [Issue tracker](docs/agents/issue-tracker.md) · [Triage labels](docs/agents/triage-labels.md)
+Reach for these by what you are about to change:
+
+- [Build & test](docs/agents/build-and-test.md) — before running a gate or
+  adding a test: the commands, the test layout, which axis runs where.
+- [Verb → state map](docs/agents/verb-state-map.md) — before changing what a
+  verb touches: which state each verb reads and writes, and where that state
+  actually lives (systemd, not nau).
+- [Domain model](docs/agents/domain.md) — before naming a type, a field, or a
+  package concept: the terms this repo already uses.
+- [Git workflow](docs/agents/git-workflow.md) — before committing, and before
+  adding a generated file: the commit shape and what is generated.
+- [Planning & docs](docs/agents/planning-and-docs.md) — before writing a
+  design note, an ADR, or a CONTEXT.md update: how planning happens here.
+- [Project context](docs/agents/project-context.md) — before touching the
+  stack or the constraints: what this project is and what it must not do.
+- [Issue tracker](docs/agents/issue-tracker.md) · [Triage labels](docs/agents/triage-labels.md) —
+  before filing or triaging an issue: how issues are written and labelled.
