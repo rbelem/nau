@@ -33,6 +33,15 @@ The three Lua/shell axes cover `pkgs/`, `test-fixtures/`, and every script
 under `scripts/`. CI runs the same three devbox scripts, so a local green and
 a CI green mean the same thing.
 
+**The token-budget gate.** A staged file may not exceed 5,000 tokens (20,000
+bytes). A file already over that limit may not grow by a single byte — the
+repo's last 40 commits shrank 39 of the over-budget files they touched and
+held the fortieth; none grew. So a change to a big file moves its new code
+into a new module and leaves the old file at or below its current size, and
+the gate's refusal is the design working. `scripts/split-inline-tests.py
+<file.rs>` moves an inline `#[cfg(test)] mod tests` into a sibling module
+directory that keeps `super::` access; run `cargo fmt` after applying it.
+
 Keep the pod shellenv on PATH (git and the curl shim ride it); the nix gcc
 prepend plus `CC=gcc` keeps every compiler invocation off the pod blobs.
 
