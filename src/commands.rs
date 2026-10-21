@@ -179,15 +179,15 @@ fn cmd_order(file: &str, output_name: &Option<String>, json: bool) -> miette::Re
     Ok(())
 }
 
-/// JSON-mode order report for one output. Seeds resolution with the
-/// build-time dependency union (`requires` ∪ `build_deps`).
+/// JSON-mode order report for one output. Seeds with the build-time
+/// dependency union (`requires` ∪ `build_deps`).
 fn report_order_json(meta: &crate::snap::SnapMeta) {
     let seeds = crate::deps::build_dep_seeds(meta);
     if seeds.is_empty() {
         return;
     }
     let seen: std::collections::HashSet<&str> = seeds.iter().map(|s| s.as_str()).collect();
-    if let Ok(order) = crate::deps::resolve_build_dep_names(meta) {
+    if let Ok(order) = crate::deps::resolve_build_dep_names(meta, &[]) {
         for dep in &order {
             let kind = if seen.contains(dep.as_str()) {
                 "direct"
@@ -225,7 +225,7 @@ fn report_order_human(meta: &crate::snap::SnapMeta) {
 
     eprintln!("  Resolved build order (transitive):");
     let seeds = crate::deps::build_dep_seeds(meta);
-    match crate::deps::resolve_build_dep_names(meta) {
+    match crate::deps::resolve_build_dep_names(meta, &[]) {
         Ok(order) => {
             let seen: std::collections::HashSet<&str> = seeds.iter().map(|s| s.as_str()).collect();
             for dep in &order {

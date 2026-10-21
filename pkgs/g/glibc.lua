@@ -21,14 +21,22 @@ return {
         architectures = { "amd64", "arm64", "armhf" },
         type = "source",
         requires = { "linux-headers" },
-        -- NOTE (2026-10-03): glibc cannot declare its own build_deps —
-        -- every build tool requires glibc, and the resolver walks
-        -- build_deps edges with the runtime closure, so glibc → gawk →
-        -- glibc is a hard cycle (live: every daily sync refused after
-        -- the attempt). The build tools ride the ambient build-deps
-        -- floor instead; bison+gawk joined that floor's requires in the
-        -- same window. A scoped build-sandbox resolution (build_deps
-        -- edges outside the runtime closure graph) is the real fix.
+        -- glibc declares its own build tools (issue #4): configure demands
+        -- bison and awk unconditionally, and no code injects an ambient
+        -- build-deps floor — the build view's seeds are exactly
+        -- `requires` ∪ `build_deps`, so without this declaration glibc's
+        -- own prefix is `{ linux-headers }` alone and a stock host has no
+        -- bison.
+        --
+        -- The cycle these tools used to close is gone (issue #18): the
+        -- build view is TWO-LEVEL. A package's view is its direct seeds
+        -- plus the runtime-`requires` closure of those seeds, so a
+        -- consumer of glibc no longer carries glibc's build tools
+        -- (issue #15) and a member's build tools are reached through that
+        -- member's own view. Edges and seeds naming a package on the
+        -- lane's building stack drop, so glibc → gawk → glibc no longer
+        -- re-enters the build in progress.
+        build_deps = { "gcc", "make", "bison", "gawk" },
         source = {
             url = "https://ftp.gnu.org/gnu/glibc/glibc-2.44.tar.xz",
             sha256 = "37f600f2bef3c5e8300147059568b2a2e40a7ad6ccc65ce942556d49429cc667",

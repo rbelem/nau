@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 
 use nau_core::snap_types::SnapMeta;
 
+use self::walk::{resolve_walk, Edges};
+
 /// A resolved dependency node with its transitive closure.
 #[derive(Debug, Clone)]
 pub struct DepNode {
@@ -71,14 +73,6 @@ fn split_dep_spec(spec: &str) -> miette::Result<(&str, Option<&str>)> {
     Ok((name, Some(constraint)))
 }
 
-/// One walked node: canonical name, effective constraint, raw edges.
-struct WalkNode {
-    name: String,
-    constraint: Option<String>,
-    requires: Vec<String>,
-    build_deps: Vec<String>,
-}
-
 /// Collapse the per-name edge-constraint sets into one effective
 /// constraint per name: the single declared line, or None when every
 /// edge was bare. Two DIFFERENT constraints for one name fail named:
@@ -111,139 +105,6 @@ fn effective_constraints(
     Ok(out)
 }
 
-/// The shared resolution walk: loads each seed (its edge may carry an
-/// `@constraint` — the constraint rides the recipe eval), follows
-/// `requires` ∪ `build_deps` transitively when `recursive`, and returns
-/// nodes in topological build order. Constraints merge through
-/// [`effective_constraints`].
-///
-/// `host` scopes the walk to a package under construction (the
-/// build-time view, [`build_view`]): an edge naming it is not followed,
-/// at any depth. Runtime callers pass `None` and keep every edge.
-fn resolve_walk(
-    seeds: &[String],
-    recursive: bool,
-    host: Option<&str>,
-) -> miette::Result<Vec<WalkNode>> {
-    resolve_walk_with(seeds, recursive, host, &load_meta_for)
-}
-
-/// [`resolve_walk`] with the recipe loader injected: the unit-test seam
-/// (recipes cannot be evaluated under the test harness — the eval worker
-/// re-executes `argv[0]`) and the one place the host rule lives.
-fn resolve_walk_with(
-    seeds: &[String],
-    recursive: bool,
-    host: Option<&str>,
-    load: &dyn Fn(&str, Option<&str>) -> miette::Result<SnapMeta>,
-) -> miette::Result<Vec<WalkNode>> {
-    let mut nodes: Vec<WalkNode> = Vec::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    // name → every constraint any edge used to reach it (deduped).
-    let mut edge_constraints: HashMap<String, Vec<String>> = HashMap::new();
-    let mut pending: Vec<(String, Option<String>)> = Vec::new();
-    for seed in seeds {
-        let (base, constraint) = split_dep_spec(seed)?;
-        pending.push((base.to_string(), constraint.map(str::to_string)));
-    }
-
-    while let Some((seed, constraint)) = pending.pop() {
-        let meta = load(&seed, constraint.as_deref())?;
-        // Canonical identity: a seed may name a package through an alias
-        // (e.g. "toolchain" → toolchain-gcc-gnu-x86_64). Every downstream
-        // consumer — payload naming, cache keys, build order — keys on the
-        // meta's own name, so the node carries the canonical form and the
-        // visited set dedupes on it (a seed and its canonical name meeting
-        // in one closure resolve to one node).
-        let name = if meta.name.is_empty() {
-            seed.clone()
-        } else {
-            meta.name.clone()
-        };
-        if let Some(c) = &constraint {
-            let seen = edge_constraints.entry(name.clone()).or_default();
-            if !seen.contains(c) {
-                seen.push(c.clone());
-            }
-        }
-        if !visited.insert(name.clone()) {
-            continue;
-        }
-
-        let requires: Vec<String> = meta
-            .requires
-            .iter()
-            .filter(|r| !r.is_empty())
-            .cloned()
-            .collect();
-        let build_deps: Vec<String> = meta
-            .build_deps
-            .iter()
-            .filter(|r| !r.is_empty())
-            .cloned()
-            .collect();
-
-        nodes.push(WalkNode {
-            name: name.clone(),
-            constraint,
-            requires: requires.clone(),
-            build_deps: build_deps.clone(),
-        });
-
-        if recursive {
-            for dep in requires.iter().chain(&build_deps) {
-                let (base, c) = split_dep_spec(dep)?;
-                // Transitive self-host rule (issue #4): the package under
-                // construction supplies its own payload, so an edge back
-                // to it is not walked. Scoped to the host name alone —
-                // every other edge, including the member's own runtime
-                // `requires`, still resolves.
-                if host == Some(base) {
-                    continue;
-                }
-                if !visited.contains(base) {
-                    pending.push((base.to_string(), c.map(str::to_string)));
-                } else {
-                    // Already resolved — still record the edge's
-                    // constraint so a conflict between two edges that
-                    // both name an already-visited node fails loud.
-                    if let Some(c) = c {
-                        let seen = edge_constraints.entry(base.to_string()).or_default();
-                        if !seen.contains(&c.to_string()) {
-                            seen.push(c.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Conflicting lines: one name, two different constraints — refuse
-    // instead of letting edge order pick the winner silently.
-    let effective = effective_constraints(&edge_constraints)?;
-    for node in &mut nodes {
-        node.constraint = effective.get(&node.name).cloned().flatten();
-    }
-
-    // Topological sort: leaves first
-    let sorted = topological_sort(
-        &nodes
-            .iter()
-            .map(|n| DepNode {
-                name: n.name.clone(),
-                requires: n.requires.clone(),
-                build_deps: n.build_deps.clone(),
-            })
-            .collect::<Vec<_>>(),
-    );
-    let mut order: HashMap<String, usize> = HashMap::new();
-    for (i, node) in sorted.iter().enumerate() {
-        order.insert(node.name.clone(), i);
-    }
-    nodes.sort_by_key(|n| order.get(&n.name).copied().unwrap_or(usize::MAX));
-    Ok(nodes)
-}
-
 /// Resolve transitive dependencies for a list of seed packages.
 ///
 /// `seeds` can be package names (resolved via pkgs/), paths to nau.lua files,
@@ -251,7 +112,7 @@ fn resolve_walk_with(
 /// (ADR-0047). Returns packages in topological build order (leaf
 /// dependencies first).
 pub fn resolve_deps(seeds: &[String], recursive: bool) -> miette::Result<Vec<DepNode>> {
-    Ok(resolve_walk(seeds, recursive, None)?
+    Ok(resolve_walk(seeds, recursive, &HashSet::new(), Edges::All)?
         .into_iter()
         .map(|n| DepNode {
             name: n.name,
@@ -265,7 +126,7 @@ pub fn resolve_deps(seeds: &[String], recursive: bool) -> miette::Result<Vec<Dep
 /// edges selected — the load-with-constraint input for closure members
 /// (ADR-0047).
 pub fn resolve_dep_specs(seeds: &[String], recursive: bool) -> miette::Result<Vec<DepSpec>> {
-    Ok(resolve_walk(seeds, recursive, None)?
+    Ok(resolve_walk(seeds, recursive, &HashSet::new(), Edges::All)?
         .into_iter()
         .map(|n| DepSpec {
             name: n.name,
@@ -491,6 +352,7 @@ pub fn recipe_dir(name_or_path: &str) -> Option<PathBuf> {
 }
 
 mod build_view;
+mod walk;
 
 pub use build_view::{resolve_build_dep_names, resolve_build_dep_nodes, resolve_build_dep_specs};
 
